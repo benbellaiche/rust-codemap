@@ -3,9 +3,11 @@
 Subcommands:
   run     Generate the call-graph + doc index for a target crate and serve
           the viewer, in one step.
-  graph   Build the call-graph for a target crate's binary or library
-          target (runs `cargo rustc --emit=mir`, then extracts the graph
-          from the resulting MIR dump).
+  graph   Build the call-graph for a target crate AND every other crate in
+          its cargo workspace (runs `cargo build --workspace` with
+          `RUSTFLAGS=--emit=mir`, then extracts and merges the graph from
+          every workspace member's MIR dump -- a single, standalone crate
+          is just a one-member workspace, so this covers that case too).
   doc     Cross-reference `cargo doc` output with a graph.json, producing
           source_index.json (signatures, doc comments, source links).
   trace   Convert a raw tracing_subscriber JSON-lines log into trace.json.
@@ -22,10 +24,13 @@ buttons in its toolbar to pick up whatever was generated.
 Run `python -m codemap <subcommand> --help` for each command's options.
 See README.md for the full workflow and the tracing log format contract.
 """
+from __future__ import annotations
+
 import argparse
 import functools
 import http.server
 import json
+import os
 import re
 import subprocess
 import sys
@@ -76,14 +81,6 @@ def default_out_dir(manifest: Path) -> Path:
     return target_dir / "rust-codemap" / crate_name(manifest)
 
 
-def target_flag(args) -> tuple:
-    """Which cargo target to compile: (cargo-rustc args, human label).
-    `--bin <name>` and `--lib` are mutually exclusive at the argparse level."""
-    if args.lib:
-        return ["--lib"], "--lib"
-    return ["--bin", args.bin], f"--bin {args.bin}"
-
-
 def write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -91,39 +88,67 @@ def write_json(path: Path, data) -> None:
 
 # ── graph ────────────────────────────────────────────────────────────────
 
-def cmd_graph(args) -> Path:
-    manifest = require_manifest(args.project)
-    target_dir = Path(cargo_metadata(manifest)["target_directory"])
-    out_path = Path(args.out) if args.out else default_out_dir(manifest) / "graph.json"
-    cargo_target_args, label = target_flag(args)
-
-    print(f"Compiling {label} with --emit=mir ...")
-    subprocess.run(
-        ["cargo", "rustc", "--manifest-path", str(manifest), *cargo_target_args, "--", "--emit=mir"],
-        check=True,
-    )
-
-    # Picking "whatever .mir is newest" breaks the moment cargo decides
-    # nothing needs rebuilding (a no-op "Finished" that never touches this
-    # crate's .mir) while some OTHER crate in the same shared target/deps
-    # dir got rebuilt more recently -- easy to hit in a workspace. Narrow
-    # the glob to this crate's own name first; only fall back to mtime to
-    # break ties among that crate's own (e.g. stale profile) artifacts.
-    cname = crate_name(manifest)
-    deps_dir = target_dir / "debug" / "deps"
-    mir_files = sorted(
-        [*deps_dir.glob(f"{cname}.mir"), *deps_dir.glob(f"{cname}-*.mir")],
+def find_mir_file(deps_dir: Path, name: str) -> Path | None:
+    """A lib's .mir carries a hash suffix (name-<hash>.mir); a bin's doesn't
+    (name.mir). Match on the crate's own name first -- picking "whatever
+    .mir is newest" breaks the moment cargo decides nothing needs
+    rebuilding (a no-op "Finished" that never touches this crate's .mir)
+    while some OTHER crate in the same shared target/deps dir got rebuilt
+    more recently, which is the common case in a workspace. mtime only
+    breaks ties among this crate's own (e.g. stale profile) artifacts."""
+    candidates = sorted(
+        [*deps_dir.glob(f"{name}.mir"), *deps_dir.glob(f"{name}-*.mir")],
         key=lambda p: p.stat().st_mtime, reverse=True,
     )
-    if not mir_files:
-        sys.exit(f"ERROR: no {cname}(-*).mir file found under {deps_dir}")
-    mir_path = mir_files[0]
-    print(f"Parsing {mir_path.name} ({mir_path.stat().st_size // 1024} KB)...")
+    return candidates[0] if candidates else None
 
-    graph = mir_graph.build_graph(mir_path.read_text(encoding="utf-8", errors="ignore"))
+
+def cmd_graph(args) -> Path:
+    manifest = require_manifest(args.project)
+    meta = cargo_metadata(manifest)
+    target_dir = Path(meta["target_directory"])
+    out_path = Path(args.out) if args.out else default_out_dir(manifest) / "graph.json"
+
+    # `packages` here is already scoped to workspace members only (cargo
+    # metadata was called with --no-deps) -- this is the *whole* workspace
+    # the target crate belongs to, discovered from pointing at just one of
+    # its members; a standalone (non-workspace) crate is just a workspace
+    # of one, so the same code path covers both.
+    members = [(pkg["name"], pkg["name"].replace("-", "_")) for pkg in meta["packages"]]
+    print(f"Workspace members: {', '.join(n for n, _ in members)}")
+
+    # cargo rustc --emit=mir only applies to the one crate being directly
+    # built -- RUSTFLAGS applies to every rustc invocation cargo makes,
+    # dependencies included, so --workspace here emits MIR for every member
+    # (and every external dependency too, which is fine: we only ever read
+    # the files matching a workspace member's own name below).
+    print("Building the workspace with RUSTFLAGS=--emit=mir ...")
+    subprocess.run(
+        ["cargo", "build", "--workspace", "--manifest-path", str(manifest)],
+        check=True, env={**os.environ, "RUSTFLAGS": "--emit=mir"},
+    )
+
+    deps_dir = target_dir / "debug" / "deps"
+    mir_texts = []
+    for pkg_name, cname in members:
+        mir_path = find_mir_file(deps_dir, cname)
+        if mir_path is None:
+            print(f"  WARNING: no .mir found for {pkg_name} ({cname}) -- skipping")
+            continue
+        print(f"  {pkg_name}: {mir_path.name} ({mir_path.stat().st_size // 1024} KB)")
+        mir_texts.append(mir_path.read_text(encoding="utf-8", errors="ignore"))
+    if not mir_texts:
+        sys.exit(f"ERROR: no .mir file found for any workspace member under {deps_dir}")
+
+    # A single combined text: parse_mir just scans lines, so concatenating
+    # every member's MIR and parsing once naturally merges nodes/edges
+    # across crates (including cross-crate calls, once resolvable) with no
+    # separate "merge N graphs" step needed.
+    graph = mir_graph.build_graph("\n".join(mir_texts))
     write_json(out_path, graph)
     traced = sum(1 for n in graph["nodes"] if n["data"]["traced"])
-    print(f"OK {out_path}  ({len(graph['nodes'])} nodes, {len(graph['edges'])} edges, {traced} traced)")
+    print(f"OK {out_path}  ({len(graph['nodes'])} nodes, {len(graph['edges'])} edges, "
+          f"{traced} traced, {len(mir_texts)} crate(s) merged)")
     return out_path
 
 
@@ -191,7 +216,7 @@ def cmd_serve(args):
 # ── run (graph + doc + serve) ──────────────────────────────────────────────
 
 def cmd_run(args):
-    graph_path = cmd_graph(SimpleNamespace(project=args.project, bin=args.bin, lib=args.lib, out=None))
+    graph_path = cmd_graph(SimpleNamespace(project=args.project, out=None))
     doc_path = cmd_doc(SimpleNamespace(project=args.project, graph=None, out=None))
 
     print()
@@ -219,18 +244,12 @@ def main():
 
     r = sub.add_parser("run", help="Generate the graph + doc index for a project and serve the viewer")
     r.add_argument("--project", required=True, help="Path to the target crate (dir containing Cargo.toml)")
-    rt = r.add_mutually_exclusive_group(required=True)
-    rt.add_argument("--bin", help="Binary target to compile (cargo rustc --bin <name>)")
-    rt.add_argument("--lib", action="store_true", help="Analyze the crate's library target instead of a binary")
     r.add_argument("--port", type=int, default=8787)
     r.add_argument("--no-browser", action="store_true", help="Don't automatically open a browser tab")
     r.set_defaults(func=cmd_run)
 
-    g = sub.add_parser("graph", help="Generate the call-graph from a target crate's MIR")
+    g = sub.add_parser("graph", help="Generate the call-graph for a target crate and its whole workspace")
     g.add_argument("--project", required=True, help="Path to the target crate (dir containing Cargo.toml)")
-    gt = g.add_mutually_exclusive_group(required=True)
-    gt.add_argument("--bin", help="Binary target to compile (cargo rustc --bin <name>)")
-    gt.add_argument("--lib", action="store_true", help="Analyze the crate's library target instead of a binary")
     g.add_argument("--out", default=None, help="Where to write graph.json (default: <target>/rust-codemap/<crate>/graph.json)")
     g.set_defaults(func=cmd_graph)
 
