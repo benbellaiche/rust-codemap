@@ -19,3 +19,16 @@ target
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Python
+__pycache__/
+*.pyc
+
+# graph/doc/trace default to writing under the *target* crate's own
+# target/rust-codemap/ directory, not here. These rules are just a safety
+# net for the (non-default) case of an explicit `--out viewer/...`.
+viewer/graph.json
+viewer/source_index.json
+viewer/trace.json
+*.mir
+

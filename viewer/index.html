@@ -1,0 +1,1009 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Rust Codemap</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0
+        }
+
+        body {
+            font-family: Segoe UI, sans-serif;
+            background: #1e1e2e;
+            color: #cdd6f4;
+            height: 100vh;
+            display: flex;
+            flex-direction: column
+        }
+
+        #toolbar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 14px;
+            background: #181825;
+            border-bottom: 1px solid #313244;
+            flex-wrap: wrap
+        }
+
+        #toolbar h1 {
+            font-size: 13px;
+            color: #89b4fa;
+        }
+
+        #toolbar-center {
+            flex: 1;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap
+        }
+
+        #toolbar-right {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap
+        }
+
+        button {
+            background: #313244;
+            color: #cdd6f4;
+            border: 1px solid #45475a;
+            border-radius: 5px;
+            padding: 4px 10px;
+            cursor: pointer;
+            font-size: 12px
+        }
+
+        button:hover {
+            background: #45475a
+        }
+
+        button:disabled {
+            opacity: .4;
+            cursor: default
+        }
+
+        button.active {
+            background: #89b4fa;
+            color: #1e1e2e
+        }
+
+        #main {
+            display: flex;
+            flex: 1;
+            overflow: hidden
+        }
+
+        #cy {
+            flex: 1;
+            min-width: 0
+        }
+
+        #sidebar {
+            width: 250px;
+            background: #181825;
+            border-left: 1px solid #313244;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            flex-shrink: 0
+        }
+
+        .pt {
+            font-size: 10px;
+            color: #6c7086;
+            padding: 6px 10px;
+            border-bottom: 1px solid #313244;
+            text-transform: uppercase;
+            letter-spacing: 1px
+        }
+
+        #legend {
+            padding: 8px 10px;
+            border-bottom: 1px solid #313244
+        }
+
+        .leg {
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            margin: 3px 0;
+            font-size: 11px
+        }
+
+        .dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 3px;
+            flex-shrink: 0
+        }
+
+        .arr {
+            width: 28px;
+            height: 2px;
+            flex-shrink: 0
+        }
+
+        #trace-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 3px 0
+        }
+
+        .sp {
+            padding: 2px 8px;
+            font-size: 11px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            border-left: 3px solid transparent
+        }
+
+        .sp:hover {
+            background: #313244
+        }
+
+        .sp.visited {
+            border-left-color: #a6e3a1;
+            color: #a6e3a1
+        }
+
+        .sp.current {
+            border-left-color: #f38ba8;
+            background: #313244;
+            color: #f38ba8;
+            font-weight: bold
+        }
+
+        .sp-name {
+            flex: 1;
+            font-family: monospace
+        }
+
+        .sp-ms {
+            color: #6c7086;
+            font-size: 10px
+        }
+
+        .sp-iter {
+            color: #fab387;
+            font-size: 10px
+        }
+
+        .sp-toggle {
+            display: inline-block;
+            width: 12px;
+            font-size: 9px;
+            color: #6c7086;
+            cursor: pointer;
+            flex-shrink: 0;
+            user-select: none;
+            text-align: center
+        }
+
+        .sp-toggle:hover {
+            color: #89b4fa
+        }
+
+        .sp-pad {
+            display: inline-block;
+            width: 12px;
+            flex-shrink: 0
+        }
+
+        #info {
+            padding: 8px 10px;
+            border-top: 1px solid #313244;
+            font-size: 11px;
+            color: #a6adc8;
+            min-height: 120px;
+            max-height: 280px;
+            overflow-y: auto
+        }
+
+        #info a {
+            color: #89b4fa;
+            cursor: pointer;
+            text-decoration: underline;
+            font-size: 11px
+        }
+
+        .type-link {
+            color: #94e2d5;
+            cursor: pointer;
+            text-decoration: underline dotted;
+        }
+
+        .type-link:hover {
+            color: #89b4fa
+        }
+
+        #status {
+            font-size: 11px;
+            color: #6c7086
+        }
+
+        #config-bar {
+            display: none;
+            align-items: center;
+            gap: 16px;
+            padding: 5px 14px;
+            background: #11111b;
+            border-bottom: 1px solid #313244;
+            font-size: 11px;
+            flex-wrap: wrap
+        }
+
+        #config-bar.open {
+            display: flex
+        }
+
+        .cfg-group {
+            display: flex;
+            align-items: center;
+            gap: 6px
+        }
+
+        .cfg-group label {
+            color: #6c7086;
+            white-space: nowrap
+        }
+
+        .cfg-group input[type=range] {
+            width: 90px;
+            cursor: pointer
+        }
+
+        .cfg-val {
+            color: #cdd6f4;
+            min-width: 40px;
+            font-family: monospace;
+            font-size: 11px
+        }
+
+        .rh {
+            width: 5px;
+            cursor: ew-resize;
+            background: #313244;
+            flex-shrink: 0;
+            transition: background .15s
+        }
+
+        .rh:hover {
+            background: #89b4fa
+        }
+    </style>
+</head>
+
+<body>
+    <div id="toolbar">
+        <h1>Rust Codemap</h1>
+        <div id="toolbar-center">
+            <button id="btn-play">&#9654; Play</button>
+            <button id="btn-pause" disabled>&#9646;&#9646; Pause</button>
+            <button id="btn-step-prev">&lt; Step</button>
+            <button id="btn-step">Step &gt;</button>
+            <button id="btn-reset">Reset</button>
+            <button id="btn-relayout">Re-layout</button>
+        </div>
+        <div id="toolbar-right">
+            <button id="btn-load-graph">Load graph&hellip;</button>
+            <input type="file" id="graph-file-input" accept=".json" style="display:none">
+            <button id="btn-load-doc">Load doc index&hellip;</button>
+            <input type="file" id="doc-file-input" accept=".json" style="display:none">
+            <button id="btn-load-trace">Load trace&hellip;</button>
+            <input type="file" id="trace-file-input" accept=".json,.jsonl,.log,.txt" style="display:none">
+            <button id="btn-config">&#9881; Settings</button>
+            <span id="status">Loading...</span>
+        </div>
+    </div>
+    <div id="config-bar">
+        <div class="cfg-group">
+            <button id="btn-untraced">Hide untraced</button>
+        </div>
+        <div class="cfg-group">
+            <label>Play step</label>
+            <input type="range" id="cfg-play" min="200" max="2000" step="50" value="700">
+            <span class="cfg-val" id="cfg-play-val">700 ms</span>
+        </div>
+        <div class="cfg-group">
+            <label>Return step</label>
+            <input type="range" id="cfg-step" min="80" max="800" step="20" value="280">
+            <span class="cfg-val" id="cfg-step-val">280 ms</span>
+        </div>
+        <div class="cfg-group">
+            <label>Hold on caller</label>
+            <input type="range" id="cfg-hold" min="150" max="1500" step="50" value="550">
+            <span class="cfg-val" id="cfg-hold-val">550 ms</span>
+        </div>
+    </div>
+    <div id="main">
+        <div id="cy"></div>
+        <div class="rh" id="rh-right"></div>
+        <div id="sidebar">
+            <div class="pt">Legend</div>
+            <div id="legend">
+                <div class="leg">
+                    <div class="dot" style="background:#a6e3a1"></div> fn / method
+                </div>
+                <div class="leg">
+                    <div class="dot" style="background:#f38ba8"></div> current (active step)
+                </div>
+                <div class="leg">
+                    <div class="dot" style="background:#cba6f7"></div> last step (end of trace)
+                </div>
+                <div class="leg" id="legend-untraced" style="display:none">
+                    <div class="dot" style="background:#45475a;border:1px dashed #6c7086;opacity:.7"></div> untraced
+                </div>
+                <div style="margin-top:6px"></div>
+                <div id="legend-edges"></div>
+                <div class="leg">
+                    <div class="arr" style="background:#f38ba8"></div> current (active step)
+                </div>
+                <div class="leg">
+                    <div class="arr" style="background:#cba6f7"></div> last step (end of trace)
+                </div>
+                <div class="leg">
+                    <div class="arr" style="background:#f9e2af;height:2px"></div> return
+                </div>
+            </div>
+            <div class="pt">Execution Trace</div>
+            <div id="trace-list">
+                <p style="padding:8px 10px;color:#6c7086;font-size:11px">Click Play to load & animate.</p>
+            </div>
+            <div id="info">Click a node for details.</div>
+        </div>
+    </div>
+    <script>
+        const COLORS = {
+            fn: '#a6e3a1', method: '#a6e3a1',
+            edge: { call: '#cdd6f4', dispatch: '#89b4fa', loop_call: '#cdd6f4', trampoline: '#f38ba8' }
+        };
+        let cy = null, traceData = [], traceIdx = -1, playActive = false, playTimeout = null, sourceIndex = {};
+        let animPlay = 700, animStep = 280, animHold = 550;
+        let loopAnimRunning = false, loopAnimEdges = null;
+
+        // Load source index from cargo doc
+        fetch('source_index.json', { cache: 'no-store' }).then(r => r.json()).then(d => { sourceIndex = d; }).catch(() => { });
+
+        function initCy(elems) {
+            // Every Rust *binary* has exactly one fn named "main" -- use it as
+            // the layout root when present. A library has no such convention,
+            // so fall back to Cytoscape's own root detection (nodes with no
+            // incoming edges) rather than assuming "main" always exists.
+            const rootId = elems.some(e => e.data && e.data.nodeType && e.data.id === 'main') ? 'main' : undefined;
+            cy = cytoscape({
+                container: document.getElementById('cy'),
+                elements: elems,
+                style: [
+                    {
+                        selector: 'node', style: {
+                            'background-color': e => COLORS[e.data('nodeType')] || '#45475a',
+                            'label': 'data(label)', 'text-valign': 'center', 'text-halign': 'center',
+                            'color': '#1e1e2e', 'font-size': '10px', 'font-family': 'monospace',
+                            'text-wrap': 'wrap', 'text-max-width': '120px',
+                            'width': 'label', 'height': 'label', 'padding': '10px',
+                            'shape': 'roundrectangle',
+                            'border-width': 2,
+                            'border-color': '#313244',
+                            'min-width': '70px', 'min-height': '28px'
+                        }
+                    },
+                    { selector: 'node.untraced', style: { 'background-color': '#45475a', 'border-style': 'dashed', 'border-color': '#6c7086', 'border-width': 3, 'opacity': 0.6 } },
+                    { selector: 'node.visited', style: { 'background-color': '#a6e3a1', 'border-color': '#1e1e2e' } },
+                    { selector: 'node.current', style: { 'background-color': '#f38ba8', 'border-color': '#fab387', 'border-width': 3 } },
+                    { selector: 'node.last-step', style: { 'background-color': '#cba6f7', 'border-color': '#fab387', 'border-width': 3 } },
+                    {
+                        selector: 'edge', style: {
+                            'line-color': e => COLORS.edge[e.data('edgeType')] || '#6c7086',
+                            'target-arrow-color': e => COLORS.edge[e.data('edgeType')] || '#6c7086',
+                            'target-arrow-shape': 'triangle',
+                            'curve-style': 'bezier',
+                            'line-style': e => ['dispatch', 'trampoline'].includes(e.data('edgeType')) ? 'dashed' : 'solid',
+                            'width': 2,
+                            'opacity': 0.75,
+                            'arrow-scale': 1.2,
+                            'label': 'data(iterLabel)', 'font-size': '9px', 'color': '#fab387',
+                            'text-rotation': 'autorotate', 'text-background-color': '#1e1e2e',
+                            'text-background-opacity': 0.85, 'text-background-padding': '2px'
+                        }
+                    },
+                ],
+                layout: { name: 'breadthfirst', directed: true, roots: rootId ? [rootId] : undefined, spacingFactor: 2.8, avoidOverlap: true, padding: 60, animate: false },
+                wheelSensitivity: 0.15
+            });
+            // "traced" is computed by the generator straight from the MIR body
+            // (presence of tracing Callsite scaffolding = #[instrument] expanded here).
+            // A node with traced===false never produces a span, on any input — it
+            // may be intentional (e.g. a function that runs before tracing is set
+            // up) or simply a real function someone forgot to instrument.
+            cy.nodes().each(n => { if (n.data('traced') === false) n.addClass('untraced'); });
+            applyUntracedVisibility(false); // hidden by default
+            buildLegend();
+            cy.on('tap', 'node', e => { showNodeInfo(e.target) });
+            cy.on('tap', 'edge', e => {
+                const d = e.target.data();
+                document.getElementById('info').innerHTML =
+                    `<b style="color:#89b4fa">${d.source}</b> -> ${d.target}<br>Type: <b>${d.edgeType}</b>${d.iterLabel ? '<br>' + d.iterLabel : ''}`;
+            });
+            const n = elems.filter(e => e.data.nodeType).length, ed = elems.filter(e => e.data.edgeType).length;
+            document.getElementById('status').textContent = `${n} nodes | ${ed} edges`;
+        }
+
+        let showUntraced = false;
+        function applyUntracedVisibility(show) {
+            showUntraced = show;
+            const nodes = cy.nodes('.untraced');
+            const edges = nodes.connectedEdges();
+            if (show) { nodes.show(); edges.show(); } else { nodes.hide(); edges.hide(); }
+            document.getElementById('btn-untraced').textContent = show ? 'Hide untraced' : 'Show untraced';
+            document.getElementById('btn-untraced').classList.toggle('active', show);
+        }
+
+        // Legend reflects only what's actually in the loaded graph — no hardcoded
+        // assumptions about which edge types or untraced nodes exist.
+        const EDGE_LEGEND = {
+            call:       { color: '#cdd6f4', dashed: false, label: 'call' },
+            dispatch:   { color: '#89b4fa', dashed: true,  label: 'dispatch' },
+            loop_call:  { color: '#cdd6f4', dashed: false, label: 'loop_call (✓ visited)' },
+            trampoline: { color: '#f38ba8', dashed: true,  label: 'trampoline' },
+        };
+        function buildLegend() {
+            const present = new Set(cy.edges().map(e => e.data('edgeType')));
+            const container = document.getElementById('legend-edges');
+            container.innerHTML = '';
+            Object.keys(EDGE_LEGEND).filter(t => present.has(t)).forEach(t => {
+                const meta = EDGE_LEGEND[t];
+                const style = meta.dashed
+                    ? `background:${meta.color};border-top:2px dashed ${meta.color};height:0`
+                    : `background:${meta.color}`;
+                const div = document.createElement('div');
+                div.className = 'leg';
+                div.innerHTML = `<div class="arr" style="${style}"></div> ${meta.label}`;
+                container.appendChild(div);
+            });
+            const hasUntraced = cy.nodes().some(n => n.data('traced') === false);
+            document.getElementById('legend-untraced').style.display = hasUntraced ? '' : 'none';
+        }
+        // Wrap identifiers in a signature with a clickable span, but only when
+        // sourceIndex actually has a doc entry for that exact name — never a
+        // hardcoded list, just whatever cargo doc produced (structs, enums,
+        // traits, free fns). "f64", "String", "Self" etc. simply have no entry.
+        function linkifySignature(sig) {
+            return sig.replace(/\b([A-Za-z_]\w*)\b/g, (word) =>
+                sourceIndex[word] ? `<span class="type-link" data-type="${word}">${word}</span>` : word
+            );
+        }
+
+        function buildInfoHtml(nodeId, nodeData, spanData) {
+            const src = sourceIndex[nodeId] || {};
+            let h = `<b style="color:#89b4fa">${nodeId}</b>`;
+            if (nodeData && nodeData.traitImpl) h += ` <span style="color:#fab387;font-size:10px">impl ${nodeData.traitImpl}</span>`;
+            if (src.signature) h += `<br><code style="color:#cdd6f4;font-size:10px;word-break:break-all">${linkifySignature(src.signature)}</code>`;
+            if (src.file && src.line) {
+                const vsUrl = src.vscodePath || '';
+                if (vsUrl) {
+                    h += `<br><a href="${vsUrl}" style="color:#6c7086;font-size:10px">&#128194; ${src.file} : ${src.line}</a>`;
+                } else {
+                    h += `<br><span style="color:#6c7086;font-size:10px">&#128194; ${src.file} : ${src.line}</span>`;
+                }
+            }
+            if (spanData) {
+                h += `<hr style="border-color:#313244;margin:4px 0">`;
+                h += `<span style="color:#6c7086;font-size:10px">${spanData.duration_ms}ms`;
+                if (spanData.iterations > 1) h += ` &nbsp;&#215;${spanData.iterations}`;
+                h += '</span>';
+                const fields = spanData.fields || {};
+                const keys = Object.keys(fields).filter(k => fields[k] !== '');
+                if (keys.length) h += '<br><span style="color:#a6adc8;font-size:10px">' + keys.map(k => `${k}: <b>${String(fields[k]).substring(0, 30)}</b>`).join(' &nbsp;') + '</span>';
+            }
+            if (src.docHtml) h += `<hr style="border-color:#313244;margin:4px 0"><div style="font-size:10px;color:#a6adc8;max-height:120px;overflow-y:auto">${src.docHtml}</div>`;
+            return h;
+        }
+
+        // ── Loop edge animation: 3 flashes then iteration count ─────────────
+        function flashLoopEdge(edges, iters) {
+            loopAnimRunning = true;
+            loopAnimEdges = edges;
+            let n = 0;
+            const ON_MS = 280;
+            const OFF_MS = 200;
+            function tick() {
+                if (!loopAnimRunning) return;
+                if (n < 3) {
+                    // Flash ON
+                    edges.style({ 'line-color': '#fab387', 'target-arrow-color': '#fab387', 'opacity': 1, 'width': 4 });
+                    setTimeout(() => {
+                        if (!loopAnimRunning) return;
+                        // Flash OFF
+                        edges.style({ 'line-color': '#6c7086', 'target-arrow-color': '#6c7086', 'opacity': 0.3, 'width': 2 });
+                        n++;
+                        setTimeout(tick, OFF_MS);
+                    }, ON_MS);
+                } else {
+                    // After 3 flashes: red like other current edges, keep label
+                    edges.style({ 'line-color': '#f38ba8', 'target-arrow-color': '#f38ba8', 'opacity': 1, 'width': 5 });
+                    if (iters > 1) edges.data('iterLabel', `×${iters}`);
+                }
+            }
+            tick();
+        }
+        function stopLoopFlow(applyGreen) {
+            loopAnimRunning = false;
+            if (loopAnimEdges && loopAnimEdges.length) {
+                loopAnimEdges.stop(false, true);
+                if (applyGreen) {
+                    loopAnimEdges.style({ 'line-color': '#a6e3a1', 'target-arrow-color': '#a6e3a1', 'line-style': 'solid', 'opacity': 1, 'width': 3 });
+                } else {
+                    loopAnimEdges.removeStyle();
+                }
+                loopAnimEdges = null;
+            }
+        }
+
+        function showNodeInfo(node) {
+            const d = node.data();
+            document.getElementById('info').innerHTML = buildInfoHtml(d.id, d, null);
+        }
+
+        // Clicking a linkified type name in a signature shows that type's own
+        // doc (fields, doc comment, source link) via the same renderer used
+        // for graph nodes — the type doesn't need to be a node in the call graph.
+        document.getElementById('info').addEventListener('click', e => {
+            const el = e.target.closest('.type-link');
+            if (!el) return;
+            document.getElementById('info').innerHTML = buildInfoHtml(el.dataset.type, {}, null);
+        });
+
+        // Loading a graph is not tied to any file living next to index.html --
+        // the server only ever serves this static viewer. `fetch('graph.json')`
+        // below is just a convenience fallback for the case where one happens
+        // to sit next to the page; the normal path is the "Load graph..."
+        // button, which reads a file picked from anywhere on disk.
+        function loadGraph(g) {
+            stopPlay();
+            stopLoopFlow(false);
+            if (cy) cy.destroy();
+            traceData = []; traceIdx = -1;
+            document.getElementById('trace-list').innerHTML =
+                '<p style="padding:8px 10px;color:#6c7086;font-size:11px">Click Play to load & animate.</p>';
+            document.getElementById('info').innerHTML = 'Click a node for details.';
+            initCy([...g.nodes, ...g.edges]);
+        }
+
+        fetch('graph.json', { cache: 'no-store' }).then(r => r.json()).then(g => {
+            loadGraph(g);
+        }).catch(() => { document.getElementById('status').textContent = 'No graph loaded — use "Load graph…".'; });
+
+        document.getElementById('btn-load-graph').addEventListener('click', () => {
+            document.getElementById('graph-file-input').click();
+        });
+        document.getElementById('graph-file-input').addEventListener('change', e => {
+            const file = e.target.files[0];
+            e.target.value = '';
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = () => {
+                let g;
+                try { g = JSON.parse(reader.result); }
+                catch { document.getElementById('status').textContent = `ERROR: ${file.name} is not valid JSON`; return; }
+                loadGraph(g); // sets #status to the new node/edge count
+            };
+            reader.readAsText(file);
+        });
+
+        document.getElementById('btn-load-doc').addEventListener('click', () => {
+            document.getElementById('doc-file-input').click();
+        });
+        document.getElementById('doc-file-input').addEventListener('change', e => {
+            const file = e.target.files[0];
+            e.target.value = '';
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = () => {
+                try { sourceIndex = JSON.parse(reader.result); }
+                catch { document.getElementById('status').textContent = `ERROR: ${file.name} is not valid JSON`; return; }
+                document.getElementById('status').textContent = `Loaded doc index: ${file.name}`;
+            };
+            reader.readAsText(file);
+        });
+
+        function renderTrace(spans) {
+            // Determine which spans have children
+            const hasChildren = new Set();
+            for (let i = 0; i < spans.length - 1; i++) {
+                if (spans[i + 1].depth > spans[i].depth) hasChildren.add(i);
+            }
+            const collapsed = new Set(); // indices whose children are hidden
+
+            const ul = document.getElementById('trace-list');
+            ul.innerHTML = spans.map((s, i) => {
+                const iters = s.iterations > 1 ? `<span class="sp-iter">x${s.iterations} | ${s.total_ms}ms</span>` : '';
+                const tog = hasChildren.has(i)
+                    ? `<span class="sp-toggle" data-i="${i}">&#9660;</span>`
+                    : `<span class="sp-pad"></span>`;
+                return `<div class="sp" id="sp-${i}" data-i="${i}" data-depth="${s.depth}">
+      ${tog}${'&nbsp;'.repeat(s.depth * 2)}<span class="sp-name">${s.name}</span>
+      <span class="sp-ms">${s.duration_ms}ms</span>${iters}</div>`;
+            }).join('');
+
+            // Click on span row → stepTo
+            ul.querySelectorAll('.sp').forEach(el =>
+                el.addEventListener('click', ev => {
+                    if (ev.target.classList.contains('sp-toggle')) return;
+                    stepTo(+el.dataset.i);
+                })
+            );
+
+            // Toggle collapse/expand
+            ul.querySelectorAll('.sp-toggle').forEach(tog => {
+                tog.addEventListener('click', e => {
+                    e.stopPropagation();
+                    const pi = +tog.dataset.i;
+                    const pd = spans[pi].depth;
+                    const isNowCollapsed = !collapsed.has(pi);
+                    if (isNowCollapsed) collapsed.add(pi); else collapsed.delete(pi);
+                    tog.innerHTML = isNowCollapsed ? '&#9658;' : '&#9660;';
+                    for (let j = pi + 1; j < spans.length; j++) {
+                        if (spans[j].depth <= pd) break;
+                        const el = document.getElementById(`sp-${j}`);
+                        if (el) el.style.display = isNowCollapsed ? 'none' : '';
+                    }
+                });
+            });
+
+            // Set loop_call edge labels
+            spans.forEach(s => {
+                if (s.iterations > 1) {
+                    cy.edges().filter(ed => ed.data('target') === s.name && ed.data('edgeType') === 'loop_call')
+                        .data('iterLabel', `x${s.iterations} | ${s.total_ms}ms`);
+                }
+            });
+        }
+
+        function stepTo(idx) {
+            if (!cy || !traceData.length) return;
+            clearAll();
+            for (let i = 0; i <= idx; i++) {
+                const span = traceData[i], isCur = i === idx;
+                const isLast = isCur && idx === traceData.length - 1;
+                cy.getElementById(span.name).addClass(isLast ? 'last-step' : isCur ? 'current' : 'visited');
+                document.getElementById(`sp-${i}`)?.classList.add(isCur ? 'current' : 'visited');
+                const fullPath = [...(span.stack || []), span.name];
+                const loopCurEdges = [];
+                for (let j = 1; j < fullPath.length; j++) {
+                    const src = fullPath[j - 1], tgt = fullPath[j];
+                    const e = cy.edges().filter(ed => ed.data('source') === src && ed.data('target') === tgt);
+                    if (!e.length) continue;
+                    if (e.data('edgeType') === 'loop_call') {
+                        if (isCur) {
+                            loopCurEdges.push(e); // will animate below
+                        } else {
+                            // Visited loop_call: solid green
+                            e.style({ 'line-color': '#a6e3a1', 'target-arrow-color': '#a6e3a1', 'line-style': 'solid', 'opacity': 1, 'width': 3 });
+                        }
+                    } else {
+                        const col = isLast ? '#cba6f7' : isCur ? '#f38ba8' : '#a6e3a1';
+                        e.style({ 'line-color': col, 'target-arrow-color': col, 'opacity': 1, 'width': isCur ? 5 : 3 });
+                    }
+                }
+                // Start flowing animation on loop_call edges entering current span
+                if (loopCurEdges.length) {
+                    const combined = loopCurEdges.reduce((acc, e) => acc.merge(e), cy.collection());
+                    const iters = (traceData[idx].iterations || 1);
+                    flashLoopEdge(combined, iters);
+                }
+            }
+            traceIdx = idx;
+            document.getElementById(`sp-${idx}`)?.scrollIntoView({ block: 'nearest' });
+            const node = cy.getElementById(traceData[idx].name);
+            if (node.length) cy.animate({ center: { eles: node } }, { duration: 250 });
+            const span = traceData[idx];
+            const nodeData = node.length ? node.data() : {};
+            document.getElementById('info').innerHTML = buildInfoHtml(span.name, nodeData, span);
+        }
+
+        function clearAll() {
+            stopLoopFlow(false);
+            cy?.nodes().removeClass('visited current last-step');
+            cy?.edges().removeStyle();
+            document.querySelectorAll('.sp').forEach(el => el.classList.remove('visited', 'current'));
+        }
+
+        function applyTraceSpans(spans) {
+            traceData = spans.filter(s => cy?.getElementById(s.name).length);
+            renderTrace(traceData);
+            traceIdx = -1; clearAll();
+        }
+
+        function loadTrace() {
+            return fetch('trace.json', { cache: 'no-store' }).then(r => r.json()).then(t => {
+                applyTraceSpans(t.spans);
+                return true;
+            });
+        }
+
+        // ── Load an arbitrary trace file (raw trace_output.jsonl or pre-parsed
+        // trace.json) to analyze a specific run without touching viewer/trace.json ──
+        function parseUs(s) {
+            s = (s || '').trim();
+            const m = /^([\d.]+)\s*([a-zµ]+)/i.exec(s);
+            if (!m) return 0;
+            const v = parseFloat(m[1]), u = m[2].toLowerCase();
+            if (u.includes('n')) return v / 1000;
+            if (s.includes('µ') || u.includes('us')) return v;
+            if (u.startsWith('m')) return v * 1000;
+            if (u.startsWith('s')) return v * 1000000;
+            return v;
+        }
+
+        function parseTraceJsonl(text) {
+            const closeStats = {}, newEvents = [];
+            for (const line of text.split('\n')) {
+                const t = line.trim();
+                if (!t) continue;
+                let entry;
+                try { entry = JSON.parse(t); } catch { continue; }
+                const fields = entry.fields || {};
+                const spanInfo = entry.span || {};
+                const spanStack = entry.spans || [];
+                const name = spanInfo.name || '';
+                if (!name) continue;
+                if ('time.busy' in fields) {
+                    const us = parseUs(fields['time.busy']);
+                    if (!closeStats[name]) closeStats[name] = { count: 0, total_us: 0 };
+                    closeStats[name].count++;
+                    closeStats[name].total_us += us;
+                } else {
+                    newEvents.push({ name, depth: spanStack.length, stack: spanStack.map(s => s.name || '') });
+                }
+            }
+            const seen = new Set(), deduped = [];
+            for (const ev of newEvents) {
+                if (seen.has(ev.name)) continue;
+                seen.add(ev.name);
+                const st = closeStats[ev.name] || { count: 1, total_us: 0 };
+                ev.iterations = st.count;
+                ev.total_ms = Math.round(st.total_us / 1000 * 10000) / 10000;
+                ev.duration_ms = ev.total_ms;
+                deduped.push(ev);
+            }
+            return deduped;
+        }
+
+        document.getElementById('btn-load-trace').addEventListener('click', () => {
+            document.getElementById('trace-file-input').click();
+        });
+        document.getElementById('trace-file-input').addEventListener('change', e => {
+            const file = e.target.files[0];
+            e.target.value = '';
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = () => {
+                const text = reader.result;
+                let spans = null;
+                try {
+                    const parsed = JSON.parse(text);
+                    if (parsed && Array.isArray(parsed.spans)) spans = parsed.spans;
+                } catch { /* not a single JSON object -> try JSONL below */ }
+                if (!spans) spans = parseTraceJsonl(text);
+                stopPlay();
+                applyTraceSpans(spans);
+                document.getElementById('status').textContent = `Loaded ${file.name}: ${spans.length} spans`;
+            };
+            reader.readAsText(file);
+        });
+
+        // ── Return path helpers ────────────────────────────────────────────────
+        function computeReturnPath(prevSpan, currSpan) {
+            const pathPrev = [...(prevSpan.stack || []), prevSpan.name];
+            const pathCurr = [...(currSpan.stack || []), currSpan.name];
+            let common = 0;
+            while (common < Math.min(pathPrev.length, pathCurr.length) &&
+                pathPrev[common] === pathCurr[common]) common++;
+            if (common >= pathPrev.length) return []; // going deeper, no return
+            // Nodes to unwind: deepest first, up to common ancestor
+            const toUnwind = pathPrev.slice(common).reverse();
+            const ancestor = pathPrev[common - 1];
+            return [...toUnwind, ancestor]; // e.g. ["from_json","load_input","main"]
+        }
+
+        function flashReturnPath(returnPath, callback) {
+            if (returnPath.length <= 1) { callback(); return; }
+
+            const STEP_MS = animStep;
+            const HOLD_MS = animHold;
+            const allEdges = [], allNodes = [];
+            let step = 0;
+
+            function animateStep() {
+                if (step >= returnPath.length - 1) {
+                    // All steps done → Phase 2: yellow hold on common ancestor
+                    const ancestor = returnPath[returnPath.length - 1];
+                    const ancNode = cy.getElementById(ancestor);
+                    if (ancNode.length) {
+                        ancNode.style({ 'background-color': '#f9e2af', 'border-color': '#fab387', 'border-width': 3 });
+                        cy.animate({ center: { eles: ancNode } }, { duration: 200 });
+                    }
+                    setTimeout(() => {
+                        allEdges.forEach(e => e.removeStyle());
+                        allNodes.forEach(n => n.removeStyle());
+                        if (ancNode.length) ancNode.removeStyle();
+                        callback();
+                    }, HOLD_MS);
+                    return;
+                }
+
+                const child = returnPath[step];
+                const parent = returnPath[step + 1];
+
+                // Reverse arrow: edge goes parent→child in graph, show return direction
+                const e = cy.edges().filter(ed =>
+                    ed.data('source') === parent && ed.data('target') === child);
+                if (e.length) {
+                    e.style({
+                        'line-color': '#f9e2af', 'source-arrow-color': '#f9e2af',
+                        'source-arrow-shape': 'triangle', 'target-arrow-shape': 'none',
+                        'opacity': 1, 'width': 4
+                    });
+                    allEdges.push(e);
+                }
+                const n = cy.getElementById(child);
+                if (n.length) {
+                    n.style({ 'background-color': '#f9e2af' });
+                    cy.animate({ center: { eles: n } }, { duration: 150 });
+                    allNodes.push(n);
+                }
+
+                step++;
+                setTimeout(animateStep, STEP_MS);
+            }
+
+            animateStep();
+        }
+
+        // ── Final unwind: from the last traced span all the way back to main ────
+        // Triggered by an extra "Step >" click once the trace is fully played.
+        function finishTraceToRoot() {
+            const last = traceData[traceIdx];
+            const rp = computeReturnPath(last, { name: 'main', stack: [] });
+            const settle = () => {
+                for (let i = 0; i < rp.length - 1; i++) {
+                    const child = rp[i], parent = rp[i + 1];
+                    const e = cy.edges().filter(ed => ed.data('source') === parent && ed.data('target') === child);
+                    if (e.length) e.style({ 'line-color': '#a6e3a1', 'target-arrow-color': '#a6e3a1', 'opacity': 1, 'width': 3 });
+                }
+                cy.getElementById(last.name).removeClass('last-step current').addClass('visited');
+                document.getElementById(`sp-${traceIdx}`)?.classList.add('visited');
+                traceIdx = traceData.length; // sentinel: fully unwound, nothing more to step through
+            };
+            if (rp.length > 1) flashReturnPath(rp, settle); else settle();
+        }
+
+        // ── Play / pause / step ───────────────────────────────────────────────
+
+        function playStep() {
+            if (!playActive) return;
+            if (traceIdx === traceData.length - 1) { finishTraceToRoot(); stopPlay(); return; }
+            traceIdx++;
+            if (traceIdx >= traceData.length) { stopPlay(); return; }
+            const proceed = () => {
+                stepTo(traceIdx);
+                if (playActive) playTimeout = setTimeout(playStep, animPlay);
+            };
+            if (traceIdx > 0) {
+                const rp = computeReturnPath(traceData[traceIdx - 1], traceData[traceIdx]);
+                if (rp.length > 1) { flashReturnPath(rp, proceed); return; }
+            }
+            proceed();
+        }
+
+        function stopPlay() {
+            playActive = false;
+            clearTimeout(playTimeout); playTimeout = null;
+            document.getElementById('btn-play').disabled = false;
+            document.getElementById('btn-pause').disabled = true;
+        }
+
+        document.getElementById('btn-play').addEventListener('click', () => {
+            if (playActive) return;
+            const startPlay = () => {
+                playActive = true;
+                document.getElementById('btn-play').disabled = true;
+                document.getElementById('btn-pause').disabled = false;
+                playStep();
+            };
+            if (!traceData.length) loadTrace().then(startPlay);
+            else startPlay();
+        });
+
+        document.getElementById('btn-pause').addEventListener('click', stopPlay);
+
+        document.getElementById('btn-step').addEventListener('click', () => {
+            if (!traceData.length) { loadTrace().then(() => { if (traceData.length) { traceIdx = 0; stepTo(0); } }); return; }
+            if (traceIdx === traceData.length - 1) { finishTraceToRoot(); return; }
+            if (traceIdx + 1 >= traceData.length) return;
+            const nextIdx = traceIdx + 1;
+            const doStep = () => setTimeout(() => stepTo(nextIdx), animPlay);
+            if (traceIdx >= 0) {
+                const rp = computeReturnPath(traceData[traceIdx], traceData[nextIdx]);
+                if (rp.length > 1) { flashReturnPath(rp, doStep); return; }
+            }
+            doStep();
+        });
+
+        document.getElementById('btn-step-prev').addEventListener('click', () => {
+            stopPlay();
+            if (!traceData.length || traceIdx <= 0) return;
+            stepTo(traceIdx - 1);
+        });
+
+        document.getElementById('btn-reset').addEventListener('click', () => {
+            stopPlay(); traceIdx = -1; clearAll();
+        });
+
+        document.getElementById('btn-untraced').addEventListener('click', () => applyUntracedVisibility(!showUntraced));
+
+        document.getElementById('btn-relayout').addEventListener('click', () => {
+            if (!cy) return;
+            const rootId = cy.getElementById('main').length ? 'main' : undefined;
+            cy.layout({ name: 'breadthfirst', directed: true, roots: rootId ? [rootId] : undefined, spacingFactor: 2.8, avoidOverlap: true, padding: 60, animate: true }).run();
+        });
+
+        // ── Config bar ────────────────────────────────────────────────────────
+        document.getElementById('btn-config').addEventListener('click', () => {
+            document.getElementById('config-bar').classList.toggle('open');
+        });
+        function wireSlider(id, valId, setter) {
+            const s = document.getElementById(id);
+            const v = document.getElementById(valId);
+            s.addEventListener('input', () => { setter(+s.value); v.textContent = s.value + ' ms'; });
+        }
+        wireSlider('cfg-play', 'cfg-play-val', val => animPlay = val);
+        wireSlider('cfg-step', 'cfg-step-val', val => animStep = val);
+        wireSlider('cfg-hold', 'cfg-hold-val', val => animHold = val);
+
+        // ── Resizable sidebar (overlay technique) ─────────────────────────────
+        function makeResizable(handleId, panelId, direction) {
+            const handle = document.getElementById(handleId);
+            const panel = document.getElementById(panelId);
+            if (!handle || !panel) return;
+            handle.addEventListener('mousedown', e => {
+                e.preventDefault();
+                e.stopPropagation();
+                const overlay = document.createElement('div');
+                overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:9999;cursor:ew-resize';
+                document.body.appendChild(overlay);
+                panel.style.transition = 'none';
+                const startX = e.clientX;
+                const startW = panel.getBoundingClientRect().width;
+                overlay.addEventListener('mousemove', ev => {
+                    const dx = ev.clientX - startX;
+                    const newW = direction === 'right'
+                        ? Math.max(140, Math.min(700, startW - dx))
+                        : Math.max(100, Math.min(600, startW + dx));
+                    panel.style.width = newW + 'px';
+                    panel.style.flexBasis = newW + 'px';
+                    // NO cy.resize() here — triggers Cytoscape re-render that blocks expansion
+                });
+                overlay.addEventListener('mouseup', () => {
+                    document.body.removeChild(overlay);
+                    panel.style.transition = '';
+                    cy?.resize(); // single resize after drag ends
+                });
+            });
+        }
+        makeResizable('rh-right', 'sidebar', 'right');
+    </script>
+</body>
+
+</html>

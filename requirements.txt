@@ -1,0 +1,5 @@
+# rust-codemap currently uses only the Python standard library
+# (re, json, argparse, subprocess, http.server, pathlib) -- nothing to
+# install. This file is kept so tooling/CI that expects a requirements.txt
+# has one, and as the natural place to add a dependency if one becomes
+# necessary later.
