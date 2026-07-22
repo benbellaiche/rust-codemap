@@ -6,7 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 An interactive call-graph viewer for Rust codebases, with execution replay
 from real `tracing` logs. It is a standalone, generic tool: it must work
-against **any** Rust binary crate, with zero hardcoded knowledge of that
+against **any** Rust crate, binary or library, standalone or with local
+(path) dependencies merged in, with zero hardcoded knowledge of that
 crate's module names, type names, or file layout. This constraint ("zero
 mapping") is the main design principle running through the codebase — see
 "Design constraints" below before adding anything that special-cases a
@@ -24,14 +25,16 @@ Run from the repo root. `--project <path>` always points at some *other*
 Rust crate on disk (there is no target crate committed to this repo).
 
 ```sh
-python -m codemap run   --project <path> (--bin <name> | --lib)   # graph + doc + serve, one shot
-python -m codemap graph --project <path> (--bin <name> | --lib)   # cargo rustc --emit=mir -> <target_dir>/rust-codemap/<crate>/graph.json
-python -m codemap doc   --project <path>                          # cargo doc -> <target_dir>/rust-codemap/<crate>/source_index.json
-python -m codemap trace --input <path-to-jsonl-log>                # -> trace.json (or <target_dir>/rust-codemap/<crate>/ with --project)
-python -m codemap serve                                             # http://localhost:8787/, serves viewer/ ONLY (no project data)
+python -m codemap run   --project <path>                # graph + doc + serve, one shot
+python -m codemap graph --project <path>                 # -> <target_dir>/rust-codemap/<crate>/graph.json
+python -m codemap doc   --project <path>                  # -> <target_dir>/rust-codemap/<crate>/source_index.json
+python -m codemap trace --input <path-to-jsonl-log>         # -> trace.json (or <target_dir>/rust-codemap/<crate>/ with --project)
+python -m codemap serve                                       # http://localhost:8787/, serves viewer/ ONLY (no project data)
 ```
 
-`--bin <name>` and `--lib` are mutually exclusive (argparse enforces this).
+No `--bin`/`--lib`: dropped entirely once MIR generation stopped needing
+cargo told which target to build (see "Multi-crate merging" below) — the
+flag became purely vestigial and keeping it would just be clutter.
 `<target_dir>` is the *target* crate's own `cargo metadata` target
 directory, not anything under this repo — see "Design constraints" below.
 `<crate>` is that crate's own name (underscored), via `crate_name()` --
@@ -44,15 +47,25 @@ fetches project-specific files automatically as the primary path; use its
 whatever `graph`/`doc`/`trace` (or `run`) just wrote.
 
 There is no test suite yet. To sanity-check a change to `codemap/`, run the
-commands above against `../dummy-lib/{dummy-core,dummy-ops,dummy-api}`
-(`--lib`, a sibling repo purpose-built as a multi-crate test fixture — see
-PROJECT.md §2.7 and its own README) and confirm `graph`/`doc` produce sane,
-non-empty output per crate under its own `target/rust-codemap/<crate>/`
-subdirectory (not overwriting a sibling crate's output at the same path).
-For `--bin` and execution replay, use a real instrumented binary crate
-(e.g. `../sandbox/tools-codemap` in the outer repo). Then open the viewer,
-use the "Load…" buttons, and check the graph renders and Play/Step works.
-Note execution replay is only meaningful for `--bin` today (see
+commands above against:
+- `../dummy-lib/{dummy-core,dummy-ops,dummy-api}` — a sibling repo
+  purpose-built as a multi-crate (library-only) test fixture, see
+  PROJECT.md §2.7 and its own README. Confirm `graph`/`doc` merge all 3
+  crates when pointed at `dummy-api`, but only `{dummy-ops, dummy-core}`
+  when pointed at `dummy-ops` (dummy-api depends on dummy-ops, not the
+  reverse -- it must NOT show up).
+- `../dummy-cli` — a standalone binary depending on `dummy-lib/dummy-api`
+  by path, kept *outside* the dummy-lib workspace on purpose. Pointing at
+  it should resolve to `{dummy-cli, dummy-api, dummy-ops, dummy-core}`;
+  pointing at any `dummy-lib` crate should never pull `dummy-cli` in (it
+  depends on them, they don't depend on it) -- this exact regression
+  happened once already (PROJECT.md §3, bug #4).
+
+For execution replay, use a real instrumented binary crate (e.g.
+`../sandbox/tools-codemap` in the outer repo -- but see PROJECT.md §2.7 for
+a caveat about that one's own workspace). Then open the viewer, use the
+"Load…" buttons, and check the graph renders and Play/Step works. Note
+execution replay is only meaningful for a binary target today (see
 "Design constraints").
 
 ## Architecture
@@ -71,13 +84,33 @@ Note execution replay is only meaningful for `--bin` today (see
    side and the viewer only communicate through those three JSON files —
    there is no other coupling.
 
+### `codemap/__main__.py` — multi-crate dependency resolution
+
+`local_dependency_closure()` is the piece that decides *which* crates get
+merged into the graph. It is deliberately **not** "every member of the
+workspace the target crate happens to live in" (`cargo metadata --no-deps`)
+— that was the first design, and it was wrong: it swept in unrelated
+sibling crates and, worse, client binaries that depend **on** the target
+crate rather than the other way around (see PROJECT.md §3 bug #4, and
+`dummy-cli` in §2.7, which exists specifically to catch a regression here).
+Instead it calls `cargo metadata` **without** `--no-deps` to get the
+dependency-resolution graph (`resolve.nodes[].deps`), then walks only the
+*forward* edges from the target's own node, keeping just the `path+file://`
+(local) ones. `cmd_graph` and `cmd_doc` both use this same closure — do not
+let them drift apart; `cmd_doc` in particular needs, per crate in the
+closure, that crate's *own* `src/` directory for resolving source links,
+not the target crate's (`doc_index.build_index()` takes a list of
+`(doc_root, src_root)` pairs for exactly this reason).
+
 ### `codemap/mir_graph.py` — how the call-graph is actually extracted
 
-This is the part most likely to need care when changed. It parses the
-*text* output of `cargo rustc --bin <name> -- --emit=mir` with regexes —
-there is no AST and no dependency on rustc's internals beyond the stability
-of its MIR pretty-printer output. Load-bearing assumptions (all rely on
-rustc behavior, not on any specific project):
+This is the part most likely to need care when changed. It parses MIR
+*text* (produced via `cargo build -p <crate> ...` with
+`RUSTFLAGS=--emit=mir`, one invocation per crate in the dependency closure
+above, texts simply concatenated before parsing) with regexes — there is no
+AST and no dependency on rustc's internals beyond the stability of its MIR
+pretty-printer output. Load-bearing assumptions (all rely on rustc
+behavior, not on any specific project):
 
 - Free functions defined in the crate being compiled are always **local**
   (anything from another crate is fully path-qualified with that other

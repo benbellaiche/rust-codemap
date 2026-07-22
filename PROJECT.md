@@ -36,8 +36,13 @@ A generic, project-agnostic tool that, for **any Rust codebase**:
 
 ### 2.1 Call-graph generation (`mir_graph.py`)
 
-- Input: Rust MIR text, produced via `cargo rustc --bin <bin> -- --emit=mir`
-  (invoked automatically by `codemap.py graph`, see §2.4).
+- Input: Rust MIR text. Originally produced per-crate via `cargo rustc
+  --bin/--lib <name> -- --emit=mir`; now produced for the target crate AND
+  every crate it locally depends on, via `RUSTFLAGS=--emit=mir cargo build
+  -p <each>` (invoked automatically by `codemap graph`, see §2.4) — the
+  resulting texts are simply concatenated before parsing, so cross-crate
+  edges resolve the same way same-crate ones do, with no separate "merge N
+  graphs" step in this module.
 - Parses MIR line-by-line with regex to extract function/method definitions
   and call edges — no AST/type-checker dependency, no external tool beyond
   `rustc` itself.
@@ -143,6 +148,46 @@ deeper: `.../rust-codemap/<crate_name>/graph.json` (mirroring, again, how
 `crate_name()` in `__main__.py` — same derivation `doc` already used to
 find `target/doc/<crate>/`, now reused for the output directory too.
 
+**Multi-crate merging** (`graph`/`doc`, `local_dependency_closure()` in
+`__main__.py`). `graph`/`doc` no longer take `--bin`/`--lib` at all — MIR
+generation via `RUSTFLAGS=--emit=mir` doesn't need cargo told which target
+to build (unlike the old `cargo rustc --bin/--lib -- --emit=mir`, which
+only ever applied to one directly-invoked target), so the flag became
+purely vestigial and was dropped. Instead: resolve the target crate's own
+*transitive local dependency graph* via `cargo metadata` (full resolution,
+not `--no-deps`), then `cargo build -p <each local dep>` with
+`RUSTFLAGS=--emit=mir`, then concatenate and parse every one's MIR
+together (see §2.1).
+
+This went through two designs before landing:
+1. First attempt: `cargo metadata --no-deps`'s package list (= every member
+   of the workspace the target belongs to) + `cargo build --workspace`.
+   Worked for `dummy-lib` (whose 3 crates form a clean dependency chain)
+   but was **wrong**: pointed at a real project, it swept in sibling crates
+   that were merely in the same workspace but unrelated, *and* — the
+   actually-reported bug — client binaries that depend **on** the target
+   crate (the reverse direction), which have no business being in its
+   call-graph at all.
+2. Fixed by switching from "every workspace member" to "the target's own
+   dependency closure": `cargo metadata` (this time WITH full dependency
+   resolution) returns a `resolve` graph — walk only the forward `deps`
+   edges from the target's own node, keep only `path+file://` (local)
+   package ids. Verified concretely on `dummy-lib`: pointing at `dummy-ops`
+   correctly resolves to `{dummy-ops, dummy-core}` and excludes
+   `dummy-api`, which depends on `dummy-ops`, not the other way around.
+   `cargo build`/`cargo doc` now take explicit `-p <name>` for exactly this
+   set, instead of `--workspace` — also faster, since unrelated siblings
+   are never even compiled.
+
+`cmd_doc` needed the identical fix in parallel (it was still iterating
+`--no-deps`'s full workspace-member list, and — a second bug found from
+actually using this — was still cross-referencing every OTHER crate's docs
+using the *target* crate's own `src/` directory, so source links/paths for
+functions in a different crate resolved against the wrong file entirely).
+`doc_index.build_index()`'s signature changed from a single `(doc_root,
+src_root)` to a list of them, one pair per crate in the closure, precisely
+so each crate's items resolve against that crate's own `src/`.
+
 ### 2.5 Viewer (`viewer/index.html`, Cytoscape.js)
 
 - **Central frame**: the call-graph itself (breadthfirst layout, re-layout
@@ -212,17 +257,31 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
 
 ### 2.7 Test fixtures
 
-- `be-quant/sandbox/tools-codemap` (`--bin`) and `be-quant/quant-pricing`
-  (`--lib`, trivial single-file crate) — the two real projects used so far
-  to validate single-crate extraction.
+- `be-quant/sandbox/tools-codemap` and `be-quant/quant-pricing` (trivial
+  single-file lib) — the two real single-crate projects used to validate
+  basic (non-multi-crate) extraction. Note `sandbox/tools-codemap` is
+  itself a member of a larger workspace (`sandbox/`) alongside several
+  unrelated learning-exercise crates — a real-world case of exactly the
+  "workspace member ≠ dependency" problem described in §2.4, not yet
+  re-verified against it (deliberately out of scope for a session; treat
+  as untested until it is).
 - `be-quant/dummy-lib` — a purpose-built, deliberately trivial 3-crate
-  workspace (`dummy-core` → `dummy-ops` → `dummy-api`) for testing
-  multi-crate scenarios: a trait implemented across two different crates
-  (dynamic dispatch), a free function called from two different crates
-  (static dispatch), a deliberately uninstrumented function, and a
-  cross-crate node-id collision (two unrelated `Item::describe`). See its
-  own `README.md`. Analyzing it one crate at a time (before any cross-crate
-  merging exists) is what surfaced the three MIR-parsing bugs below.
+  **library-only** workspace (`dummy-core` → `dummy-ops` → `dummy-api`)
+  for testing multi-crate scenarios: a trait implemented across two
+  different crates (dynamic dispatch), a free function called from two
+  different crates (static dispatch), a deliberately uninstrumented
+  function, and a cross-crate node-id collision (two unrelated
+  `Item::describe`). See its own `README.md`. Analyzing it one crate at a
+  time (before any cross-crate merging existed) is what surfaced the three
+  MIR-parsing bugs in §3.
+- `be-quant/dummy-cli` — a trivial standalone binary (deliberately **not**
+  a member of the `dummy-lib` workspace) whose `main()` calls
+  `dummy_api::run_report(...)` via a path dependency across into
+  `dummy-lib/dummy-api`. Kept separate on purpose: it's what exposed the
+  "workspace member ≠ dependency" bug in §2.4 (pointing at `dummy-lib`
+  crates was, for a while, pulling in whatever depended on them too) and
+  now serves as the fixture for the reverse-dependency case specifically,
+  independent of dummy-lib's pure-library scenario.
 
 ## 3. Points to fix
 
@@ -252,6 +311,27 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
      free_fn" reference apart from a genuine "Type::method" one -- done via
      Rust's own naming convention (lowercase first segment = module/crate,
      uppercase = Type), not a hardcoded list.
+
+  Two more, found once cross-crate merging existed and `dummy-cli` (§2.7)
+  was added to exercise it -- not MIR-parsing bugs, but CLI-level bugs in
+  the same spirit (a heuristic that happened to work on the fixture that
+  motivated it, but was wrong in general):
+  4. **"Workspace member" was used as a stand-in for "dependency"**: the
+     first multi-crate design built the graph for every member of the
+     target's workspace (via `cargo metadata --no-deps` + `cargo build
+     --workspace`). Fine for `dummy-lib` alone (a clean 3-crate dependency
+     chain), wrong in general -- it also sweeps in unrelated sibling crates
+     *and* client binaries that depend **on** the target rather than the
+     other way around (exactly what `dummy-cli` was added to catch). Fixed
+     by resolving the target's actual transitive dependency graph instead
+     (`local_dependency_closure()`, §2.4).
+  5. **`cmd_doc` cross-referenced every crate's docs against the wrong
+     `src/`**: even after `graph` started merging crates, `doc` was still
+     only docing the one `--project` crate and, for the others, resolving
+     their source links against *that* crate's `src/` directory instead of
+     their own. Fixed alongside #4 -- `doc_index.build_index()` now takes a
+     list of `(doc_root, src_root)` pairs, one per crate in the same
+     dependency closure `graph` uses.
 
   Still genuinely untested: generics/monomorphization noise, async fns,
   deeply nested/chained closures, recursive functions, iterator chains
@@ -291,17 +371,27 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
   keep MIR as the sole mechanism or consider alternatives (`syn`-based
   source parsing, DWARF) later.
 - **Scope of "any Rust code."** ~~Single binary crate only, or also
-  libraries~~ **Partially settled**: `graph`/`doc`/`run` now accept `--lib`
-  as well as `--bin` (`mir_graph.py` never assumed a binary in the first
-  place — the CLI's `--bin`-only requirement was the actual restriction,
-  plus the viewer's layout hardcoding `roots: ['main']`, now conditional on
-  that node actually existing). Execution replay is explicitly **not**
-  covered by this — `finishTraceToRoot()` still assumes the trace's root
-  span is named `main`, which nothing guarantees for a library (there's no
-  language-mandated entry point to key off of, unlike `fn main`). Still
-  fully open: multi-crate workspaces as a single combined graph (today each
-  `--project` is one crate, workspace member or not, analyzed alone), and
-  sync-only vs. `async fn`/multi-threaded tracing.
+  libraries~~ ~~multi-crate workspaces as a single combined graph~~
+  **Settled, both**: `graph`/`doc`/`run` no longer even ask (`--bin`/`--lib`
+  were dropped entirely, see §2.4) — `mir_graph.py` never assumed a binary,
+  and the viewer's layout hardcoding `roots: ['main']` is now conditional
+  on that node existing. Multi-crate merging is real and working (§2.4,
+  §2.7), scoped to the target's actual dependency closure. Execution
+  replay is explicitly **not** covered by either of these —
+  `finishTraceToRoot()` still assumes the trace's root span is named
+  `main`, which nothing guarantees for a library, and replaying a trace
+  that spans multiple crates hasn't been considered at all. Still fully
+  open: sync-only vs. `async fn`/multi-threaded tracing.
+- **Cross-crate node-id collision — leave as a known limitation, or
+  disambiguate?** Confirmed on `dummy-lib` (§2.7): two different crates'
+  same-named `Type::method` (or free function) silently merge into one
+  graph node once merged, with no signal that it happened. Options: (a)
+  leave it, document it (current state); (b) detect the collision and
+  surface it somehow (viewer warning, CLI warning at generation time); (c)
+  qualify node ids by crate name to prevent it structurally -- but that's
+  a bigger change (ids are currently bare/`Type::method` everywhere: the
+  viewer, `doc_index.py`'s node lookup, `main`-detection for layout, all of
+  it) and would need its own design pass, not a quick fix.
 - **Call-stack/timing frame — new visualization or evolve the existing
   one?** The sidebar's "Execution Trace" list already shows per-span
   duration and iteration counts, but flat. Still open whether the dedicated
@@ -363,3 +453,12 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
   development; `cache: 'no-store'` on internal fetches fixed it. Worth
   applying the same treatment to any new fetch added later (e.g. for the
   doc frame).
+- A recurring shape of bug in this project: a heuristic that's correct on
+  the *specific fixture* that motivated it, but wrong in general --
+  `INCLUDE_MODULES`, "every workspace member = a dependency" (§2.4), and
+  `cmd_doc`'s single-`src_root` assumption were all like this. The fix each
+  time was the same move: test against a *second*, deliberately different
+  fixture that stresses the assumption differently (a crate-root `impl`, a
+  reverse-dependency binary) rather than trusting that one working example
+  generalizes. `dummy-cli` (§2.7) exists specifically because `dummy-lib`
+  alone couldn't have caught the reverse-dependency bug.

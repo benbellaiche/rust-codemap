@@ -3,11 +3,12 @@
 An interactive call-graph viewer for Rust codebases, with execution replay
 from real `tracing` logs.
 
-Point it at any Rust binary crate and it will:
+Point it at any Rust crate (binary or library) and it will:
 
 1. Extract the call-graph (who calls whom) directly from the compiler's MIR
    output — no source parsing, no per-project configuration, no mapping of
-   module or type names to maintain.
+   module or type names to maintain. If the crate depends on other local
+   (path) crates, their graphs are merged in automatically too.
 2. Let you replay a real run of that binary, if it was instrumented with
    [`tracing`](https://docs.rs/tracing) spans, by loading its log output and
    stepping/animating through the call graph in the order things actually
@@ -67,24 +68,24 @@ straight off disk, no server-side path coordination needed.
 The fastest way to get going, run from this repo's root:
 
 ```sh
-python -m codemap run --project /path/to/target-crate --bin <bin-name>
-# or, to analyze a library crate instead of a binary:
-python -m codemap run --project /path/to/target-crate --lib
+python -m codemap run --project /path/to/target-crate
 ```
 
-This compiles the target crate, extracts the call-graph, cross-references it
-with `cargo doc`, writes both under
+This compiles the target crate (and every local crate it actually depends
+on — see [Multi-crate merging](#multi-crate-merging)), extracts the
+call-graph, cross-references it with `cargo doc`, writes both under
 `<target-crate>/target/rust-codemap/<crate name>/`, starts the viewer, and
-opens it in a browser. The command's own output
-prints the exact file paths — in the viewer toolbar, click **"Load
-graph…"** and pick `graph.json` (and **"Load doc index…"** for
-`source_index.json`) from there.
+opens it in a browser. The command's own output prints the exact file
+paths — in the viewer toolbar, click **"Load graph…"** and pick
+`graph.json` (and **"Load doc index…"** for `source_index.json`) from
+there.
 
-`--bin <name>` and `--lib` are mutually exclusive: pick whichever target of
-the crate you want the call-graph for. A library has no `fn main`, so the
-graph won't have a single obvious entry point (the viewer's layout falls
-back to auto-detecting roots) — see [Known limitations](#known-limitations)
-for what's not yet supported on libraries (namely, execution replay).
+No `--bin`/`--lib` to choose: the target can be either, and it doesn't
+change how the graph is built (see below). A library has no `fn main`, so
+its graph won't have a single obvious entry point (the viewer's layout
+falls back to auto-detecting roots) — see
+[Known limitations](#known-limitations) for what's not yet supported on
+libraries (namely, execution replay).
 
 ### Step by step
 
@@ -92,7 +93,7 @@ Useful when iterating (e.g. regenerating just the graph after a code
 change, without restarting the server):
 
 ```sh
-python -m codemap graph --project /path/to/target-crate --bin <bin-name>  # or --lib
+python -m codemap graph --project /path/to/target-crate
 python -m codemap doc   --project /path/to/target-crate
 python -m codemap serve
 ```
@@ -161,8 +162,8 @@ surprise.
 ## Command reference
 
 ```
-python -m codemap run   --project <path> (--bin <name> | --lib) [--port 8787] [--no-browser]
-python -m codemap graph --project <path> (--bin <name> | --lib) [--out <path>]
+python -m codemap run   --project <path> [--port 8787] [--no-browser]
+python -m codemap graph --project <path> [--out <path>]
 python -m codemap doc   --project <path> [--graph <path>] [--out <path>]
 python -m codemap trace --input <path-to-log> [--project <path>] [--out <path>]
 python -m codemap serve [--dir viewer] [--port 8787]
@@ -171,12 +172,36 @@ python -m codemap serve [--dir viewer] [--port 8787]
 `--out`/`--graph` default to `<target crate>/target/rust-codemap/<crate name>/...` — see
 above. Run any subcommand with `--help` for details.
 
+## Multi-crate merging
+
+If the target crate depends on other crates that live locally (path
+dependencies — e.g. sibling members of the same cargo workspace), their
+call-graphs are merged in automatically: `graph`/`doc` resolve the target's
+own transitive dependency graph via `cargo metadata`, compile each local
+dependency with `RUSTFLAGS=--emit=mir`, and merge every one's MIR into a
+single graph (and doc every one of them too, so cross-references resolve
+correctly no matter which crate a function actually lives in).
+
+This is deliberately the crate's own **dependency closure** — what it
+actually depends on — not "every crate that happens to share its
+workspace". A workspace can contain unrelated sibling projects, or a client
+binary that depends *on* the target crate (rather than the other way
+around); neither belongs in the target's own call-graph, and both are
+correctly excluded by walking `cargo metadata`'s resolved dependency graph
+outward from the target instead of just listing workspace members.
+
+Known limitation: node ids aren't crate-qualified (a function is just
+`name` or `Type::method`, see below), so if two different crates in the
+closure happen to define the same free function name or the same
+`Type::method` pair, they collide into a single graph node. Not yet solved
+— see PROJECT.md.
+
 ## How the call-graph is built
 
-`codemap/mir_graph.py` parses the text output of `cargo rustc --bin <name>
--- --emit=mir` with regular expressions — no AST, no type-checker, no
-external tool beyond `rustc` itself. It handles a few cases a naive "grep
-for calls" would miss:
+`codemap/mir_graph.py` parses MIR text (produced via `cargo build` with
+`RUSTFLAGS=--emit=mir`, see above) with regular expressions — no AST, no
+type-checker, no external tool beyond `rustc` itself. It handles a few
+cases a naive "grep for calls" would miss:
 
 - **Dynamic dispatch** (`&dyn Trait` calls): over-approximated by linking to
   *every* local implementation of that trait method, since MIR alone can't
@@ -207,13 +232,19 @@ for calls" would miss:
 See [PROJECT.md](PROJECT.md) for the full list and the reasoning behind
 each. In short, today:
 
-- Regex-based MIR parsing has only been exercised against small,
-  single-crate, synchronous examples — generics, async fns, multi-crate
-  workspaces, and deeply chained iterator/closure code are untested.
-- The static call-graph (`run`/`graph`/`doc`) works for both binaries
-  (`--bin`) and libraries (`--lib`). Execution replay does not yet: it
-  assumes a trace's root span is named `main`, which only a binary is
-  guaranteed to have.
+- Regex-based MIR parsing has only been exercised against small, mostly
+  synchronous examples — generics, async fns, and deeply chained
+  iterator/closure code are untested. Crate-root `impl` blocks, module-
+  qualified `Self` types, and inconsistently-qualified free functions were
+  bugs found via a dedicated multi-crate test fixture and are now fixed
+  (see PROJECT.md §2.7).
+- The static call-graph (`run`/`graph`/`doc`) works for both binaries and
+  libraries, standalone or with local dependencies merged in. Execution
+  replay does not yet: it assumes a trace's root span is named `main`,
+  which only a binary is guaranteed to have.
+- Cross-crate node-id collisions (see "Multi-crate merging" above) are
+  detected-but-unresolved: two crates' same-named items silently merge into
+  one graph node.
 - All call edges are typed generically as `call` — the distinction between
   a direct call, a dynamic dispatch, and a loop are not yet recovered from
   MIR (the viewer already supports styling `dispatch`/`loop_call`/

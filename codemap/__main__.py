@@ -3,11 +3,13 @@
 Subcommands:
   run     Generate the call-graph + doc index for a target crate and serve
           the viewer, in one step.
-  graph   Build the call-graph for a target crate AND every other crate in
-          its cargo workspace (runs `cargo build --workspace` with
-          `RUSTFLAGS=--emit=mir`, then extracts and merges the graph from
-          every workspace member's MIR dump -- a single, standalone crate
-          is just a one-member workspace, so this covers that case too).
+  graph   Build the call-graph for a target crate AND every crate it
+          actually (transitively) depends on locally -- not merely every
+          crate that happens to share its workspace, which could include
+          unrelated siblings or client binaries that depend on the target
+          rather than the other way around. Runs `cargo build -p <each>`
+          with `RUSTFLAGS=--emit=mir`, then extracts and merges the graph
+          from each one's MIR dump.
   doc     Cross-reference `cargo doc` output with a graph.json, producing
           source_index.json (signatures, doc comments, source links).
   trace   Convert a raw tracing_subscriber JSON-lines log into trace.json.
@@ -69,6 +71,46 @@ def crate_name(manifest: Path) -> str:
     return read_package_name(manifest).replace("-", "_")
 
 
+def local_dependency_closure(manifest: Path) -> list:
+    """Every package in the target crate's own transitive dependency graph
+    that's local (a path dependency, not crates.io/a git registry) --
+    including the target crate itself.
+
+    This is deliberately *not* "every member of the workspace this crate
+    happens to live in" (that was the previous approach, `cargo metadata
+    --no-deps`): a workspace can contain sibling crates unrelated to this
+    one, or -- the case that actually broke -- client binaries that DEPEND
+    ON this crate rather than being depended on BY it. Those must not be
+    swept in just because `cargo build --workspace` would build them too.
+
+    Uses `cargo metadata`'s dependency-resolution graph (no --no-deps this
+    time) and walks only the forward `deps` edges from the target's own
+    node, so it naturally handles both directions correctly."""
+    out = subprocess.run(
+        ["cargo", "metadata", "--format-version", "1", "--manifest-path", str(manifest)],
+        capture_output=True, text=True, check=True,
+    )
+    meta = json.loads(out.stdout)
+    resolve = meta["resolve"]
+    root = resolve["root"]
+    if root is None:
+        sys.exit(f"ERROR: {manifest} has no resolvable root package "
+                  f"(pointing --project at a virtual workspace manifest?)")
+
+    nodes_by_id = {n["id"]: n for n in resolve["nodes"]}
+    closure = set()
+    stack = [root]
+    while stack:
+        pid = stack.pop()
+        if pid in closure:
+            continue
+        closure.add(pid)
+        stack.extend(dep["pkg"] for dep in nodes_by_id[pid]["deps"])
+
+    packages_by_id = {p["id"]: p for p in meta["packages"]}
+    return [packages_by_id[pid] for pid in closure if pid.startswith("path+file://")]
+
+
 def default_out_dir(manifest: Path) -> Path:
     """Where generated artifacts land by default:
     <target_directory>/rust-codemap/<crate_name>/ -- resolved via `cargo
@@ -105,26 +147,24 @@ def find_mir_file(deps_dir: Path, name: str) -> Path | None:
 
 def cmd_graph(args) -> Path:
     manifest = require_manifest(args.project)
-    meta = cargo_metadata(manifest)
-    target_dir = Path(meta["target_directory"])
+    target_dir = Path(cargo_metadata(manifest)["target_directory"])
     out_path = Path(args.out) if args.out else default_out_dir(manifest) / "graph.json"
 
-    # `packages` here is already scoped to workspace members only (cargo
-    # metadata was called with --no-deps) -- this is the *whole* workspace
-    # the target crate belongs to, discovered from pointing at just one of
-    # its members; a standalone (non-workspace) crate is just a workspace
-    # of one, so the same code path covers both.
-    members = [(pkg["name"], pkg["name"].replace("-", "_")) for pkg in meta["packages"]]
-    print(f"Workspace members: {', '.join(n for n, _ in members)}")
+    packages = local_dependency_closure(manifest)
+    members = [(pkg["name"], pkg["name"].replace("-", "_")) for pkg in packages]
+    print(f"Local dependency closure: {', '.join(n for n, _ in members)}")
 
     # cargo rustc --emit=mir only applies to the one crate being directly
-    # built -- RUSTFLAGS applies to every rustc invocation cargo makes,
-    # dependencies included, so --workspace here emits MIR for every member
-    # (and every external dependency too, which is fine: we only ever read
-    # the files matching a workspace member's own name below).
-    print("Building the workspace with RUSTFLAGS=--emit=mir ...")
+    # built -- RUSTFLAGS applies to every rustc invocation cargo makes, so
+    # it reaches every -p we ask for (and their external deps too, which is
+    # fine: we only ever read the files matching one of OUR package names
+    # below). Building just these -p's (not --workspace) also means we
+    # never compile -- and never even glance at -- unrelated sibling crates
+    # or client binaries that merely happen to share the workspace.
+    print("Building with RUSTFLAGS=--emit=mir ...")
     subprocess.run(
-        ["cargo", "build", "--workspace", "--manifest-path", str(manifest)],
+        ["cargo", "build", "--manifest-path", str(manifest),
+         *[a for pkg_name, _ in members for a in ("-p", pkg_name)]],
         check=True, env={**os.environ, "RUSTFLAGS": "--emit=mir"},
     )
 
@@ -138,7 +178,7 @@ def cmd_graph(args) -> Path:
         print(f"  {pkg_name}: {mir_path.name} ({mir_path.stat().st_size // 1024} KB)")
         mir_texts.append(mir_path.read_text(encoding="utf-8", errors="ignore"))
     if not mir_texts:
-        sys.exit(f"ERROR: no .mir file found for any workspace member under {deps_dir}")
+        sys.exit(f"ERROR: no .mir file found for any dependency-closure member under {deps_dir}")
 
     # A single combined text: parse_mir just scans lines, so concatenating
     # every member's MIR and parsing once naturally merges nodes/edges
@@ -156,21 +196,25 @@ def cmd_graph(args) -> Path:
 
 def cmd_doc(args) -> Path:
     manifest = require_manifest(args.project)
-    meta = cargo_metadata(manifest)
-    target_dir = Path(meta["target_directory"])
+    target_dir = Path(cargo_metadata(manifest)["target_directory"])
     default_dir = default_out_dir(manifest)
     graph_path = Path(args.graph) if args.graph else default_dir / "graph.json"
     out_path = Path(args.out) if args.out else default_dir / "source_index.json"
 
-    # graph.json can contain nodes from every workspace member (see `graph`
-    # merging them all) -- doc the whole workspace too, not just the one
-    # crate --project points at, or cross-references for the others would
-    # silently come up empty.
-    print("Running cargo doc --workspace --no-deps ...")
-    subprocess.run(["cargo", "doc", "--workspace", "--no-deps", "--manifest-path", str(manifest)], check=True)
+    # graph.json can contain nodes from any crate in the dependency closure
+    # (see `graph`) -- doc exactly that same set, not the whole workspace
+    # (which could include unrelated siblings or client binaries), or
+    # cross-references for those crates' items would silently come up empty.
+    packages = local_dependency_closure(manifest)
+    print("Running cargo doc --no-deps ...")
+    subprocess.run(
+        ["cargo", "doc", "--no-deps", "--manifest-path", str(manifest),
+         *[a for pkg in packages for a in ("-p", pkg["name"])]],
+        check=True,
+    )
 
     crates = []
-    for pkg in meta["packages"]:
+    for pkg in packages:
         cname = pkg["name"].replace("-", "_")
         doc_root = target_dir / "doc" / cname
         if doc_root.exists():
