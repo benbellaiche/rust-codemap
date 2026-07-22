@@ -11,11 +11,13 @@ Subcommands:
   trace   Convert a raw tracing_subscriber JSON-lines log into trace.json.
   serve   Serve the viewer directory over plain HTTP.
 
-`graph`/`doc`/`trace` write into `<target crate>/target/rust-codemap/` by
-default -- next to cargo's own build output, never into this repo. The
-viewer never needs project-specific files sitting next to it: use the
-"Load graph..." / "Load doc index..." / "Load trace..." buttons in its
-toolbar to pick up whatever was generated.
+`graph`/`doc`/`trace` write into
+`<target crate>/target/rust-codemap/<crate_name>/` by default -- next to
+cargo's own build output, never into this repo, and nested under the
+crate's own name so multiple crates in one workspace don't overwrite each
+other's output. The viewer never needs project-specific files sitting next
+to it: use the "Load graph..." / "Load doc index..." / "Load trace..."
+buttons in its toolbar to pick up whatever was generated.
 
 Run `python -m codemap <subcommand> --help` for each command's options.
 See README.md for the full workflow and the tracing log format contract.
@@ -58,11 +60,20 @@ def require_manifest(project: str) -> Path:
     return manifest
 
 
+def crate_name(manifest: Path) -> str:
+    return read_package_name(manifest).replace("-", "_")
+
+
 def default_out_dir(manifest: Path) -> Path:
-    """Where generated artifacts land by default: <target_directory>/rust-codemap,
-    resolved via `cargo metadata` so it's correct for workspace members too
-    (same directory cargo itself already uses for build output and docs)."""
-    return Path(cargo_metadata(manifest)["target_directory"]) / "rust-codemap"
+    """Where generated artifacts land by default:
+    <target_directory>/rust-codemap/<crate_name>/ -- resolved via `cargo
+    metadata` so it's correct for workspace members too (same directory
+    cargo itself already uses for build output and docs). Nested under the
+    crate's own name, not just "rust-codemap/": a workspace's members all
+    share one target_directory, so without this every crate's output would
+    land at the exact same path and each one would overwrite the last."""
+    target_dir = Path(cargo_metadata(manifest)["target_directory"])
+    return target_dir / "rust-codemap" / crate_name(manifest)
 
 
 def target_flag(args) -> tuple:
@@ -83,7 +94,7 @@ def write_json(path: Path, data) -> None:
 def cmd_graph(args) -> Path:
     manifest = require_manifest(args.project)
     target_dir = Path(cargo_metadata(manifest)["target_directory"])
-    out_path = Path(args.out) if args.out else target_dir / "rust-codemap" / "graph.json"
+    out_path = Path(args.out) if args.out else default_out_dir(manifest) / "graph.json"
     cargo_target_args, label = target_flag(args)
 
     print(f"Compiling {label} with --emit=mir ...")
@@ -92,10 +103,20 @@ def cmd_graph(args) -> Path:
         check=True,
     )
 
-    mir_files = sorted((target_dir / "debug" / "deps").glob("*.mir"),
-                        key=lambda p: p.stat().st_mtime, reverse=True)
+    # Picking "whatever .mir is newest" breaks the moment cargo decides
+    # nothing needs rebuilding (a no-op "Finished" that never touches this
+    # crate's .mir) while some OTHER crate in the same shared target/deps
+    # dir got rebuilt more recently -- easy to hit in a workspace. Narrow
+    # the glob to this crate's own name first; only fall back to mtime to
+    # break ties among that crate's own (e.g. stale profile) artifacts.
+    cname = crate_name(manifest)
+    deps_dir = target_dir / "debug" / "deps"
+    mir_files = sorted(
+        [*deps_dir.glob(f"{cname}.mir"), *deps_dir.glob(f"{cname}-*.mir")],
+        key=lambda p: p.stat().st_mtime, reverse=True,
+    )
     if not mir_files:
-        sys.exit(f"ERROR: no .mir file found under {target_dir / 'debug' / 'deps'}")
+        sys.exit(f"ERROR: no {cname}(-*).mir file found under {deps_dir}")
     mir_path = mir_files[0]
     print(f"Parsing {mir_path.name} ({mir_path.stat().st_size // 1024} KB)...")
 
@@ -111,15 +132,14 @@ def cmd_graph(args) -> Path:
 def cmd_doc(args) -> Path:
     manifest = require_manifest(args.project)
     target_dir = Path(cargo_metadata(manifest)["target_directory"])
-    default_dir = target_dir / "rust-codemap"
+    default_dir = default_out_dir(manifest)
     graph_path = Path(args.graph) if args.graph else default_dir / "graph.json"
     out_path = Path(args.out) if args.out else default_dir / "source_index.json"
 
     print("Running cargo doc --no-deps ...")
     subprocess.run(["cargo", "doc", "--no-deps", "--manifest-path", str(manifest)], check=True)
 
-    pkg_name = read_package_name(manifest).replace("-", "_")
-    doc_root = target_dir / "doc" / pkg_name
+    doc_root = target_dir / "doc" / crate_name(manifest)
     if not doc_root.exists():
         sys.exit(f"ERROR: {doc_root} not found (unexpected crate/package name mismatch?)")
 
@@ -211,18 +231,18 @@ def main():
     gt = g.add_mutually_exclusive_group(required=True)
     gt.add_argument("--bin", help="Binary target to compile (cargo rustc --bin <name>)")
     gt.add_argument("--lib", action="store_true", help="Analyze the crate's library target instead of a binary")
-    g.add_argument("--out", default=None, help="Where to write graph.json (default: <target>/rust-codemap/graph.json)")
+    g.add_argument("--out", default=None, help="Where to write graph.json (default: <target>/rust-codemap/<crate>/graph.json)")
     g.set_defaults(func=cmd_graph)
 
     d = sub.add_parser("doc", help="Cross-reference cargo doc output with a graph.json")
     d.add_argument("--project", required=True, help="Path to the target crate (dir containing Cargo.toml)")
-    d.add_argument("--graph", default=None, help="graph.json to cross-reference against (default: <target>/rust-codemap/graph.json)")
-    d.add_argument("--out", default=None, help="Where to write source_index.json (default: <target>/rust-codemap/source_index.json)")
+    d.add_argument("--graph", default=None, help="graph.json to cross-reference against (default: <target>/rust-codemap/<crate>/graph.json)")
+    d.add_argument("--out", default=None, help="Where to write source_index.json (default: <target>/rust-codemap/<crate>/source_index.json)")
     d.set_defaults(func=cmd_doc)
 
     t = sub.add_parser("trace", help="Parse a tracing_subscriber JSON-lines log into trace.json")
     t.add_argument("--input", required=True, help="Path to the raw trace log (JSON lines)")
-    t.add_argument("--project", default=None, help="Optional -- if given, default --out is <target>/rust-codemap/trace.json")
+    t.add_argument("--project", default=None, help="Optional -- if given, default --out is <target>/rust-codemap/<crate>/trace.json")
     t.add_argument("--out", default=None, help="Where to write trace.json (default: trace.json, or under --project's target dir)")
     t.set_defaults(func=cmd_trace)
 

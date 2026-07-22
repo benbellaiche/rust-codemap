@@ -372,8 +372,8 @@
         let animPlay = 700, animStep = 280, animHold = 550;
         let loopAnimRunning = false, loopAnimEdges = null;
 
-        // Load source index from cargo doc
-        fetch('source_index.json', { cache: 'no-store' }).then(r => r.json()).then(d => { sourceIndex = d; }).catch(() => { });
+        // sourceIndex starts empty; populated only via "Load doc index..."
+        // (see below) -- no automatic fetch, for the same reason as graph.json.
 
         function initCy(elems) {
             // Every Rust *binary* has exactly one fn named "main" -- use it as
@@ -427,7 +427,12 @@
             // may be intentional (e.g. a function that runs before tracing is set
             // up) or simply a real function someone forgot to instrument.
             cy.nodes().each(n => { if (n.data('traced') === false) n.addClass('untraced'); });
-            applyUntracedVisibility(false); // hidden by default
+            // Hidden by default -- UNLESS that would hide every single node
+            // (e.g. a tiny binary whose main() has no #[instrument] at all).
+            // An empty canvas with no indication of why is worse than just
+            // showing the untraced nodes in that case.
+            const noTracedNodesAtAll = cy.nodes().length > 0 && cy.nodes('.untraced').length === cy.nodes().length;
+            applyUntracedVisibility(noTracedNodesAtAll);
             buildLegend();
             cy.on('tap', 'node', e => { showNodeInfo(e.target) });
             cy.on('tap', 'edge', e => {
@@ -564,11 +569,11 @@
             document.getElementById('info').innerHTML = buildInfoHtml(el.dataset.type, {}, null);
         });
 
-        // Loading a graph is not tied to any file living next to index.html --
-        // the server only ever serves this static viewer. `fetch('graph.json')`
-        // below is just a convenience fallback for the case where one happens
-        // to sit next to the page; the normal path is the "Load graph..."
-        // button, which reads a file picked from anywhere on disk.
+        // Loading a graph is never tied to a file living next to index.html --
+        // the server only ever serves this static viewer, nothing project-
+        // specific. No automatic fetch is attempted (it would just 404 every
+        // time, since that's not where output lands): the only path in is
+        // the "Load graph..." button, reading a file picked from anywhere.
         function loadGraph(g) {
             stopPlay();
             stopLoopFlow(false);
@@ -580,9 +585,7 @@
             initCy([...g.nodes, ...g.edges]);
         }
 
-        fetch('graph.json', { cache: 'no-store' }).then(r => r.json()).then(g => {
-            loadGraph(g);
-        }).catch(() => { document.getElementById('status').textContent = 'No graph loaded — use "Load graph…".'; });
+        document.getElementById('status').textContent = 'No graph loaded — use "Load graph…".';
 
         document.getElementById('btn-load-graph').addEventListener('click', () => {
             document.getElementById('graph-file-input').click();

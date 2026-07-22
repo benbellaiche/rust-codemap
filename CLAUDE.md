@@ -25,24 +25,32 @@ Rust crate on disk (there is no target crate committed to this repo).
 
 ```sh
 python -m codemap run   --project <path> (--bin <name> | --lib)   # graph + doc + serve, one shot
-python -m codemap graph --project <path> (--bin <name> | --lib)   # cargo rustc --emit=mir -> <target_dir>/rust-codemap/graph.json
-python -m codemap doc   --project <path>                          # cargo doc -> <target_dir>/rust-codemap/source_index.json
-python -m codemap trace --input <path-to-jsonl-log>                # -> trace.json (or <target_dir>/rust-codemap/ with --project)
+python -m codemap graph --project <path> (--bin <name> | --lib)   # cargo rustc --emit=mir -> <target_dir>/rust-codemap/<crate>/graph.json
+python -m codemap doc   --project <path>                          # cargo doc -> <target_dir>/rust-codemap/<crate>/source_index.json
+python -m codemap trace --input <path-to-jsonl-log>                # -> trace.json (or <target_dir>/rust-codemap/<crate>/ with --project)
 python -m codemap serve                                             # http://localhost:8787/, serves viewer/ ONLY (no project data)
 ```
 
 `--bin <name>` and `--lib` are mutually exclusive (argparse enforces this).
 `<target_dir>` is the *target* crate's own `cargo metadata` target
 directory, not anything under this repo — see "Design constraints" below.
-The viewer never fetches project-specific files automatically as the
-primary path; use its "Load graph…" / "Load doc index…" / "Load trace…"
-buttons to pick up whatever `graph`/`doc`/`trace` (or `run`) just wrote.
+`<crate>` is that crate's own name (underscored), via `crate_name()` --
+**required** even for a single-crate project: every member of a workspace
+shares one `target_dir`, so without this per-crate subdirectory, two crates
+in the same workspace would overwrite each other's output at the same path
+(this happened; see PROJECT.md §2.4 "Second round"). The viewer never
+fetches project-specific files automatically as the primary path; use its
+"Load graph…" / "Load doc index…" / "Load trace…" buttons to pick up
+whatever `graph`/`doc`/`trace` (or `run`) just wrote.
 
 There is no test suite yet. To sanity-check a change to `codemap/`, run the
-commands above against a real instrumented Rust crate for `--bin` (any
-crate with `#[instrument]`/`tracing` spans works) and a plain library crate
-for `--lib` (there is no bundled fixture crate in this repo) and confirm
-`graph`/`doc`/`trace` produce non-empty, sane output, then open the viewer,
+commands above against `../dummy-lib/{dummy-core,dummy-ops,dummy-api}`
+(`--lib`, a sibling repo purpose-built as a multi-crate test fixture — see
+PROJECT.md §2.7 and its own README) and confirm `graph`/`doc` produce sane,
+non-empty output per crate under its own `target/rust-codemap/<crate>/`
+subdirectory (not overwriting a sibling crate's output at the same path).
+For `--bin` and execution replay, use a real instrumented binary crate
+(e.g. `../sandbox/tools-codemap` in the outer repo). Then open the viewer,
 use the "Load…" buttons, and check the graph renders and Play/Step works.
 Note execution replay is only meaningful for `--bin` today (see
 "Design constraints").
@@ -71,10 +79,21 @@ there is no AST and no dependency on rustc's internals beyond the stability
 of its MIR pretty-printer output. Load-bearing assumptions (all rely on
 rustc behavior, not on any specific project):
 
-- Free functions defined in the crate being compiled are printed **bare**
-  (`fn name(...)`, no `::`), while anything from another crate is always
-  fully path-qualified. This is what lets local free functions be
-  recognized without knowing the crate's name.
+- Free functions defined in the crate being compiled are always **local**
+  (anything from another crate is fully path-qualified with that other
+  crate's name) -- but MIR is *inconsistent* about whether it prints a
+  local free function's own module path or not (`basics::add` right next
+  to bare `compute`, both `pub fn` in their own submodule -- confirmed via
+  the dummy-lib fixture, PROJECT.md §2.7). `RE_FREE_FN` and `normalize_call`
+  both normalize to the bare name either way, so don't assume "bare = safe
+  to match, qualified = something else" anywhere new.
+- Similarly, an impl block's module prefix before `<impl at ...>` is only
+  present when the impl isn't at the crate root, and the `Self` type in a
+  method's first parameter can itself be module-qualified (`&report::Item`,
+  not just `&Item`) when that type lives in a submodule. Both prefixes are
+  optional/repeatable in `RE_IMPL_SELF`/`RE_IMPL_CTOR` (`(?:\w+::)*`), not a
+  single mandatory segment -- a crate-root impl silently vanished from the
+  graph before this was fixed.
 - A module-qualified impl method (`fn mod::<impl at PATH:...>::name(...)`)
   is treated as local **unless** `PATH` resolves through cargo's dependency
   or toolchain caches (`is_local_impl`, checked via `.cargo`/`registry`/
@@ -82,6 +101,12 @@ rustc behavior, not on any specific project):
   list of "our" module names — do not reintroduce a name-based allowlist
   here; extend the path-based heuristic instead. Known gap: `cargo vendor`
   dependencies aren't excluded by this (their path doesn't look external).
+- `normalize_call` tells a "module::free_fn" call-site reference apart from
+  a genuine "Type::method" one by Rust's own naming convention (lowercase
+  first segment = module/crate qualifier -> drop it; uppercase = a real
+  Type -> keep "Type::method"). This is why case matters if you're ever
+  tempted to loosen this: it's not a stylistic nicety here, it's the only
+  signal distinguishing the two shapes.
 - Closures compile to their own top-level MIR item
   (`...::{closure#N}`). Calls made inside a closure body are reattributed to
   the *enclosing* function (`closure_owner_path`), so a call hidden inside

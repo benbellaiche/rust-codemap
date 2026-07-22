@@ -120,8 +120,8 @@ scripts at the repo root — `python -m codemap` picks up the package without
 any `sys.path` hacking. `requirements.txt` is present but currently empty:
 the tool has zero third-party Python dependencies today.
 
-**Output location, revisited.** `graph`/`doc`/`trace` default to writing
-under `<target crate's target_directory>/rust-codemap/` — the same
+**Output location, revisited (twice).** `graph`/`doc`/`trace` default to
+writing under `<target crate's target_directory>/rust-codemap/` — the same
 directory cargo itself already uses for build output and `cargo doc`, and
 already gitignored by any normal Rust project. Nothing is ever written into
 this repo. `run` composes `graph` + `doc` + `serve` in one call and prints
@@ -129,9 +129,19 @@ the exact paths it wrote. This replaced an earlier version where these
 commands defaulted to writing into `viewer/` inside *this* repo — wrong on
 two counts: it mixed generated per-target data with the tool's own checked-
 in source, and re-running against a second target project would silently
-overwrite the first's output. See §2.5 for the other half of the fix (how
+overwrite the first's output. See §2.5 for the other half of that fix (how
 the viewer picks this data up without the server needing to know where it
 is).
+
+**Second round**: even after moving out of `viewer/`, all members of one
+*workspace* still share the exact same `target_directory` — so
+`dummy-core`, `dummy-ops`, `dummy-api` (see §2.7) were each overwriting the
+previous one's `graph.json` at the same path. Fixed by nesting one level
+deeper: `.../rust-codemap/<crate_name>/graph.json` (mirroring, again, how
+`cargo doc` itself avoids the same problem via `target/doc/<crate_name>/`).
+`crate_name` here is the underscored form of the `[package] name`, per
+`crate_name()` in `__main__.py` — same derivation `doc` already used to
+find `target/doc/<crate>/`, now reused for the output directory too.
 
 ### 2.5 Viewer (`viewer/index.html`, Cytoscape.js)
 
@@ -200,18 +210,54 @@ undone) rather than migrated:
 (an instrumented option-pricing toy program) used to validate this tool —
 its `Cargo.toml`/`src/` — with no tool logic of its own.
 
+### 2.7 Test fixtures
+
+- `be-quant/sandbox/tools-codemap` (`--bin`) and `be-quant/quant-pricing`
+  (`--lib`, trivial single-file crate) — the two real projects used so far
+  to validate single-crate extraction.
+- `be-quant/dummy-lib` — a purpose-built, deliberately trivial 3-crate
+  workspace (`dummy-core` → `dummy-ops` → `dummy-api`) for testing
+  multi-crate scenarios: a trait implemented across two different crates
+  (dynamic dispatch), a free function called from two different crates
+  (static dispatch), a deliberately uninstrumented function, and a
+  cross-crate node-id collision (two unrelated `Item::describe`). See its
+  own `README.md`. Analyzing it one crate at a time (before any cross-crate
+  merging exists) is what surfaced the three MIR-parsing bugs below.
+
 ## 3. Points to fix
 
 - **Duplicated trace-parsing logic**: `trace_log.py` (Python) and the
   in-browser `parseTraceJsonl()` (JS) implement the same
   dedup/iteration/duration logic independently. Risk of the two drifting
   apart. Not resolved in this move — still an open cleanup.
-- **Regex-based MIR parsing is fragile by construction**: only exercised
-  against one small, single-crate, sync, non-generic example. Constructs
-  not yet tested: generics/monomorphization noise, async fns, multi-crate
-  workspaces, deeply nested/chained closures, recursive functions, iterator
-  chains beyond a single `.map()`. Should be treated as a known risk area
-  before calling the tool "works on any Rust code."
+- **Regex-based MIR parsing is fragile by construction** — confirmed by the
+  dummy-lib fixture (§2.7), which surfaced three real bugs, all now fixed:
+  1. An `impl` block at crate root (no enclosing module) prints as
+     `fn <impl at ...>::method(...)` with **no** module prefix, whereas one
+     inside a submodule prints `fn mymod::<impl at ...>::method(...)`.
+     `RE_IMPL_SELF`/`RE_IMPL_CTOR` required that prefix unconditionally, so
+     crate-root impls were silently invisible. Fixed: prefix is now
+     `(?:\w+::)*` (zero or more), not mandatory.
+  2. The same applies to the `Self` type in an impl method's first
+     parameter: `&report::Item` (module-qualified, when `Item` lives in a
+     submodule) vs `&Item` (crate root). The type-name capture didn't skip
+     a module prefix either, so it grabbed the module name instead of the
+     type. Fixed the same way.
+  3. A free function's module path is *inconsistently* printed by MIR —
+     `basics::add` (qualified) right next to `compute` (bare), for
+     functions that are structurally equivalent (both are `pub fn` in their
+     own same-named-file submodule). Both `RE_FREE_FN` (definitions) and
+     `normalize_call` (call sites) now normalize to the bare name either
+     way. This required teaching `normalize_call` to tell a "module::
+     free_fn" reference apart from a genuine "Type::method" one -- done via
+     Rust's own naming convention (lowercase first segment = module/crate,
+     uppercase = Type), not a hardcoded list.
+
+  Still genuinely untested: generics/monomorphization noise, async fns,
+  deeply nested/chained closures, recursive functions, iterator chains
+  beyond a single `.map()`. Should still be treated as a known risk area
+  before calling the tool "works on any Rust code" -- dummy-lib covers
+  cross-crate wiring and the module-qualification issues above, not these.
 - **Vendored dependencies aren't excluded**: the crate-scoping heuristic
   (§2.1) relies on dependency source paths resolving through `.cargo`/
   `registry`; a `cargo vendor`-based project would have its dependencies

@@ -55,8 +55,10 @@ Nothing here refers to any specific target project. `viewer/` contains
 **only** the tool's own static UI (`index.html`) — the HTTP server never
 serves anything project-specific, and nothing generated is ever written
 into this repo. `graph`/`doc`/`trace` write their output under
-`<target crate>/target/rust-codemap/` (next to cargo's own build output),
-and the viewer picks that data up via its **"Load graph…" / "Load doc
+`<target crate>/target/rust-codemap/<crate name>/` (next to cargo's own
+build output, nested under the crate's own name so that multiple crates in
+one workspace don't overwrite each other's output at the same path), and
+the viewer picks that data up via its **"Load graph…" / "Load doc
 index…" / "Load trace…"** toolbar buttons — plain file pickers, reading
 straight off disk, no server-side path coordination needed.
 
@@ -71,8 +73,9 @@ python -m codemap run --project /path/to/target-crate --lib
 ```
 
 This compiles the target crate, extracts the call-graph, cross-references it
-with `cargo doc`, writes both under `<target-crate>/target/rust-codemap/`,
-starts the viewer, and opens it in a browser. The command's own output
+with `cargo doc`, writes both under
+`<target-crate>/target/rust-codemap/<crate name>/`, starts the viewer, and
+opens it in a browser. The command's own output
 prints the exact file paths — in the viewer toolbar, click **"Load
 graph…"** and pick `graph.json` (and **"Load doc index…"** for
 `source_index.json`) from there.
@@ -95,8 +98,9 @@ python -m codemap serve
 ```
 
 `graph` and `doc` share the same default output directory
-(`<target-crate>/target/rust-codemap/`) unless you pass `--out`/`--graph`
-explicitly. `serve` only ever serves `viewer/index.html` — use "Load
+(`<target-crate>/target/rust-codemap/<crate name>/`) unless you pass
+`--out`/`--graph` explicitly. `serve` only ever serves `viewer/index.html`
+— use "Load
 graph…" / "Load doc index…" in the already-running page to pick up
 whatever you just (re)generated.
 
@@ -164,7 +168,7 @@ python -m codemap trace --input <path-to-log> [--project <path>] [--out <path>]
 python -m codemap serve [--dir viewer] [--port 8787]
 ```
 
-`--out`/`--graph` default to `<target crate>/target/rust-codemap/...` — see
+`--out`/`--graph` default to `<target crate>/target/rust-codemap/<crate name>/...` — see
 above. Run any subcommand with `--help` for details.
 
 ## How the call-graph is built

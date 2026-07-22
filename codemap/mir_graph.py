@@ -42,10 +42,20 @@ EXCLUDE_LINE = [
 # toolchain caches. This replaces any hardcoded list of "our" module names.
 EXTERNAL_PATH_MARKERS = (".cargo", "registry", ".rustup", "toolchains")
 
-RE_IMPL_SELF = re.compile(r"fn \w+::<impl at [^>]+>::(\w+)\(_1:\s*&(?:mut\s+)?(\w+)")
-RE_IMPL_CTOR = re.compile(r"fn \w+::<impl at [^>]+>::(\w+)\(.*?\)\s*->\s*(\w+)\s*\{")
+## A module prefix before `<impl at ...>` is only present when the impl
+## isn't at the crate root (e.g. `report::<impl at ...>`; a crate-root impl
+## is just `<impl at ...>` with no prefix at all), and the Self type in the
+## first parameter can itself be module-qualified (e.g. `&report::Item`,
+## not just `&Item`) when it's defined in a submodule. Both prefixes are
+## therefore optional / repeatable, not a single mandatory `\w+::`.
+RE_IMPL_SELF = re.compile(r"fn (?:\w+::)*<impl at [^>]+>::(\w+)\(_1:\s*&(?:mut\s+)?(?:\w+::)*(\w+)")
+RE_IMPL_CTOR = re.compile(r"fn (?:\w+::)*<impl at [^>]+>::(\w+)\(.*?\)\s*->\s*(?:\w+::)*(\w+)\s*\{")
 RE_IMPL_SOURCE = re.compile(r"<impl at ([^:]+):")
-RE_FREE_FN = re.compile(r"^fn (\w+)\(")
+# A free function's module path is sometimes printed (e.g. `basics::add`)
+# and sometimes not (e.g. `compute`, for a function in its own `compute.rs`
+# module) -- MIR isn't consistent about this. Normalize to the bare name
+# either way, matching the (already relied-upon) unqualified form.
+RE_FREE_FN = re.compile(r"^fn (?:\w+::)*(\w+)\(")
 RE_CALL_TERM = re.compile(r"= ([a-zA-Z_<][^(]*)\([^)]*\)\s*->\s*\[return:")
 RE_CLOSURE_SUFFIX = re.compile(r"(::\{closure#\d+\})+$")
 
@@ -129,7 +139,18 @@ def normalize_call(raw: str):
     m = re.match(r"<([^>]+) as [^>]+>::(\w+)$", raw)
     if m: return f"{m.group(1).split('::')[-1]}::{m.group(2)}"
     parts = raw.split("::")
-    return "::".join(parts[-2:]) if len(parts) >= 2 else (parts[0] if parts else None)
+    if not parts: return None
+    if len(parts) == 1: return parts[0]
+    # Two shapes reach here: "Type::method" (module::Type::method with the
+    # module dropped) and "module::free_fn" (a free function's call site
+    # keeping its module qualifier, while its own definition normalizes to
+    # the bare name -- see RE_FREE_FN). Tell them apart the same way Rust's
+    # own naming convention does: a Type starts uppercase, a module/crate
+    # segment doesn't.
+    last_two = parts[-2:]
+    if last_two[0][:1].isupper():
+        return "::".join(last_two)
+    return last_two[-1]
 
 
 def parse_mir(text: str):
