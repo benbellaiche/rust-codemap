@@ -144,9 +144,11 @@ is).
 previous one's `graph.json` at the same path. Fixed by nesting one level
 deeper: `.../rust-codemap/<crate_name>/graph.json` (mirroring, again, how
 `cargo doc` itself avoids the same problem via `target/doc/<crate_name>/`).
-`crate_name` here is the underscored form of the `[package] name`, per
-`crate_name()` in `__main__.py` — same derivation `doc` already used to
-find `target/doc/<crate>/`, now reused for the output directory too.
+`crate_name` here is the actual compiled crate name, per `crate_name()` in
+`__main__.py` — same derivation `doc` already used to find
+`target/doc/<crate>/`, now reused for the output directory too. (Initially
+just "the underscored form of the `[package] name`"; that turned out to be
+wrong whenever a `[lib] name` override is present — see §3 bug #6.)
 
 **Multi-crate merging** (`graph`/`doc`, `local_dependency_closure()` in
 `__main__.py`). `graph`/`doc` no longer take `--bin`/`--lib` at all — MIR
@@ -266,22 +268,24 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
   re-verified against it (deliberately out of scope for a session; treat
   as untested until it is).
 - `be-quant/dummy-lib` — a purpose-built, deliberately trivial 3-crate
-  **library-only** workspace (`dummy-core` → `dummy-ops` → `dummy-api`)
-  for testing multi-crate scenarios: a trait implemented across two
-  different crates (dynamic dispatch), a free function called from two
-  different crates (static dispatch), a deliberately uninstrumented
-  function, and a cross-crate node-id collision (two unrelated
-  `Item::describe`). See its own `README.md`. Analyzing it one crate at a
-  time (before any cross-crate merging existed) is what surfaced the three
-  MIR-parsing bugs in §3.
+  **library-only** workspace (`dummy-core` → `dummy-ops` → `dummy-api`,
+  compiled crate names `dcore`/`dops`/`dapi` respectively) for testing
+  multi-crate scenarios: a trait implemented across two different crates
+  (dynamic dispatch), a free function called from two different crates
+  (static dispatch), a deliberately uninstrumented function, a cross-crate
+  node-id collision (two unrelated `Item::describe`), and every crate's
+  `[lib] name` overridden from its package name (bug #6 below). See its own
+  `README.md`. Analyzing it one crate at a time (before any cross-crate
+  merging existed) is what surfaced MIR-parsing bugs #1-3 in §3.
 - `be-quant/dummy-cli` — a trivial standalone binary (deliberately **not**
-  a member of the `dummy-lib` workspace) whose `main()` calls
-  `dummy_api::run_report(...)` via a path dependency across into
+  a member of the `dummy-lib` workspace, and deliberately **without** a
+  `[lib] name` override, unlike everything it depends on) whose `main()`
+  calls `dapi::run_report(...)` via a path dependency across into
   `dummy-lib/dummy-api`. Kept separate on purpose: it's what exposed the
-  "workspace member ≠ dependency" bug in §2.4 (pointing at `dummy-lib`
-  crates was, for a while, pulling in whatever depended on them too) and
+  "workspace member ≠ dependency" bug (#4 below) -- pointing at `dummy-lib`
+  crates was, for a while, pulling in whatever depended on them too -- and
   now serves as the fixture for the reverse-dependency case specifically,
-  independent of dummy-lib's pure-library scenario.
+  and for the mixed overridden/non-overridden crate-name case (#6).
 
 ## 3. Points to fix
 
@@ -332,6 +336,25 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
      their own. Fixed alongside #4 -- `doc_index.build_index()` now takes a
      list of `(doc_root, src_root)` pairs, one per crate in the same
      dependency closure `graph` uses.
+  6. **The compiled crate name was assumed to always equal the package
+     name (with hyphens turned into underscores)** -- true by default, but
+     a `[lib] name = "..."` override in `Cargo.toml` (used consistently
+     across every crate in a real project this was tested against) changes
+     the actual `--crate-name` rustc uses, and therefore the `.mir`
+     filename cargo produces *and* the `target/doc/<name>/` directory
+     `cargo doc` writes. `crate_name()` derived everything from `pkg["name"]`
+     directly, so overridden crates produced "WARNING: no .mir found for
+     X" and were silently dropped from the graph, even though they'd
+     compiled successfully -- the artifact just existed under a name
+     nothing was looking for. Fixed: `crate_name()` now reads the `[lib]`
+     table specifically (via a new scoped `read_toml_section()` helper,
+     also used to make `read_package_name()` itself scope to `[package]`
+     rather than "the first `name = ` in the file") and only falls back to
+     the package-name derivation when there's no override. Reproduced and
+     verified on `dummy-lib` by giving all three crates (`dcore`/`dops`/
+     `dapi`) a `[lib]` override matching the reported scenario exactly,
+     including a mixed case (`dummy-cli`, no override, depending on three
+     crates that do have one).
 
   Still genuinely untested: generics/monomorphization noise, async fns,
   deeply nested/chained closures, recursive functions, iterator chains

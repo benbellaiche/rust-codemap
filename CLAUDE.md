@@ -37,11 +37,16 @@ cargo told which target to build (see "Multi-crate merging" below) — the
 flag became purely vestigial and keeping it would just be clutter.
 `<target_dir>` is the *target* crate's own `cargo metadata` target
 directory, not anything under this repo — see "Design constraints" below.
-`<crate>` is that crate's own name (underscored), via `crate_name()` --
-**required** even for a single-crate project: every member of a workspace
-shares one `target_dir`, so without this per-crate subdirectory, two crates
-in the same workspace would overwrite each other's output at the same path
-(this happened; see PROJECT.md §2.4 "Second round"). The viewer never
+`<crate>` is that crate's *actual compiled* name, via `crate_name()` --
+**not** simply the package name with hyphens underscored: a `[lib] name`
+override in Cargo.toml changes it, and assuming otherwise silently drops
+that crate from the graph (real bug, see PROJECT.md §3 bug #6; `crate_name()`
+checks the `[lib]` table first, falls back to the package-name derivation
+only if there's no override). This subdirectory is **required** even for a
+single-crate project: every member of a workspace shares one `target_dir`,
+so without it, two crates in the same workspace would overwrite each
+other's output at the same path (this happened too; see PROJECT.md §2.4
+"Second round"). The viewer never
 fetches project-specific files automatically as the primary path; use its
 "Load graph…" / "Load doc index…" / "Load trace…" buttons to pick up
 whatever `graph`/`doc`/`trace` (or `run`) just wrote.
@@ -59,7 +64,13 @@ commands above against:
   it should resolve to `{dummy-cli, dummy-api, dummy-ops, dummy-core}`;
   pointing at any `dummy-lib` crate should never pull `dummy-cli` in (it
   depends on them, they don't depend on it) -- this exact regression
-  happened once already (PROJECT.md §3, bug #4).
+  happened once already (PROJECT.md §3, bug #4). Also useful for the
+  `[lib] name` case below, since `dummy-cli` itself has no override while
+  everything it depends on does.
+- All three `dummy-lib` crates additionally have a `[lib] name` override
+  in their `Cargo.toml` (different from their package name) -- confirm
+  `graph`/`doc` still find their `.mir`/doc output under the *overridden*
+  name, not a name derived from the package name (PROJECT.md §3, bug #6).
 
 For execution replay, use a real instrumented binary crate (e.g.
 `../sandbox/tools-codemap` in the outer repo -- but see PROJECT.md §2.7 for

@@ -51,12 +51,25 @@ def cargo_metadata(manifest: Path) -> dict:
     return json.loads(out.stdout)
 
 
+def read_toml_section(manifest: Path, section: str) -> str | None:
+    """Crude single-section extractor: the text between `[section]` and the
+    next `[...]` header (or end of file). Good enough for the handful of
+    single-line string fields this tool reads (package/lib name) without
+    pulling in a TOML parser dependency -- but it does mean it's scoped to
+    one specific table, not just "the first match anywhere in the file"."""
+    text = manifest.read_text(encoding="utf-8")
+    m = re.search(rf"^\[{re.escape(section)}\]\s*$(.*?)(?=^\[|\Z)", text, re.MULTILINE | re.DOTALL)
+    return m.group(1) if m else None
+
+
 def read_package_name(manifest: Path) -> str:
-    """First `name = "..."` in Cargo.toml -- the [package] name, in practice
-    always the first such line in an idiomatic manifest."""
-    m = re.search(r'^\s*name\s*=\s*"([^"]+)"', manifest.read_text(encoding="utf-8"), re.MULTILINE)
+    """The [package] name, read from within the [package] table
+    specifically -- not just "the first name = ... in the file", which
+    would be wrong if a [lib] name override happens to appear earlier."""
+    section = read_toml_section(manifest, "package")
+    m = re.search(r'^\s*name\s*=\s*"([^"]+)"', section, re.MULTILINE) if section else None
     if not m:
-        sys.exit(f'ERROR: could not find name = "..." in {manifest}')
+        sys.exit(f'ERROR: could not find [package] name = "..." in {manifest}')
     return m.group(1)
 
 
@@ -68,6 +81,17 @@ def require_manifest(project: str) -> Path:
 
 
 def crate_name(manifest: Path) -> str:
+    """The actual compiled crate name: [lib] name if the manifest overrides
+    it (some real projects do this on every crate -- confirmed to silently
+    break MIR/doc lookup otherwise, since cargo then names the artifact
+    after the override, not the package name), else [package] name with
+    hyphens turned into underscores (cargo's own default when there's no
+    override)."""
+    section = read_toml_section(manifest, "lib")
+    if section:
+        m = re.search(r'^\s*name\s*=\s*"([^"]+)"', section, re.MULTILINE)
+        if m:
+            return m.group(1)
     return read_package_name(manifest).replace("-", "_")
 
 
@@ -151,7 +175,7 @@ def cmd_graph(args) -> Path:
     out_path = Path(args.out) if args.out else default_out_dir(manifest) / "graph.json"
 
     packages = local_dependency_closure(manifest)
-    members = [(pkg["name"], pkg["name"].replace("-", "_")) for pkg in packages]
+    members = [(pkg["name"], crate_name(Path(pkg["manifest_path"]))) for pkg in packages]
     print(f"Local dependency closure: {', '.join(n for n, _ in members)}")
 
     # cargo rustc --emit=mir only applies to the one crate being directly
@@ -215,7 +239,7 @@ def cmd_doc(args) -> Path:
 
     crates = []
     for pkg in packages:
-        cname = pkg["name"].replace("-", "_")
+        cname = crate_name(Path(pkg["manifest_path"]))
         doc_root = target_dir / "doc" / cname
         if doc_root.exists():
             crates.append((doc_root, Path(pkg["manifest_path"]).parent / "src"))
