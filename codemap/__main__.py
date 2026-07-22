@@ -156,23 +156,35 @@ def cmd_graph(args) -> Path:
 
 def cmd_doc(args) -> Path:
     manifest = require_manifest(args.project)
-    target_dir = Path(cargo_metadata(manifest)["target_directory"])
+    meta = cargo_metadata(manifest)
+    target_dir = Path(meta["target_directory"])
     default_dir = default_out_dir(manifest)
     graph_path = Path(args.graph) if args.graph else default_dir / "graph.json"
     out_path = Path(args.out) if args.out else default_dir / "source_index.json"
 
-    print("Running cargo doc --no-deps ...")
-    subprocess.run(["cargo", "doc", "--no-deps", "--manifest-path", str(manifest)], check=True)
+    # graph.json can contain nodes from every workspace member (see `graph`
+    # merging them all) -- doc the whole workspace too, not just the one
+    # crate --project points at, or cross-references for the others would
+    # silently come up empty.
+    print("Running cargo doc --workspace --no-deps ...")
+    subprocess.run(["cargo", "doc", "--workspace", "--no-deps", "--manifest-path", str(manifest)], check=True)
 
-    doc_root = target_dir / "doc" / crate_name(manifest)
-    if not doc_root.exists():
-        sys.exit(f"ERROR: {doc_root} not found (unexpected crate/package name mismatch?)")
+    crates = []
+    for pkg in meta["packages"]:
+        cname = pkg["name"].replace("-", "_")
+        doc_root = target_dir / "doc" / cname
+        if doc_root.exists():
+            crates.append((doc_root, Path(pkg["manifest_path"]).parent / "src"))
+        else:
+            print(f"  WARNING: no doc output for {pkg['name']} ({cname}) -- skipping")
+    if not crates:
+        sys.exit(f"ERROR: no cargo doc output found under {target_dir / 'doc'}")
 
     graph = json.loads(graph_path.read_text(encoding="utf-8")) if graph_path.exists() else {"nodes": []}
 
-    index = doc_index.build_index(doc_root, manifest.parent / "src", graph)
+    index = doc_index.build_index(crates, graph)
     write_json(out_path, index)
-    print(f"OK {out_path}  ({len(index)} entries)")
+    print(f"OK {out_path}  ({len(index)} entries, {len(crates)} crate(s) cross-referenced)")
     return out_path
 
 

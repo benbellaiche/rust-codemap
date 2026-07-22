@@ -57,11 +57,20 @@ def extract_method(html: str, anchor: str):
     return sig, doc, file_, line
 
 
-def build_index(doc_root: Path, src_root: Path, graph: dict) -> dict:
-    """doc_root: target/doc/<crate>/ ; src_root: the target crate's src/ dir.
-    graph: a parsed graph.json (only its node ids are used)."""
+def build_index(crates, graph: dict) -> dict:
+    """crates: an iterable of (doc_root, src_root) pairs -- one per crate
+    whose docs should be cross-referenced (e.g. every member of the
+    workspace the call-graph was merged from, see mir_graph.build_graph).
+    doc_root is that crate's target/doc/<crate>/ ; src_root is that same
+    crate's own src/ dir (needed so a source link resolves against the
+    right crate, not whichever one happens to be the "primary" target).
 
-    def to_entry(sig, doc, file_, line):
+    graph: a parsed graph.json (only its node ids are used). Node ids
+    aren't crate-qualified (see mir_graph), so if the same name exists in
+    two crates' docs, the same collision the call-graph itself has applies
+    here too -- last crate processed wins, silently."""
+
+    def to_entry(sig, doc, file_, line, src_root):
         abs_path = str((src_root / file_).resolve()).replace("\\", "/") if file_ else ""
         vscode_url = f"vscode://file/{abs_path}:{line}:1" if line and abs_path else ""
         return {
@@ -72,36 +81,39 @@ def build_index(doc_root: Path, src_root: Path, graph: dict) -> dict:
             "vscodePath": vscode_url,
         }
 
-    # Discover every doc page cargo actually generated, keyed by item name.
+    # Discover every doc page cargo actually generated, across every crate,
+    # keyed by item name -> (html path, that crate's own src/ dir).
     pages = {}
-    for html_path in doc_root.rglob("*.html"):
-        m = ITEM_FILE_RE.match(html_path.name)
-        if not m: continue
-        _kind, name = m.groups()
-        pages[name] = html_path
+    for doc_root, src_root in crates:
+        for html_path in doc_root.rglob("*.html"):
+            m = ITEM_FILE_RE.match(html_path.name)
+            if not m: continue
+            _kind, name = m.groups()
+            pages[name] = (html_path, src_root)
 
     index = {}
 
     # Whole-item doc (struct/enum/trait/free fn), keyed by its own name --
     # this is what makes a type name found inside another signature clickable.
-    for name, path in pages.items():
+    for name, (path, src_root) in pages.items():
         html = path.read_text(encoding="utf-8", errors="ignore")
         sig, doc, file_, line = extract_top(html)
         if sig or doc:
-            index[name] = to_entry(sig, doc, file_, line)
+            index[name] = to_entry(sig, doc, file_, line, src_root)
 
     # Method doc ("Type::method"), for every such node actually present in graph.json.
     for node in graph.get("nodes", []):
         nid = node["data"]["id"]
         if "::" not in nid: continue
         type_name, method = nid.split("::", 1)
-        page = pages.get(type_name)
-        if not page: continue
-        html = page.read_text(encoding="utf-8", errors="ignore")
+        entry = pages.get(type_name)
+        if not entry: continue
+        path, src_root = entry
+        html = path.read_text(encoding="utf-8", errors="ignore")
         sig, doc, file_, line = extract_method(html, f"method.{method}")
         if not (sig or doc):
             sig, doc, file_, line = extract_method(html, f"tymethod.{method}")
         if sig or doc:
-            index[nid] = to_entry(sig, doc, file_, line)
+            index[nid] = to_entry(sig, doc, file_, line, src_root)
 
     return index
