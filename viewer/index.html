@@ -292,11 +292,6 @@
             color: #89b4fa
         }
 
-        #status {
-            font-size: 11px;
-            color: #6c7086
-        }
-
         #config-bar {
             display: none;
             align-items: center;
@@ -442,7 +437,6 @@
             <input type="file" id="trace-file-input" accept=".json,.jsonl,.log,.txt" style="display:none">
             <button id="btn-config">&#9881; Settings</button>
             <button id="btn-log">Log<span id="log-badge"></span></button>
-            <span id="status">Loading...</span>
         </div>
     </div>
     <div id="log-panel">
@@ -818,7 +812,6 @@
                     `<b style="color:#89b4fa">${d.source}</b> -> ${d.target}<br>Type: <b>${d.edgeType}</b>${d.iterLabel ? '<br>' + d.iterLabel : ''}`;
             });
             const n = elems.filter(e => e.data.nodeType).length, ed = elems.filter(e => e.data.edgeType).length;
-            document.getElementById('status').textContent = `${n} nodes | ${ed} edges`;
             logToServer('initCy', `done (${n} nodes, ${ed} edges)`);
         }
 
@@ -982,50 +975,36 @@
                 initCy(elems);
                 logToServer(label, `initCy returned after ${Math.round(performance.now() - t0)}ms`);
             } catch (err) {
-                reportError(label, err);
-                document.getElementById('status').textContent =
-                    `ERROR while rendering (${n} nodes, ${ed} edges) — see server terminal for details`;
+                reportError(label, err); // surfaces in the Log panel, auto-opens on error
             }
         }
-
-        document.getElementById('status').textContent = 'No graph loaded — use "Load graph…".';
 
         // `codemap run` serves the graph/doc index it just generated at
         // these fixed URLs (see LoggingHandler in __main__.py) -- try them
         // once on page load so the common case (one project, `codemap
         // run`) needs zero clicks. A 404 (plain `codemap serve` with no
-        // --graph/--doc) or any fetch failure just leaves "Load graph…"/
-        // "Load doc index…" as the only path in, exactly like before this
-        // existed -- silent, no error surfaced, since "nothing to
-        // auto-load" is the expected, common case for `serve` alone.
+        // --graph/--doc) or any fetch failure just leaves the page empty,
+        // silently -- there's no other way left to load a graph/doc index
+        // into the viewer at all, so "nothing to auto-load" simply means
+        // nothing shows. Results (counts, errors) go through the Log
+        // panel like everything else -- see logToServer/reportError.
         (async () => {
-            let graphLoaded = false, docLoaded = false, nodeCount = 0, edgeCount = 0, docCount = 0;
             try {
                 const res = await fetch('/graph.json', { cache: 'no-store' });
                 if (res.ok) {
                     const g = await res.json();
-                    nodeCount = g.nodes?.length ?? 0; edgeCount = g.edges?.length ?? 0;
-                    logToServer('autoload', `graph.json: ${nodeCount} nodes, ${edgeCount} edges`);
+                    logToServer('autoload', `graph.json: ${g.nodes?.length ?? 0} nodes, ${g.edges?.length ?? 0} edges`);
                     loadGraph(g);
-                    graphLoaded = true;
                 }
-            } catch { /* no server-side graph.json -- fall back to manual load */ }
+            } catch { /* no server-side graph.json (plain `serve` with no --graph) */ }
             try {
                 const res = await fetch('/source_index.json', { cache: 'no-store' });
                 if (res.ok) {
                     sourceIndex = await res.json();
-                    docCount = Object.keys(sourceIndex).length;
-                    logToServer('autoload', `source_index.json: ${docCount} entries`);
+                    logToServer('autoload', `source_index.json: ${Object.keys(sourceIndex).length} entries`);
                     renderDocList();
-                    docLoaded = true;
                 }
-            } catch { /* no server-side source_index.json -- fall back to manual load */ }
-            if (graphLoaded || docLoaded) {
-                const parts = [];
-                if (graphLoaded) parts.push(`${nodeCount} nodes | ${edgeCount} edges`);
-                if (docLoaded) parts.push(`doc index: ${docCount} entries`);
-                document.getElementById('status').textContent = parts.join(' — ') + ' (auto-loaded)';
-            }
+            } catch { /* no server-side source_index.json (plain `serve` with no --doc) */ }
         })();
 
         // ── Doc-driven focus: click a public function in the doc index to
@@ -1361,8 +1340,6 @@
                 }
                 stopPlay();
                 applyTraceSpans(spans);
-                document.getElementById('status').textContent =
-                    `Loaded ${file.name}: ${spans.length} spans` + (usedFallback ? ' (parsed client-side -- no server)' : '');
                 logToServer('Load trace…', `${file.name}: ${spans.length} spans, client-side fallback=${usedFallback}`);
             };
             reader.readAsText(file);

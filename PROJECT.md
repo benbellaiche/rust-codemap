@@ -245,6 +245,15 @@ so each crate's items resolve against that crate's own `src/`.
   **"Load trace…" deliberately stays manual** -- which run to replay can
   change from one look at the same code to the next, unlike the graph/doc,
   so there's no fixed answer to auto-load there even for `run`.
+- **`#status` (the toolbar's node/edge-count text) removed entirely.**
+  Every one of its five call sites had a `logToServer()` call doing the
+  same job right next to it already (redundant, not load-bearing), except
+  one -- the very first placeholder, `'No graph loaded -- use "Load
+  graph…".'` -- which had gone stale and wrong (referencing a button that
+  no longer exists) without anyone noticing, exactly *because* nothing
+  else depended on that text being accurate. Counts/errors that used to
+  show there are all in the Log panel now (§ above) -- one place for this
+  instead of two that could (and did) drift apart.
 - **Load trace…** additionally accepts either an already-parsed
   `trace.json` (`{spans: [...]}`) or a raw log, parsed client-side.
 - **Playback engine**: step-by-step replay (`stepTo`), with an animated
