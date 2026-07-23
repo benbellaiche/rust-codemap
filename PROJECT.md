@@ -366,6 +366,31 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
   `registry`; a `cargo vendor`-based project would have its dependencies
   copied into a local, non-external-looking path, and they'd currently be
   (wrongly) treated as part of the target crate.
+- **Large graphs (thousands of nodes) rendered nothing, silently**: reported
+  on a real ~6300-node/6300-edge crate — the status bar showed the right
+  counts, no error appeared anywhere (browser or server log), and zooming in
+  the viewer revealed nothing. Root-caused via a diagnostic added to
+  `initCy()` that logs node position finiteness plus `cy.zoom()`/`pan()`/
+  `extent()`: 0 non-finite positions (rules out the "NaN from layout"
+  hypothesis), but the post-layout bounding box was ~5.7M units wide,
+  forcing `fit:true` to zoom out to `~0.0015` — at that zoom every node
+  renders at a sub-pixel size. Cause: a *single* `breadthfirst` layout run
+  across the whole graph spaces every disconnected tree apart from every
+  other one, and a big real crate has a lot of small/disconnected
+  components (isolated pub fns nothing else calls, tiny call clusters) —
+  the more of them, the bigger the combined bounding box, independent of
+  how many nodes are actually in each. Fixed by `layoutComponents()`
+  (`viewer/index.html`): split the graph into connected components
+  (`cy.elements().components()`, built into Cytoscape core, no plugin
+  needed), run `breadthfirst` independently *within* each component only
+  (skipped entirely for isolated size-1 components — nothing to lay out),
+  then tile the resulting per-component bounding boxes into a compact grid
+  ourselves. Verified with a headless Cytoscape script (synthetic graph,
+  same node/edge shape: small clusters + many singletons) outside the repo,
+  comparing old vs new bounding-box width on the identical input — new
+  approach came out ~1270x smaller. Not yet confirmed at the reporter's
+  actual scale/graph (pending: reload and re-check the same diagnostic log
+  line).
 
 ## 4. Points to decide
 

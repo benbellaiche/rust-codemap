@@ -409,13 +409,52 @@
         // sourceIndex starts empty; populated only via "Load doc index..."
         // (see below) -- no automatic fetch, for the same reason as graph.json.
 
+        // Runs breadthfirst independently on each connected component, then
+        // tiles the components into a compact grid instead of letting a
+        // single breadthfirst run across the whole graph space every tree
+        // apart. A graph with thousands of small/disconnected components
+        // (common on a big real crate: lots of never-cross-called pub fns)
+        // blows the combined bounding box up to millions of units when laid
+        // out together, which forces cy.fit() to zoom out so far that every
+        // node renders at a sub-pixel size -- "loads fine, shows nothing".
+        // Tiling per-component keeps total canvas size ~O(n) instead.
+        function layoutComponents(cy) {
+            const comps = cy.elements().components();
+            comps.sort((a, b) => b.length - a.length);
+            const PADDING = 80;
+            const targetRowWidth = Math.max(1400, Math.ceil(Math.sqrt(cy.nodes().length)) * 220);
+            let cursorX = 0, cursorY = 0, rowHeight = 0, rowWidth = 0;
+            comps.forEach(comp => {
+                const nodesInComp = comp.nodes();
+                // A real crate tends to have a lot of single, never-linked
+                // nodes (isolated components of size 1) -- skip the layout
+                // algorithm for those entirely, it has nothing to do anyway.
+                if (nodesInComp.length > 1) {
+                    const rootId = nodesInComp.some(n => n.id() === 'main') ? 'main'
+                        : nodesInComp.filter(n => n.indegree(true) === 0).map(n => n.id())[0];
+                    comp.layout({
+                        name: 'breadthfirst', directed: true,
+                        roots: rootId ? [rootId] : undefined,
+                        spacingFactor: 1.15, avoidOverlap: true, animate: false,
+                    }).run();
+                }
+                const bb = comp.boundingBox();
+                if (rowWidth > 0 && rowWidth + bb.w > targetRowWidth) {
+                    cursorX = 0; cursorY += rowHeight + PADDING; rowHeight = 0; rowWidth = 0;
+                }
+                const dx = cursorX - bb.x1, dy = cursorY - bb.y1;
+                nodesInComp.positions(node => {
+                    const p = node.position();
+                    return { x: p.x + dx, y: p.y + dy };
+                });
+                cursorX += bb.w + PADDING;
+                rowWidth += bb.w + PADDING;
+                rowHeight = Math.max(rowHeight, bb.h);
+            });
+        }
+
         function initCy(elems) {
-            // Every Rust *binary* has exactly one fn named "main" -- use it as
-            // the layout root when present. A library has no such convention,
-            // so fall back to Cytoscape's own root detection (nodes with no
-            // incoming edges) rather than assuming "main" always exists.
-            const rootId = elems.some(e => e.data && e.data.nodeType && e.data.id === 'main') ? 'main' : undefined;
-            logToServer('initCy', `constructing cytoscape instance (${elems.length} elements total) + running breadthfirst layout...`);
+            logToServer('initCy', `constructing cytoscape instance (${elems.length} elements total)...`);
             const tCy = performance.now();
             cy = cytoscape({
                 container: document.getElementById('cy'),
@@ -454,10 +493,14 @@
                         }
                     },
                 ],
-                layout: { name: 'breadthfirst', directed: true, roots: rootId ? [rootId] : undefined, spacingFactor: 2.8, avoidOverlap: true, padding: 60, animate: false },
+                layout: { name: 'preset' },
                 wheelSensitivity: 0.15
             });
-            logToServer('initCy', `cytoscape construction + layout done after ${Math.round(performance.now() - tCy)}ms -- post-processing (untraced/legend)...`);
+            logToServer('initCy', `cytoscape construction done after ${Math.round(performance.now() - tCy)}ms -- laying out per component...`);
+            const tLayout = performance.now();
+            layoutComponents(cy);
+            cy.fit(undefined, 60);
+            logToServer('initCy', `per-component layout + fit done after ${Math.round(performance.now() - tLayout)}ms -- post-processing (untraced/legend)...`);
             // Diagnostic: are the positions the layout produced actually
             // finite numbers, and does the viewport (zoom/pan/extent) cover
             // wherever they ended up? A canvas silently draws nothing for
@@ -1044,8 +1087,8 @@
 
         document.getElementById('btn-relayout').addEventListener('click', () => {
             if (!cy) return;
-            const rootId = cy.getElementById('main').length ? 'main' : undefined;
-            cy.layout({ name: 'breadthfirst', directed: true, roots: rootId ? [rootId] : undefined, spacingFactor: 2.8, avoidOverlap: true, padding: 60, animate: true }).run();
+            layoutComponents(cy);
+            cy.animate({ fit: { padding: 60 }, duration: 300 });
         });
 
         // ── Config bar ────────────────────────────────────────────────────────
