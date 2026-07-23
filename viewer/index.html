@@ -421,10 +421,19 @@
         function layoutComponents(cy) {
             const comps = cy.elements().components();
             comps.sort((a, b) => b.length - a.length);
+            // Diagnostic: is the blow-up actually caused by many small
+            // components (the tiling below fixes that), or by one/a few
+            // dominant components that are themselves wide once laid out
+            // (tiling can't fix that -- the component's own internal layout
+            // is the problem, e.g. a flat call graph with a huge fan-out at
+            // one BFS depth)?
+            logToServer('layoutComponents',
+                `${comps.length} connected component(s); ` +
+                `top 10 sizes (nodes): ${comps.slice(0, 10).map(c => c.nodes().length).join(', ')}`);
             const PADDING = 80;
             const targetRowWidth = Math.max(1400, Math.ceil(Math.sqrt(cy.nodes().length)) * 220);
             let cursorX = 0, cursorY = 0, rowHeight = 0, rowWidth = 0;
-            comps.forEach(comp => {
+            comps.forEach((comp, idx) => {
                 const nodesInComp = comp.nodes();
                 // A real crate tends to have a lot of single, never-linked
                 // nodes (isolated components of size 1) -- skip the layout
@@ -439,6 +448,9 @@
                     }).run();
                 }
                 const bb = comp.boundingBox();
+                if (idx < 5) {
+                    logToServer('layoutComponents', `component #${idx} (${nodesInComp.length} nodes): own bbox after its layout = w=${bb.w.toFixed(1)} h=${bb.h.toFixed(1)}`);
+                }
                 if (rowWidth > 0 && rowWidth + bb.w > targetRowWidth) {
                     cursorX = 0; cursorY += rowHeight + PADDING; rowHeight = 0; rowWidth = 0;
                 }
