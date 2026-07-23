@@ -146,8 +146,26 @@ def closure_owner_path(raw: str):
 
 def normalize_call(raw: str):
     if "<dyn " in raw: return None
-    m = re.match(r"<([^>]+) as [^>]+>::(\w+)$", raw)
-    if m: return f"{m.group(1).split('::')[-1]}::{m.group(2)}"
+    # `<Type as Trait>::method` (e.g. operator-overload desugaring:
+    # `v + i` compiles to `<&i32 as Add<i32>>::add`). `[^>]+` on either
+    # side breaks the instant Type or Trait carries its own generic
+    # argument (`Add<i32>` has a `>` before the wrapper's own closing
+    # `>`) -- it silently fails to match, falls through to the
+    # module::free_fn logic below, and "Add<i32>" one specific case cost
+    # us here: it got misread by that fallback as `module::add`, an exact
+    # collision with a real *local* `add` free function even though this
+    # was std's operator trait, not ours. `.+` (matches `>` too) doesn't
+    # have that problem -- greedy, so it finds the *last* " as " and the
+    # *last* "::method" in the string, which is always the outermost
+    # wrapper's own boundary regardless of what's nested inside Type/Trait.
+    m = re.match(r"<(.+) as .+>::(\w+)$", raw)
+    if m:
+        type_part = m.group(1).split("::")[-1]
+        # A leading `&`/`&mut ` (e.g. `&i32`) would otherwise leave an
+        # empty first segment ("" before "i32") -- skip past it instead of
+        # returning a blank type name.
+        type_name = next((p for p in re.split(r"[<>&]|mut ", type_part) if p), type_part)
+        return f"{type_name}::{m.group(2)}"
     # A generic fn's call site carries its monomorphized type argument(s) as
     # a turbofish (`generic_max::<i32>`, `generic_max::<f64>` for the same
     # definition) -- strip it, or the `<i32>` segment gets mistaken for a

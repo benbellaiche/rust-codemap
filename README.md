@@ -54,14 +54,20 @@ rust-codemap/
 
 Nothing here refers to any specific target project. `viewer/` contains
 **only** the tool's own static UI (`index.html`) — the HTTP server never
-serves anything project-specific, and nothing generated is ever written
-into this repo. `graph`/`doc`/`trace` write their output under
-`<target crate>/target/rust-codemap/<crate name>/` (next to cargo's own
-build output, nested under the crate's own name so that multiple crates in
-one workspace don't overwrite each other's output at the same path), and
-the viewer picks that data up via its **"Load graph…" / "Load doc
-index…" / "Load trace…"** toolbar buttons — plain file pickers, reading
-straight off disk, no server-side path coordination needed.
+serves anything project-specific by default, and nothing generated is
+ever written into this repo. `graph`/`doc`/`trace` write their output
+under `<target crate>/target/rust-codemap/<crate name>/` (next to cargo's
+own build output, nested under the crate's own name so that multiple
+crates in one workspace don't overwrite each other's output at the same
+path). `codemap run` knows those exact paths (it just generated them) and
+serves them at fixed URLs (`/graph.json`, `/source_index.json`) the viewer
+auto-loads on page load — zero clicks. Calling `serve` on its own needs
+the same paths spelled out via `--graph`/`--doc` (see "Command reference")
+to have anything to show; there's no toolbar file picker as a fallback —
+the graph and doc index always come from the server now. **"Load
+trace…"** is the one thing that's still a manual toolbar button, since
+which run you want to replay can change from one look at the same code to
+the next (see "Replaying a real execution").
 
 ## Quick start
 
@@ -75,10 +81,9 @@ This compiles the target crate (and every local crate it actually depends
 on — see [Multi-crate merging](#multi-crate-merging)), extracts the
 call-graph, cross-references it with `cargo doc`, writes both under
 `<target-crate>/target/rust-codemap/<crate name>/`, starts the viewer, and
-opens it in a browser. The command's own output prints the exact file
-paths — in the viewer toolbar, click **"Load graph…"** and pick
-`graph.json` (and **"Load doc index…"** for `source_index.json`) from
-there.
+opens it in a browser — with the graph and doc index already loaded, no
+clicks needed. Only **"Load trace…"** stays manual, since which run you
+want to replay can change from one look at the same code to the next.
 
 No `--bin`/`--lib` to choose: the target can be either, and it doesn't
 change how the graph is built (see below). A library has no `fn main`, so
@@ -95,15 +100,17 @@ change, without restarting the server):
 ```sh
 python -m codemap graph --project /path/to/target-crate
 python -m codemap doc   --project /path/to/target-crate
-python -m codemap serve
+python -m codemap serve --graph /path/to/target-crate/target/rust-codemap/<crate name>/graph.json \
+                         --doc /path/to/target-crate/target/rust-codemap/<crate name>/source_index.json
 ```
 
 `graph` and `doc` share the same default output directory
 (`<target-crate>/target/rust-codemap/<crate name>/`) unless you pass
-`--out`/`--graph` explicitly. `serve` only ever serves `viewer/index.html`
-— use "Load
-graph…" / "Load doc index…" in the already-running page to pick up
-whatever you just (re)generated.
+`--out`/`--graph` explicitly (that flag on `doc` means something
+different — see "Command reference"). Re-running just `graph`/`doc` after
+a code change and then reloading the already-running `serve` page picks up
+the new output automatically, no restart needed — `serve` re-reads
+`--graph`/`--doc` from disk on every request, it doesn't cache them.
 
 ### Replaying a real execution
 
@@ -114,56 +121,59 @@ whatever you just (re)generated.
 
 Run the target binary once (it must emit logs per the format below, to some
 file, e.g. `trace_output.jsonl`), then use **"Load trace…"** in the viewer
-to pick that file directly — no CLI step needed. If the viewer is running
-under `codemap serve`/`run`, the raw log is parsed server-side (the same
-`trace_log.py` the `trace` subcommand below uses); with no server to ask
-(e.g. `index.html` opened straight off disk) it falls back to an equivalent
-parser in the viewer itself. To keep a parsed copy on disk instead: `python
--m codemap trace --input /path/to/trace_output.jsonl --project
-/path/to/target-crate` (same default directory as `graph`/`doc`; omit
-`--project` to just write `trace.json` in the current directory).
+to pick that file directly — no CLI step needed, no separate command to
+convert it first. If the viewer is running under `codemap serve`/`run`,
+the raw log is parsed server-side (`trace_log.py`, via a `/__codemap_
+parse_trace` endpoint); with no server to ask (e.g. `index.html` opened
+straight off disk) it falls back to an equivalent parser in the viewer
+itself.
 
-Either way, hit **Play** (or **Step >**) in the viewer to replay the run.
+Hit **Play** (or **Step >**) in the viewer to replay the run.
 
 ### Doc-driven graph focus
 
 A crate with thousands of functions renders as an unreadable wall of nodes
 if you just dump the whole call-graph at once (see "Known limitations"). The
-left-hand **"Public API (doc index)"** panel is the way around that: load a
-`source_index.json` via **"Load doc index…"**, and it lists every
-`cargo doc`-documented item, grouped by crate then by class/type (both come
+left-hand **"Public API (doc index)"** panel is the way around that: once
+`source_index.json` is loaded (auto-loaded by `codemap run`, see above),
+it lists every `cargo doc`-documented item, grouped by crate then by
+class/type (both come
 straight from `doc_index.py`'s output — no new mapping: a method's class is
 the `Type` half of its `Type::method` node id, a free fn has none, and a
 type's own entry acts as its own class heading, which is why its methods
 land right under it).
 
-Clicking an entry does two things at once:
+Clicking an entry does two things at once, and it's fully symmetric —
+clicking a node **in the graph** does the same pair of things in reverse:
 
-1. **Focuses the graph** on that function plus everything it calls,
-   recursively (outgoing edges only — cytoscape's `successors()`, walked
-   ourselves layer by layer so it can be capped). Set **"Max call depth
-   (doc focus)"** in Settings (0 = unlimited) to bound it; if the cap
-   actually cut off real callees, the info panel and status bar say so
-   explicitly (`— truncated: ...`) rather than silently showing a
-   smaller-looking graph. **"Show full graph"** clears the focus.
-2. **Loads the native `cargo doc` HTML page** for that item in the frame
-   below the list — the real styled page (fields, trait impls, examples),
-   not just the signature/doc text also shown in the graph's info panel.
-   This needs the doc HTML actually served: `codemap run` wires this up
+1. **Pans/zooms the graph** to that node (a fixed, strong zoom level,
+   consistent regardless of how many other functions call it) and
+   highlights it (a soft halo, distinct from the untraced/visited/current/
+   last-step colors so it never conflicts with them) until the next click
+   or **"Show full graph"** (which now just resets the viewport — nothing
+   is ever hidden by this).
+2. **Updates the "Selected" panel** right below the doc list — the same
+   function name/signature/source-link/doc-comment info a graph node's
+   click already showed, now living in one place instead of two, plus an
+   **"Open in new tab"** button that opens that item's real `cargo doc`
+   HTML page (fields, trait impls, examples) in a full browser tab. This
+   needs the doc HTML actually served: `codemap run` wires this up
    automatically; calling `serve` directly needs `--docs <target
-   crate>/target/doc` (see "Command reference"). Without it, the frame
-   just says so instead of showing a broken/blocked `file://` load.
+   crate>/target/doc` (see "Command reference"). Without a matching
+   `docPage`, the button just stays disabled instead of opening a broken
+   link.
 
 An entry that isn't a node in the currently loaded graph (e.g. a struct's
 own doc page — the type itself isn't a call-graph node, only its methods
-are) still opens its native doc page, but can't focus the graph on it
+are) still opens its native doc page, but can't pan the graph to it
 (reported in the info panel, not a silent no-op).
 
 ## Tracing log format
 
 > **Status: partially settled.** This is the format the tool currently
-> parses correctly (both `codemap trace` and the viewer's client-side
-> parser implement exactly this). It has not yet been written up as a
+> parses correctly (both `trace_log.py`, used server-side, and the
+> viewer's own client-side fallback parser implement exactly this). It
+> has not yet been written up as a
 > formal, versioned spec — see [PROJECT.md](PROJECT.md) for what's still
 > open (root-span requirements, uniqueness of span names, field-naming
 > guarantees). Treat this section as "what works today", not a final
@@ -202,17 +212,26 @@ surprise.
 python -m codemap run   --project <path> [--port 8787] [--no-browser]
 python -m codemap graph --project <path> [--out <path>]
 python -m codemap doc   --project <path> [--graph <path>] [--out <path>]
-python -m codemap trace --input <path-to-log> [--project <path>] [--out <path>]
-python -m codemap serve [--dir viewer] [--docs <path>] [--port 8787]
+python -m codemap serve [--dir viewer] [--docs <path>] [--graph <path>] [--doc <path>] [--port 8787]
 ```
 
-`--out`/`--graph` default to `<target crate>/target/rust-codemap/<crate name>/...` — see
+`--out`/`--graph` (on `graph`/`doc`) default to `<target crate>/target/rust-codemap/<crate name>/...` — see
 above. Run any subcommand with `--help` for details.
 
-`run` always passes its own `--docs` to `serve` automatically (pointing at
-`<target crate>/target/doc/`, generated by the `doc` step it just ran) — see
-"Doc-driven graph focus" below for what that's for. Calling `serve` directly
-needs `--docs` spelled out if you want that too.
+`run` always passes its own `--docs`/`--graph`/`--doc` to `serve`
+automatically, pointing at exactly what it just generated: `--docs` at
+`<target crate>/target/doc/` (see "Doc-driven graph focus" below for what
+that's for), `--graph`/`--doc` at that run's `graph.json`/
+`source_index.json` (served at fixed `/graph.json` / `/source_index.json`
+URLs the viewer auto-loads on page load — see "Quick start"). Calling
+`serve` directly needs these spelled out if you want the same thing
+without regenerating — e.g. to reopen a graph you already built:
+
+```sh
+python -m codemap serve --graph /path/to/target/rust-codemap/<crate>/graph.json \
+                         --doc /path/to/target/rust-codemap/<crate>/source_index.json \
+                         --docs /path/to/target/doc
+```
 
 ## Multi-crate merging
 
@@ -299,11 +318,11 @@ each. In short, today:
   MIR (the viewer already supports styling `dispatch`/`loop_call`/
   `trampoline` differently if the generator is later extended to emit them).
 - There's no dedicated "call stack + timing" frame yet beyond the sidebar's
-  flat execution-trace list. The documentation frame does now show the real
-  rustdoc page (see "Doc-driven graph focus" above), alongside the scraped
-  signature/doc snippets inline in the graph's own info panel — but
-  navigating a link *inside* the rustdoc iframe doesn't sync the doc list's
-  selection or the graph's focus back to wherever that link went.
+  flat execution-trace list.
+- The real rustdoc page opens in a separate browser tab (see "Doc-driven
+  graph focus" above), not embedded in the viewer — navigating a link on
+  that page has no way to sync back to the doc list's selection or the
+  graph's focus, since it's a plain, unrelated tab at that point.
 
 ## License
 

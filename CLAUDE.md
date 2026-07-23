@@ -25,12 +25,21 @@ Run from the repo root. `--project <path>` always points at some *other*
 Rust crate on disk (there is no target crate committed to this repo).
 
 ```sh
-python -m codemap run   --project <path>                # graph + doc + serve, one shot
+python -m codemap run   --project <path>                # graph + doc + serve, one shot -- auto-loads in the viewer, no clicks
 python -m codemap graph --project <path>                 # -> <target_dir>/rust-codemap/<crate>/graph.json
 python -m codemap doc   --project <path>                  # -> <target_dir>/rust-codemap/<crate>/source_index.json
-python -m codemap trace --input <path-to-jsonl-log>         # -> trace.json (or <target_dir>/rust-codemap/<crate>/ with --project)
-python -m codemap serve                                       # http://localhost:8787/, serves viewer/ ONLY (no project data)
+python -m codemap serve --graph <path> --doc <path> [--docs <path>]  # re-serves already-generated output, re-read on every request
 ```
+
+No `trace` subcommand anymore -- removed once "Load trace…" in the viewer
+started accepting a raw log directly (parsed server-side via
+`/__codemap_parse_trace`, which still calls `trace_log.py`) and the other
+subcommands' own manual-load fallback (the old "Load graph…"/"Load doc
+index…" buttons) was removed too, in favor of the `--graph`/`--doc` auto-
+load above -- keeping a fourth, CLI-only, now-redundant path felt
+inconsistent once neither of those applied to it anymore. `serve` with no
+`--graph`/`--doc` now serves an empty shell: there is no other way to get
+a graph/doc index into the viewer.
 
 No `--bin`/`--lib`: dropped entirely once MIR generation stopped needing
 cargo told which target to build (see "Multi-crate merging" below) — the

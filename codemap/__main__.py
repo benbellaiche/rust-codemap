@@ -2,26 +2,35 @@
 
 Subcommands:
   run     Generate the call-graph + doc index for a target crate and serve
-          the viewer, in one step.
+          the viewer, in one step -- the graph and doc index load
+          automatically on page load, no further action needed.
   graph   Build the call-graph for a target crate AND every crate it
           actually (transitively) depends on locally -- not merely every
           crate that happens to share its workspace, which could include
           unrelated siblings or client binaries that depend on the target
           rather than the other way around. Runs `cargo build -p <each>`
           with `RUSTFLAGS=--emit=mir`, then extracts and merges the graph
-          from each one's MIR dump.
+          from each one's MIR dump. Useful on its own (paired with `serve
+          --graph ...`, already running) to regenerate just the graph after
+          a code change without rebuilding the doc index or restarting the
+          server -- `serve` re-reads its `--graph`/`--doc` files on every
+          request, so reloading the page alone picks up new output.
   doc     Cross-reference `cargo doc` output with a graph.json, producing
-          source_index.json (signatures, doc comments, source links).
-  trace   Convert a raw tracing_subscriber JSON-lines log into trace.json.
-  serve   Serve the viewer directory over plain HTTP.
+          source_index.json (signatures, doc comments, source links). Same
+          iterate-without-restarting use case as `graph`.
+  serve   Serve the viewer directory over plain HTTP, optionally also
+          serving a graph.json/source_index.json/doc root at fixed URLs
+          the viewer auto-loads (`--graph`/`--doc`/`--docs`) -- `run` always
+          passes its own just-generated ones. Without them there's nothing
+          to auto-load and no other way to load anything into the viewer:
+          the old "Load graph.../Load doc index..." file-picker fallback
+          was removed once auto-load made it redundant for the case it
+          existed for.
 
-`graph`/`doc`/`trace` write into
-`<target crate>/target/rust-codemap/<crate_name>/` by default -- next to
-cargo's own build output, never into this repo, and nested under the
-crate's own name so multiple crates in one workspace don't overwrite each
-other's output. The viewer never needs project-specific files sitting next
-to it: use the "Load graph..." / "Load doc index..." / "Load trace..."
-buttons in its toolbar to pick up whatever was generated.
+`graph`/`doc` write into `<target crate>/target/rust-codemap/<crate_name>/`
+by default -- next to cargo's own build output, never into this repo, and
+nested under the crate's own name so multiple crates in one workspace
+don't overwrite each other's output.
 
 Run `python -m codemap <subcommand> --help` for each command's options.
 See README.md for the full workflow and the tracing log format contract.
@@ -301,29 +310,6 @@ def cmd_doc(args) -> Path:
     return out_path
 
 
-# ── trace ────────────────────────────────────────────────────────────────
-
-def cmd_trace(args) -> Path:
-    in_path = Path(args.input)
-    if not in_path.exists():
-        sys.exit(f"ERROR: {in_path} not found")
-
-    if args.out:
-        out_path = Path(args.out)
-    elif args.project:
-        out_path = default_out_dir(require_manifest(args.project)) / "trace.json"
-    else:
-        out_path = Path("trace.json")
-
-    spans = trace_log.parse_trace(in_path.read_text(encoding="utf-8", errors="ignore"))
-    write_json(out_path, {"spans": spans})
-    print(f"OK {out_path}  ({len(spans)} spans)")
-    for s in spans:
-        it = f" x{s['iterations']}" if s["iterations"] > 1 else ""
-        print(f"  {'  ' * s['depth']}{s['name']}  {s['duration_ms']}ms{it}")
-    return out_path
-
-
 # ── serve ────────────────────────────────────────────────────────────────
 
 class LoggingHandler(http.server.SimpleHTTPRequestHandler):
@@ -343,11 +329,27 @@ class LoggingHandler(http.server.SimpleHTTPRequestHandler):
     a sibling static.files/ dir) resolve correctly through this same prefix
     without any rewriting."""
 
-    def __init__(self, *args, docs_root=None, **kwargs):
+    def __init__(self, *args, docs_root=None, graph_path=None, doc_path=None, **kwargs):
         self.docs_root = docs_root
+        self.graph_path = graph_path
+        self.doc_path = doc_path
         super().__init__(*args, **kwargs)
 
     def translate_path(self, path):
+        # graph.json/source_index.json are single files living wherever
+        # `codemap graph`/`doc` actually wrote them (next to the target
+        # crate, never next to this viewer) -- `run` knows those exact
+        # paths already, since it just generated them, so it can serve
+        # them at a fixed URL the viewer auto-fetches on load instead of
+        # requiring "Load graph…"/"Load doc index…" every single time.
+        # Returning the absolute path directly here needs no directory-
+        # swap trick (unlike --docs below): the base class's send_head()
+        # doesn't care whether translate_path's result sits under
+        # self.directory or not.
+        if path == "/graph.json" and self.graph_path:
+            return self.graph_path
+        if path == "/source_index.json" and self.doc_path:
+            return self.doc_path
         if self.docs_root and (path == "/docs" or path.startswith("/docs/")):
             original_directory = self.directory
             self.directory = self.docs_root
@@ -414,11 +416,18 @@ def cmd_serve(args):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     directory = str(Path(args.dir).resolve())
     docs_root = str(Path(args.docs).resolve()) if getattr(args, "docs", None) else None
-    handler = functools.partial(LoggingHandler, directory=directory, docs_root=docs_root)
+    graph_path = str(Path(args.graph).resolve()) if getattr(args, "graph", None) else None
+    doc_path = str(Path(args.doc).resolve()) if getattr(args, "doc", None) else None
+    handler = functools.partial(LoggingHandler, directory=directory, docs_root=docs_root,
+                                 graph_path=graph_path, doc_path=doc_path)
     with http.server.ThreadingHTTPServer(("", args.port), handler) as httpd:
         print(f"Serving {directory} at http://localhost:{args.port}/", flush=True)
         if docs_root:
             print(f"Serving {docs_root} at http://localhost:{args.port}/docs/", flush=True)
+        if graph_path:
+            print(f"Serving {graph_path} at http://localhost:{args.port}/graph.json (auto-loaded)", flush=True)
+        if doc_path:
+            print(f"Serving {doc_path} at http://localhost:{args.port}/source_index.json (auto-loaded)", flush=True)
         print("Press Ctrl+C to stop.", flush=True)
         try:
             httpd.serve_forever()
@@ -439,13 +448,17 @@ def cmd_run(args):
     print(f"  {graph_path}")
     print(f"  {doc_path}")
     url = f"http://localhost:{args.port}/"
-    print(f"\nStarting the viewer at {url}")
-    print('Use "Load graph..." and "Load doc index..." in the toolbar to pick the files above.')
+    print(f"\nStarting the viewer at {url} -- graph and doc index load automatically.")
+    print('Use "Load trace..." in the toolbar once you have a run to replay.')
 
     if not args.no_browser:
         webbrowser.open(url)
 
-    cmd_serve(SimpleNamespace(dir="viewer", port=args.port, docs=str(docs_root) if docs_root.exists() else None))
+    cmd_serve(SimpleNamespace(
+        dir="viewer", port=args.port,
+        docs=str(docs_root) if docs_root.exists() else None,
+        graph=str(graph_path), doc=str(doc_path),
+    ))
 
 
 # ── CLI wiring ───────────────────────────────────────────────────────────
@@ -474,16 +487,14 @@ def main():
     d.add_argument("--out", default=None, help="Where to write source_index.json (default: <target>/rust-codemap/<crate>/source_index.json)")
     d.set_defaults(func=cmd_doc)
 
-    t = sub.add_parser("trace", help="Parse a tracing_subscriber JSON-lines log into trace.json")
-    t.add_argument("--input", required=True, help="Path to the raw trace log (JSON lines)")
-    t.add_argument("--project", default=None, help="Optional -- if given, default --out is <target>/rust-codemap/<crate>/trace.json")
-    t.add_argument("--out", default=None, help="Where to write trace.json (default: trace.json, or under --project's target dir)")
-    t.set_defaults(func=cmd_trace)
-
     s = sub.add_parser("serve", help="Serve the viewer directory over HTTP")
     s.add_argument("--dir", default="viewer", help="Directory to serve (should contain index.html)")
     s.add_argument("--docs", default=None, help="Also serve this directory (a target/doc/ root) under /docs/, "
                                                   "so the viewer can embed native cargo-doc pages")
+    s.add_argument("--graph", default=None, help="graph.json to serve at /graph.json -- the viewer auto-loads "
+                                                   "it on page load instead of needing \"Load graph...\"")
+    s.add_argument("--doc", default=None, help="source_index.json to serve at /source_index.json -- "
+                                                 "auto-loaded the same way as --graph")
     s.add_argument("--port", type=int, default=8787)
     s.set_defaults(func=cmd_serve)
 

@@ -119,13 +119,22 @@ A generic, project-agnostic tool that, for **any Rust codebase**:
 
 ### 2.4 CLI (`codemap/` package, run as `python -m codemap <subcommand>`)
 
-A single entry point with subcommands (`run`, `graph`, `doc`, `trace`,
-`serve`) replacing what used to be several independently-invoked scripts
-plus manual `cargo rustc`/`cargo doc` calls. `graph` and `doc` use `cargo
+A single entry point with subcommands (`run`, `graph`, `doc`, `serve`)
+replacing what used to be several independently-invoked scripts plus
+manual `cargo rustc`/`cargo doc` calls. `graph` and `doc` use `cargo
 metadata` to resolve the target crate's actual `target_directory` (correct
 even inside a workspace) instead of guessing a path. This directly answers
 the "how is the tool invoked" open question from the original notes — see
 §4.
+
+~~`trace`~~ **removed** as a subcommand once the viewer stopped needing a
+pre-conversion step at all (raw logs load directly via "Load trace…",
+parsed server-side through `/__codemap_parse_trace` -- see §2.3/§3) *and*
+the other three subcommands lost their own file-picker fallback to an
+auto-load mechanism that made keeping a fourth, now-redundant CLI-only
+path in felt inconsistent. `trace_log.py` itself stays -- the server
+endpoint still calls it directly; only the standalone `cmd_trace` CLI
+wrapper and its argparse subparser are gone.
 
 Laid out as a proper Python package (`codemap/__main__.py`, `mir_graph.py`,
 `doc_index.py`, `trace_log.py` all under `codemap/`) rather than loose
@@ -204,22 +213,38 @@ so each crate's items resolve against that crate's own `src/`.
   button), node color by type (fn/method), edge color by type.
 - **Toolbar**, in three zones: title (left), playback actions — Play /
   Pause / `< Step` / `Step >` / Reset / Re-layout — centered, and
-  **Load graph…** / **Load doc index…** / **Load trace…** + **Settings**
-  on the right only.
+  **Load trace…** + **Settings** + **Log** on the right only.
 - **Settings bar**: houses toggles (currently "Hide/Show untraced") and the
   three animation sliders (play step, return step, hold-on-caller).
-- **Load graph…** / **Load doc index…** / **Load trace…**: plain file
-  pickers (`<input type="file">` + `FileReader`), reading straight off disk
-  client-side — no fetch, no server-side path coordination. This is the
-  mechanism that lets `viewer/` stay pure static tool assets regardless of
-  which target project (or how many, one after another) is being analyzed:
-  `loadGraph(g)` tears down and rebuilds the Cytoscape instance
-  (`cy.destroy()` then re-`initCy()`), and the doc/trace pickers just
-  replace `sourceIndex` / re-render the trace list. `fetch('graph.json')` /
-  `fetch('source_index.json')` on page load are kept as a convenience
-  fallback (silently does nothing if absent) for the rare case where
-  someone deliberately drops those files next to `index.html`, but it's no
-  longer the recommended flow — see §2.4.
+- **Auto-load on page load**: `fetch('/graph.json')` /
+  `fetch('/source_index.json')` (`cache: 'no-store'`), silently no-op on a
+  404 or any other failure. A much earlier version of this same idea
+  (fetching plain relative `graph.json`/`source_index.json`, hoping they'd
+  been dropped next to `index.html`) was deliberately removed for
+  "always 404s, that's not where output lands" -- this isn't that: the
+  real ask was "`codemap run` should need zero clicks," and the actual fix
+  was server-side, not client-side -- `run` now passes its own just-
+  generated paths to `serve` (`--graph`/`--doc`, alongside the existing
+  `--docs`), and `LoggingHandler.translate_path()` serves them at those
+  exact fixed URLs regardless of where on disk they really live -- the
+  same technique `--docs` already used (`__main__.py`), just returning an
+  absolute file path directly instead of swapping `self.directory` for a
+  whole subtree.
+  Only *then* did re-adding the fetch make sense: it now actually
+  resolves, for the one case (`codemap run`) it's meant to.
+  **The "Load graph…"/"Load doc index…" toolbar buttons and file pickers
+  are gone entirely** (removed once the auto-load above existed and made
+  them redundant for the one case they mattered for) -- `viewer/` no
+  longer has ANY client-side way to load a graph/doc index other than
+  these two fixed-URL fetches. Calling `serve` standalone now genuinely
+  needs `--graph`/`--doc` to show anything at all; without them it 404s on
+  both URLs and the page just sits empty, no fallback UI left to reach for.
+  This is a real, deliberate trade-off, not an oversight: the previous
+  file-picker mechanism worked with a graph/doc index from *anywhere*, not
+  just what `codemap` itself generated -- that flexibility is gone now.
+  **"Load trace…" deliberately stays manual** -- which run to replay can
+  change from one look at the same code to the next, unlike the graph/doc,
+  so there's no fixed answer to auto-load there even for `run`.
 - **Load trace…** additionally accepts either an already-parsed
   `trace.json` (`{spans: [...]}`) or a raw log, parsed client-side.
 - **Playback engine**: step-by-step replay (`stepTo`), with an animated
@@ -233,6 +258,11 @@ so each crate's items resolve against that crate's own `src/`.
   neutral ("untraced", not "static-only") since `traced === false` can mean
   either "structurally cannot be traced" or "a real function someone forgot
   to instrument" — the tool can't tell those apart.
+- **Default node color**: was `#a6e3a1` -- the *same* green as
+  `node.visited` during replay, so a never-visited node and an actually-
+  visited one were indistinguishable. Changed the default to blue
+  (`#89b4fa`); `visited` keeps the green (unchanged, along with `current`/
+  `last-step`/return-path colors -- only the *default* collided).
 - **Dynamic legend**: only lists edge types / states actually present in
   the currently loaded graph, grouped by shape (squares first, then lines).
 - **Doc cross-links in the info panel**: a node's signature renders with
@@ -246,25 +276,83 @@ so each crate's items resolve against that crate's own `src/`.
   `Type::method` id, straight off the id, no new mapping; a free fn has no
   class; a type's own struct/enum/trait entry is its own class heading, so
   its methods land under it for free). Clicking an entry does two things:
-  1. `focusOnCallees()`: a depth-limited BFS over outgoing edges only
-     (`outgoers('node')`, not Cytoscape's own `successors()`, specifically
-     so it can be capped — see "Max call depth" in Settings, 0 =
-     unlimited), hides everything outside the reached set, `cy.fit()`s to
-     it. If the depth cap actually excluded real callees, the info panel
-     and status bar say `truncated` explicitly rather than showing a
-     smaller graph with no indication anything was cut — "Show full graph"
-     clears it. Verified headless (Cytoscape, outside this repo) against
-     `dummy-api`'s real generated graph+doc output: correct reachable sets
-     including cross-crate trait-dispatch edges, correct truncation
-     flagging at every depth, graceful (no throw) on both a doc entry with
-     no matching graph node (e.g. a bare struct/enum/trait's own entry —
-     only its *methods* are graph nodes) and a nonexistent id.
+  1. `focusOnNode()`: pans/zooms to that node plus its immediate
+     neighborhood (`node.closedNeighborhood()`) and gives it a persistent
+     highlight (`.doc-focused`, an overlay halo — not a border/background
+     override, so it composes with untraced/visited/current/last-step
+     instead of fighting them over the same style properties) until the
+     next focus or "Show full graph" (now just a viewport reset,
+     `cy.fit()`, since nothing is hidden). **Replaced** an earlier version
+     (`focusOnCallees()`) that instead did a depth-limited BFS over
+     outgoing edges and hid everything outside the reached set — dropped
+     once the large-graph layout fixes (below) made the *whole* graph
+     usable at once: isolating a subtree stopped being necessary, and the
+     real ask that emerged instead was full sync between the graph and the
+     doc list, in both directions (see point 2's sibling `cy.on('tap',
+     'node', ...)` handler) — which an isolating filter actively worked
+     against, since it had to hide most of the graph to do its job. The
+     "Max call depth" setting went with it.
   2. Loads the actual `cargo doc` HTML page for that item into an `<iframe
      id="doc-frame">` stacked below the list (`/docs/<docPage>`, `#<anchor>`
      for methods) — the real rustdoc page, not just the extracted
      signature/doc text the info panel already showed. Needs the doc HTML
      served (see `--docs` below); says so in the frame instead of a
-     broken/blocked `file://` load if it isn't.
+     broken/blocked `file://` load if it isn't. Clicking a node **in the
+     graph** now does the same thing symmetrically (`cy.on('tap', 'node',
+     ...)` also calls `showDocPage()` and sets the same highlight) — full
+     two-way sync between graph and doc list, not just list-to-graph.
+
+  Follow-up fixes once the reporter tried this against the bulk-scale
+  fixture (§2.7), in two rounds -- the first round's zoom fix
+  (`FOCUS_NEIGHBOR_FIT_LIMIT`/`FOCUS_MIN_ZOOM`: fit to the neighborhood
+  below a size cutoff, fixed 1.4 zoom above it) still wasn't strong enough
+  reported back, so the second round **dropped the neighborhood-fit path
+  entirely**: `focusOnNode()` now always animates to `Math.max(cy.zoom(),
+  FOCUS_ZOOM)` (2.2) centered on just the node itself, every time,
+  regardless of degree -- consistent and predictable beats "usually fine,
+  sometimes weak," and it never zooms *out* if the user was already more
+  zoomed in than that. Second issue from the same round: the rustdoc page
+  in `#doc-frame` still wasn't comfortable to read even after widening
+  the sidebar (250px -> 460px default, 600px -> 1200px resize cap,
+  `rh-left`/`makeResizable()`) -- narrower than rustdoc's own desktop
+  breakpoint renders with bigger, cruder fonts, not something fixable
+  from our side of the iframe boundary (a different origin's page,
+  styling is its own). Added a **"Open in new tab"** button
+  (`#btn-doc-newtab`) instead of chasing iframe width further -- opens the
+  exact same `/docs/<docPage>#<anchor>` URL via `window.open(...,
+  '_blank')`, a real tab with no width constraint at all. `currentDocUrl`
+  (set by `showDocPage()`) backs the button, which stays disabled until a
+  doc page with a real `docPage` has actually been shown.
+
+  **Third round: the iframe itself is gone.** Even widened, it was never
+  actually used as a preview -- "Open in new tab" was. Removed `#doc-frame`
+  entirely along with `showDocPage()`'s iframe manipulation (it now only
+  tracks `currentDocUrl` and the button's enabled state). At the same
+  time, merged the two bottom panels that had ended up split across the
+  two side columns: `#info` (function name, signature, source link, doc
+  snippet -- previously at the bottom of the *right* `#sidebar`, alongside
+  the execution trace) moved into the *left* `#doc-sidebar`, right below
+  the now-iframe-less "Selected" header, next to the doc list and "Open in
+  new tab" it's actually related to. The right sidebar keeps only Legend
+  and Execution Trace now. `cy.on('tap', 'node', ...)` and the doc-list
+  click handler both still update the same `#info` (via `showNodeInfo()`)
+  and the same `currentDocUrl` (via `showDocPage()`) -- only *where* that
+  shared state renders changed, not the sync logic itself.
+
+  **Fourth round**: the sidebar went back to 250px (460px only ever
+  existed to make room for the now-gone iframe). The "Open in new tab"
+  button is gone too, replaced by making the name itself -- the `<b>` at
+  the top of `#info`, now `docLinkHtml()` -- a real `<a target="_blank">`
+  whenever `sourceIndex[id].docPage` exists. `showDocPage()`/
+  `currentDocUrl`/`#btn-doc-newtab` all removed; `buildInfoHtml()` and the
+  "not a node in the loaded graph" message in `focusOnNode()` both call
+  `docLinkHtml()` now, which is why the latter kept working for a doc
+  entry with no graph node (a bare struct/enum/trait's own page) -- it
+  never depended on the graph lookup succeeding to begin with. Also added
+  the one thing the legend never had: a green dot and a green line for
+  `visited`, alongside the `current`/`last-step` states it already listed
+  (their un-visited default was in there since the beginning; the
+  post-visit state never was).
   This closes the "not yet a separate doc frame with real rustdoc
   navigation" gap noted below, and the abandoned crate/class/trait
   *graph*-hierarchy idea (§4) landed here instead, scoped to the *list*
@@ -330,6 +418,40 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
   crates was, for a while, pulling in whatever depended on them too -- and
   now serves as the fixture for the reverse-dependency case specifically,
   and for the mixed overridden/non-overridden crate-name case (#6).
+- `dummy-{core,ops,api}/src/bulk/` — ~700 generated functions (a one-off
+  Python generator, not part of the shipped tool -- `strategy.rs`/
+  `trampoline.rs`/`recursion.rs`/`closures.rs`/`free.rs`/`getters.rs`/
+  `hubs.rs` per crate) exercising strategy (trait + several impls + a
+  dyn-dispatch `Context`), trampoline (driver loop calling several step
+  fns), self/mutual recursion, closures/iterator chains, plain free-fn
+  chains, untraced getters, one wide-fan-out orchestrator, and a pile of
+  never-called isolated fns -- all still typed as plain `call` edges, no
+  new edge-type distinction (decided against one; the animation is what's
+  supposed to show strategy/trampoline control flow, not static edge
+  color). Added because deploying against the real ~6300-node crate that
+  motivated the large-graph work (§3) is impractical -- this reproduces
+  the *scale* locally, without needing that real project at all. Surfaced
+  bug #9 below.
+
+  **v2, `bridges.rs` per crate**: the first version compiled fine but
+  rendered too cleanly -- every category stayed its own small isolated
+  cluster, nothing like the real crate's actual shape (a big, deeply
+  cross-linked call graph with no single entry point that reaches almost
+  everything). Added `bridges.rs`: base "bridge" functions built as a
+  genuine nested chain of small "hop" functions (hop0 calls a category
+  adapter target *and* hop1, hop1 calls its own target and hop2, ...),
+  plus "meta bridges" that each call a handful of base bridges, with the
+  specific bridges/steps picked so different bridges and meta-bridges
+  reuse each other's steps instead of staying in disjoint lanes -- real
+  crossing, not just depth. `dummy-ops`/`dummy-api`'s bridges also reach
+  down into lower crates' `bulk::free` (cross-crate depth, not just intra-
+  crate). Result on the merged graph: one connected component of 685 (of
+  1046) nodes, real depth of ~10 hops from a meta-bridge to a leaf,
+  fan-in up to 8-11 on shared convergence points -- surfaced two more
+  issues, both in the *viewer's* layout, not the generator: see the
+  breadthfirst/grid rewrite in §3.
+  `dummy-lib/README.md` doesn't cover this -- it's explicitly a stress-
+  test add-on, not part of the curated fixture the README documents.
 
 ## 3. Points to fix
 
@@ -450,6 +572,34 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
   itself the correct answer, not a gap). Verified across the full merged
   `dummy-api` graph and `dummy-cli` (reverse-dependency fixture), not just
   `dummy-core` in isolation, to catch any cross-crate-merge regression.
+
+  9. **Operator-overload desugaring collided with real local functions of
+     the same bare name.** Found via the `bulk/` stress fixture (§2.7): a
+     closure doing plain arithmetic (`v + i as i32`, inside an iterator
+     `.map()`) desugars to a call to `<&i32 as Add<i32>>::add` -- and the
+     regex meant to parse `<Type as Trait>::method` (`<([^>]+) as
+     [^>]+>::(\w+)$`) silently failed to match, because `Add<i32>` has its
+     *own* `>` before the wrapper's closing one, and `[^>]+` can't cross
+     it. Fell through to the module::free_fn fallback logic instead, which
+     saw a "type" starting with `<` (not an uppercase letter) and treated
+     it as a module qualifier to strip -- collapsing the whole thing down
+     to the bare method name, `add`. Since dummy-core *has* a real `add`
+     function, this manufactured a completely fictitious edge from every
+     such closure straight to it. Generalizes to any arithmetic/comparison
+     operator on a generic-parameterized type (`Sub<T>`, `Mul<Rhs>`, ...),
+     not just `Add<i32>` -- exactly the kind of code closures doing real
+     arithmetic produce constantly, so this wasn't some exotic edge case.
+     Fixed: switched both regex halves from `[^>]+` to `.+` (matches `>`
+     too) and extract type/method by construction after the match (find
+     the *last* `::` for the method, split the type on `<`/`>`/`&`/`mut `
+     to drop reference sigils and generic args) instead of trying to
+     bound the match with a character class that assumed no nesting.
+     `<&i32 as Add<i32>>::add` now correctly normalizes to `i32::add`,
+     which isn't any of our local ids, so it correctly produces no edge at
+     all -- verified the fix directly against several shapes (plain,
+     `&mut`, nested generics, dyn) and confirmed the real, pre-existing
+     `add`/`sub` cross-crate call sites (`Op::apply`, `Mode::compute`,
+     `Report::generate`, `double`) were untouched by the fix.
 - ~~Vendored dependencies aren't excluded~~ **Fixed the mechanism, but
   couldn't force a real repro to confirm it matters in practice.** Added
   `find_vendor_dirs()` (`__main__.py`): reads any `.cargo/config.toml` in
@@ -525,6 +675,42 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
   out `969 x 969` vs `breadthfirst`'s structure-dependent blow-up.
   `breadthfirst` is kept for components at or below 50 nodes, where it's
   bounded in practice and shows call depth, which `grid` doesn't.
+
+  **Revisited once real deployment against the reporter's own crate turned
+  out impractical** (see the `bulk/` stress fixture, §2.7): the blunt
+  50-node cutoff punished perfectly well-behaved *large* components too --
+  a genuinely deep, moderately-branching 685-node component got rendered
+  as a flat `grid` "blob" with its whole shape thrown away, purely for
+  being over the count, even though `breadthfirst` might have handled it
+  fine. Replaced with an adaptive check: try `breadthfirst` on every
+  component regardless of size, actually measure the resulting bounding
+  box, and only redo with `grid` if it's disproportionate for that node
+  count (`width/height > max(3000, n*40)`). Verified both directions on
+  the same real bulk-fixture graph: the pathological single-root case that
+  motivated the original fix still measures far over budget and still
+  gets `grid`; the 685-node component initially measured ~96,000 units
+  wide with a single root and would have gotten `grid` under the new
+  check too -- until a second, related fix (below) brought it back under
+  budget on its own.
+
+  Also found while checking that: `roots` was being passed only ONE zero-
+  indegree node, even though `nodesInComp.filter(n => n.indegree(true) ===
+  0)` was already computing all of them. A component often has *several*
+  independent entry points that only converge further downstream (e.g.
+  unrelated top-level functions sharing a common callee) -- breadthfirst
+  from a single root still has to place every *other* entry point
+  somewhere, and piles them all at shallow depth, which is exactly what
+  blew the width out. Passing the full list of zero-indegree nodes as
+  `roots` (each becomes the root of its own subtree) cut that same 685-
+  node component's `breadthfirst` width from ~96,000 to ~20,000 -- under
+  the adaptive budget, so it now stays `breadthfirst` and actually shows
+  its real hierarchy instead of falling back to `grid`. Verified in a real
+  browser (Playwright/Chromium), not just headless -- headless Cytoscape
+  gave materially different (and wrong) numbers for this specific
+  comparison, apparently because `avoidOverlap` behaves differently
+  without a real renderer measuring text/node dimensions; not safe to
+  trust for layout-sizing comparisons specifically, unlike the parsing/
+  logic tests elsewhere in this doc where it was fine.
 
   Confirmed fixed by the reporter -- the graph renders now. Their very next
   feedback, though: rendering ~everything at once is still unreadable at
