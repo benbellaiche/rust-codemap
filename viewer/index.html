@@ -458,6 +458,25 @@
                 wheelSensitivity: 0.15
             });
             logToServer('initCy', `cytoscape construction + layout done after ${Math.round(performance.now() - tCy)}ms -- post-processing (untraced/legend)...`);
+            // Diagnostic: are the positions the layout produced actually
+            // finite numbers, and does the viewport (zoom/pan/extent) cover
+            // wherever they ended up? A canvas silently draws nothing for
+            // NaN/Infinity coordinates -- no thrown error either way.
+            {
+                let nonFinite = 0, minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+                cy.nodes().forEach(node => {
+                    const p = node.position();
+                    if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) { nonFinite++; return; }
+                    if (p.x < minX) minX = p.x;
+                    if (p.x > maxX) maxX = p.x;
+                    if (p.y < minY) minY = p.y;
+                    if (p.y > maxY) maxY = p.y;
+                });
+                logToServer('initCy',
+                    `position check: ${nonFinite}/${cy.nodes().length} node(s) with non-finite position; ` +
+                    `bbox of the rest: x=[${minX}, ${maxX}] y=[${minY}, ${maxY}]; ` +
+                    `zoom=${cy.zoom()}; pan=${JSON.stringify(cy.pan())}; cy.extent()=${JSON.stringify(cy.extent())}`);
+            }
             // "traced" is computed by the generator straight from the MIR body
             // (presence of tracing Callsite scaffolding = #[instrument] expanded here).
             // A node with traced===false never produces a span, on any input — it
