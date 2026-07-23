@@ -133,14 +133,24 @@
             font-weight: bold;
             color: #89b4fa;
             text-transform: uppercase;
-            letter-spacing: .5px
+            letter-spacing: .5px;
+            cursor: pointer;
+            user-select: none
         }
 
         .doc-group-class {
             padding: 2px 10px 2px 18px;
             font-size: 10px;
             color: #94e2d5;
-            font-family: monospace
+            font-family: monospace;
+            cursor: pointer;
+            user-select: none
+        }
+
+        .doc-toggle {
+            display: inline-block;
+            width: 11px;
+            font-size: 9px
         }
 
         .doc-item {
@@ -654,47 +664,71 @@
                 // nodes (isolated components of size 1) -- skip the layout
                 // algorithm for those entirely, it has nothing to do anyway.
                 if (nodesInComp.length > 1) {
-                    // breadthfirst is nice to look at (it shows call depth
-                    // and crossing between branches -- grid throws both
-                    // away, it ignores edges entirely for positioning).
-                    // Its width grows with however many nodes share the
-                    // *widest single BFS level* though -- unbounded for a
-                    // flat/fan-out-heavy component (confirmed: a 2163-node
-                    // one came out ~1.2M units wide). A blunt node-count
-                    // threshold used to decide breadthfirst-vs-grid up
-                    // front -- but that punished perfectly well-behaved
-                    // large components too (a genuinely deep, moderately-
-                    // branching 685-node hierarchy rendered as a flat grid
-                    // "blob" with its whole shape thrown away, just for
-                    // being over the count). Try breadthfirst first
-                    // regardless of size, actually measure what it
-                    // produced, and only redo with grid if the result is
-                    // truly disproportionate for this many nodes.
-                    // A component can have many independent entry points
-                    // that only converge further downstream (e.g. several
-                    // unrelated top-level functions that happen to share
-                    // some callee) -- passing just ONE of them as `roots`
-                    // makes breadthfirst treat every *other* entry point as
-                    // if it were reachable from that one root too, which it
-                    // isn't; it still has to place them somewhere, so they
-                    // pile up at shallow depth and blow the width out
-                    // (confirmed on a real 685-node component: single root
-                    // -> ~96,000 units wide, all 53 of its actual zero-
-                    // indegree roots given at once -> ~20,000). Passing all
-                    // of them lets each be the root of its own subtree.
-                    const roots = nodesInComp.some(n => n.id() === 'main') ? ['main']
-                        : nodesInComp.filter(n => n.indegree(true) === 0).map(n => n.id());
+                    const rootNodes = nodesInComp.some(n => n.id() === 'main')
+                        ? nodesInComp.filter(n => n.id() === 'main')
+                        : nodesInComp.filter(n => n.indegree(true) === 0);
+                    // Plain (rectangular) breadthfirst puts each BFS level on
+                    // its own horizontal row, so the widest level sets the
+                    // component's *width* directly -- unbounded in one axis
+                    // only (confirmed: a synthetic 2000-node single-level
+                    // fan-out came out 114989x230, ratio 500:1). Its own
+                    // circle:true option moves that to a ring instead, which
+                    // sounded like the fix, but avoidOverlap under circle
+                    // mode turned out cosmetic, not real: it just scales
+                    // every ring's radius by the same factor, so the
+                    // innermost ring (fewest nodes, smallest radius, and
+                    // exactly where many independent roots pile up) keeps
+                    // real node-vs-node overlap no matter how far that
+                    // factor is pushed (measured: 353 overlapping pairs at
+                    // spacingFactor 1.5, still 37 left at 5, while the whole
+                    // component's footprint tripled getting there).
+                    // `concentric` is a different, purpose-built layout for
+                    // "place things in genuinely non-overlapping rings" --
+                    // minNodeSpacing grows each ring's radius by an actual
+                    // measured amount instead of a blanket multiplier
+                    // (measured: 0 overlaps at every minNodeSpacing tried,
+                    // ratio ~1:1, and the 2000-fan-out case above dropped to
+                    // 44619x44604 -- same zero-overlap guarantee, less than
+                    // half the old single-axis footprint). It doesn't take a
+                    // `directed`/`roots` option of its own though, so BFS
+                    // depth (== call depth, the reason breadthfirst was
+                    // chosen over grid in the first place -- grid ignores
+                    // edges for positioning entirely) has to be computed by
+                    // hand and fed in via `concentric()`, using every zero-
+                    // indegree node as a source at once for the same reason
+                    // multi-root breadthfirst did: a single root would make
+                    // every *other* independent entry point look like it's
+                    // reachable from it, piling them onto one ring instead
+                    // of each starting its own.
+                    const depth = {};
+                    const idToNode = {};
+                    nodesInComp.forEach(n => { idToNode[n.id()] = n; depth[n.id()] = Infinity; });
+                    const queue = [];
+                    rootNodes.forEach(r => { depth[r.id()] = 0; queue.push(r.id()); });
+                    for (let qi = 0; qi < queue.length; qi++) {
+                        const id = queue[qi], d = depth[id];
+                        idToNode[id].outgoers('node').forEach(m => {
+                            if (nodesInComp.contains(m) && depth[m.id()] > d + 1) {
+                                depth[m.id()] = d + 1;
+                                queue.push(m.id());
+                            }
+                        });
+                    }
+                    const maxDepth = Math.max(0, ...Object.values(depth).filter(d => d !== Infinity));
+                    nodesInComp.forEach(n => { if (depth[n.id()] === Infinity) depth[n.id()] = maxDepth + 1; });
                     comp.layout({
-                        name: 'breadthfirst', directed: true,
-                        roots: roots.length ? roots : undefined,
-                        spacingFactor: 1.15, avoidOverlap: true, animate: false,
+                        name: 'concentric',
+                        concentric: n => -depth[n.id()], // shallow call depth -> higher value -> nearer the center
+                        levelWidth: () => 1,
+                        minNodeSpacing: 20,
+                        avoidOverlap: true, animate: false,
                     }).run();
-                    const bfBox = comp.boundingBox();
+                    const cBox = comp.boundingBox();
                     const widthBudget = Math.max(3000, nodesInComp.length * 40);
-                    if (bfBox.w > widthBudget || bfBox.h > widthBudget) {
+                    if (cBox.w > widthBudget || cBox.h > widthBudget) {
                         logToServer('layoutComponents',
-                            `component of ${nodesInComp.length} nodes: breadthfirst came out ` +
-                            `w=${bfBox.w.toFixed(0)} h=${bfBox.h.toFixed(0)} (budget ${widthBudget}) -- redoing with grid`);
+                            `component of ${nodesInComp.length} nodes: concentric came out ` +
+                            `w=${cBox.w.toFixed(0)} h=${cBox.h.toFixed(0)} (budget ${widthBudget}) -- redoing with grid`);
                         comp.layout({ name: 'grid', avoidOverlap: true, avoidOverlapPadding: 20, condense: true, animate: false }).run();
                     }
                 }
@@ -805,6 +839,7 @@
                 const node = e.target;
                 setFocusedNode(node.id());
                 showNodeInfo(node);
+                revealInDocList(node.id());
             });
             cy.on('tap', 'edge', e => {
                 const d = e.target.data();
@@ -1021,6 +1056,20 @@
             if (entry.kind === 'fn') return '(free functions)';
             return id;
         }
+
+        // Crate/class headers are collapsible -- collapsedCrates/
+        // collapsedClasses just remember *which* keys are collapsed;
+        // updateDocListVisibility() is the one place that turns that,
+        // together with the search filter, into actual show/hide. Two
+        // independent mechanisms fighting over the same style.display
+        // would be a mess (a collapsed class re-appearing because a filter
+        // keystroke touched it, or vice versa) -- computing both together
+        // avoids that entirely. classKey alone isn't unique across crates
+        // (e.g. "(free functions)" repeats), so class collapse state is
+        // keyed by `${crateKey}::${classKey}`.
+        const collapsedCrates = new Set();
+        const collapsedClasses = new Set();
+
         function renderDocList() {
             const listEl = document.getElementById('doc-list');
             const ids = Object.keys(sourceIndex);
@@ -1038,57 +1087,101 @@
             });
             let html = '';
             Object.keys(tree).sort().forEach(crateKey => {
-                html += `<div class="doc-group-crate">${crateKey}</div>`;
+                html += `<div class="doc-group-crate" data-crate="${crateKey}">` +
+                    `<span class="doc-toggle"></span>${crateKey}</div>`;
                 const classes = tree[crateKey];
                 Object.keys(classes).sort().forEach(classKey => {
-                    html += `<div class="doc-group-class">${classKey}</div>`;
+                    const classId = `${crateKey}::${classKey}`;
+                    html += `<div class="doc-group-class" data-crate="${crateKey}" data-class="${classId}">` +
+                        `<span class="doc-toggle"></span>${classKey}</div>`;
                     classes[classKey].sort().forEach(id => {
                         const entry = sourceIndex[id];
                         const label = entry.kind === 'method' ? id.split('::').slice(1).join('::') : id;
-                        html += `<div class="doc-item" data-id="${id}">${label}</div>`;
+                        html += `<div class="doc-item" data-id="${id}" data-crate="${crateKey}" data-class="${classId}">${label}</div>`;
                     });
                 });
             });
             listEl.innerHTML = html;
+            listEl.querySelectorAll('.doc-group-crate').forEach(el => {
+                el.addEventListener('click', () => toggleDocCollapse(collapsedCrates, el.dataset.crate));
+            });
+            listEl.querySelectorAll('.doc-group-class').forEach(el => {
+                el.addEventListener('click', () => toggleDocCollapse(collapsedClasses, el.dataset.class));
+            });
             listEl.querySelectorAll('.doc-item').forEach(el => {
                 el.addEventListener('click', () => focusOnNode(el.dataset.id));
             });
-            // Re-apply whatever's currently typed in the filter box -- the
-            // list was just fully rebuilt, so without this a previously
-            // typed filter stays visible in the search box while the list
-            // itself silently shows everything, unfiltered, until the next
-            // keystroke.
-            document.getElementById('doc-search').dispatchEvent(new Event('input'));
+            updateDocListVisibility();
         }
-        // Hides a class/crate group header too once none of its items match
-        // the filter, instead of leaving a heading floating over nothing.
-        document.getElementById('doc-search').addEventListener('input', e => {
-            const q = e.target.value.toLowerCase();
+
+        function toggleDocCollapse(set, key) {
+            if (set.has(key)) set.delete(key); else set.add(key);
+            updateDocListVisibility();
+        }
+
+        // The one place that combines collapse state + the search filter
+        // into final visibility. A crate/class header shows only if it has
+        // at least one filter-matching item *and* isn't itself collapsed
+        // (matches the pre-collapse behavior: hides a heading floating
+        // over nothing); an item shows only if it matches the filter *and*
+        // neither its class nor its crate is collapsed.
+        function updateDocListVisibility() {
+            const q = document.getElementById('doc-search').value.toLowerCase();
             const listEl = document.getElementById('doc-list');
-            let classEl = null, crateEl = null, classHasMatch = false, crateHasMatch = false;
-            const flushClass = () => { if (classEl) classEl.style.display = classHasMatch ? '' : 'none'; };
-            const flushCrate = () => { if (crateEl) crateEl.style.display = crateHasMatch ? '' : 'none'; };
-            Array.from(listEl.children).forEach(el => {
-                if (el.classList.contains('doc-group-crate')) {
-                    flushClass(); flushCrate();
-                    crateEl = el; classEl = null; crateHasMatch = false; classHasMatch = false;
-                } else if (el.classList.contains('doc-group-class')) {
-                    flushClass();
-                    classEl = el; classHasMatch = false;
-                } else {
-                    const show = el.dataset.id.toLowerCase().includes(q);
-                    el.style.display = show ? '' : 'none';
-                    if (show) { classHasMatch = true; crateHasMatch = true; }
-                }
+            const items = Array.from(listEl.querySelectorAll('.doc-item'));
+            const classHasMatch = {}, crateHasMatch = {};
+            items.forEach(el => {
+                const match = el.dataset.id.toLowerCase().includes(q);
+                el.dataset.match = match ? '1' : '0';
+                if (match) { classHasMatch[el.dataset.class] = true; crateHasMatch[el.dataset.crate] = true; }
             });
-            flushClass(); flushCrate();
-        });
+            listEl.querySelectorAll('.doc-group-crate').forEach(el => {
+                const collapsed = collapsedCrates.has(el.dataset.crate);
+                el.style.display = crateHasMatch[el.dataset.crate] ? '' : 'none';
+                el.querySelector('.doc-toggle').textContent = collapsed ? '▸' : '▾';
+            });
+            listEl.querySelectorAll('.doc-group-class').forEach(el => {
+                const collapsed = collapsedClasses.has(el.dataset.class);
+                const visible = !collapsedCrates.has(el.dataset.crate) &&
+                    crateHasMatch[el.dataset.crate] && classHasMatch[el.dataset.class];
+                el.style.display = visible ? '' : 'none';
+                el.querySelector('.doc-toggle').textContent = collapsed ? '▸' : '▾';
+            });
+            items.forEach(el => {
+                const visible = el.dataset.match === '1' &&
+                    !collapsedCrates.has(el.dataset.crate) && !collapsedClasses.has(el.dataset.class);
+                el.style.display = visible ? '' : 'none';
+            });
+        }
+        document.getElementById('doc-search').addEventListener('input', updateDocListVisibility);
+
+        // Clicking a node *in the graph* used to leave the doc list exactly
+        // as it was -- if the matching entry sat under a collapsed crate/
+        // class, there was no way to tell where it was without manually
+        // expanding things to go find it. Un-collapses just the two groups
+        // this one id actually needs (not everything -- unrelated collapsed
+        // sections stay collapsed) and scrolls it into view. A no-op if
+        // this id was never in the doc index to begin with (an internal fn
+        // cargo doc never generated a page for -- nothing to reveal).
+        function revealInDocList(id) {
+            const entry = sourceIndex[id];
+            if (!entry) return;
+            const crateKey = entry.crate || '(unknown crate)';
+            const classId = `${crateKey}::${classKeyFor(id, entry)}`;
+            // Both .delete() calls must run regardless -- `||` would
+            // short-circuit and skip the second one entirely.
+            const crateWasCollapsed = collapsedCrates.delete(crateKey);
+            const classWasCollapsed = collapsedClasses.delete(classId);
+            if (crateWasCollapsed || classWasCollapsed) updateDocListVisibility();
+            document.querySelector(`.doc-item[data-id="${id}"]`)?.scrollIntoView({ block: 'nearest' });
+        }
 
         // Keeps the graph <-> doc-list views in sync around a single
-        // "currently selected" node: clicking a node in the graph enables
-        // "Open in new tab" for its native doc page (see the cy.on('tap',
-        // 'node', ...) handler below); clicking a doc-list entry does the
-        // reverse -- pans/zooms to that node in the graph. Nothing is
+        // "currently selected" node: clicking a node in the graph reveals
+        // and scrolls to it in the doc list, and links its name to its
+        // native doc page in #info (see the cy.on('tap', 'node', ...)
+        // handler below); clicking a doc-list entry does the reverse --
+        // pans/zooms to that node in the graph. Nothing is
         // hidden either way (that was the previous, now-removed focusOnCallees()
         // behavior) -- the graph stays exactly as it was, just re-centered.
         let focusedNodeId = null;
@@ -1123,6 +1216,23 @@
                 return;
             }
             setFocusedNode(id);
+            // Reset any local reveal-override from a *previous* focus back
+            // to the global "Hide untraced" setting first, so these never
+            // accumulate across clicks -- cheap (just re-applies the same
+            // class-based hide/show), a no-op if there was nothing to undo.
+            applyUntracedVisibility(showUntraced);
+            if (!node.visible()) {
+                // Hidden because it's untraced and "Hide untraced" is on.
+                // Revealing just this node wouldn't show anything useful on
+                // its own -- an edge stays hidden if *either* endpoint is,
+                // so its neighbors need revealing too, or there'd be a
+                // visible node with no visible connections to anything.
+                // This is a local exception for this node's neighborhood
+                // only; the rest of the graph's untraced nodes stay exactly
+                // as hidden as the global toggle says.
+                node.closedNeighborhood().show();
+                logToServer('focusOnNode', `${id}: revealed despite "Hide untraced" (local override, its neighborhood too)`);
+            }
             cy.animate({ zoom: Math.max(cy.zoom(), FOCUS_ZOOM), center: { eles: node } }, { duration: 400 });
             showNodeInfo(node);
             logToServer('focusOnNode', `${id}: centered at zoom >= ${FOCUS_ZOOM}`);
@@ -1131,6 +1241,7 @@
         document.getElementById('btn-clear-focus').addEventListener('click', () => {
             if (!cy) return;
             setFocusedNode(null);
+            applyUntracedVisibility(showUntraced); // undoes any focus-driven untraced reveal-override
             cy.animate({ fit: { padding: 60 } }, { duration: 400 });
             logToServer('btn-clear-focus', 'reset view to the full graph');
         });

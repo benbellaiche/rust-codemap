@@ -284,32 +284,52 @@ so each crate's items resolve against that crate's own `src/`.
   (`classKeyFor()` — a method's class is the `Type` half of its
   `Type::method` id, straight off the id, no new mapping; a free fn has no
   class; a type's own struct/enum/trait entry is its own class heading, so
-  its methods land under it for free). Clicking an entry does two things:
-  1. `focusOnNode()`: pans/zooms to that node plus its immediate
-     neighborhood (`node.closedNeighborhood()`) and gives it a persistent
-     highlight (`.doc-focused`, an overlay halo — not a border/background
-     override, so it composes with untraced/visited/current/last-step
-     instead of fighting them over the same style properties) until the
-     next focus or "Show full graph" (now just a viewport reset,
-     `cy.fit()`, since nothing is hidden). **Replaced** an earlier version
-     (`focusOnCallees()`) that instead did a depth-limited BFS over
-     outgoing edges and hid everything outside the reached set — dropped
-     once the large-graph layout fixes (below) made the *whole* graph
-     usable at once: isolating a subtree stopped being necessary, and the
-     real ask that emerged instead was full sync between the graph and the
-     doc list, in both directions (see point 2's sibling `cy.on('tap',
-     'node', ...)` handler) — which an isolating filter actively worked
-     against, since it had to hide most of the graph to do its job. The
-     "Max call depth" setting went with it.
-  2. Loads the actual `cargo doc` HTML page for that item into an `<iframe
-     id="doc-frame">` stacked below the list (`/docs/<docPage>`, `#<anchor>`
-     for methods) — the real rustdoc page, not just the extracted
-     signature/doc text the info panel already showed. Needs the doc HTML
-     served (see `--docs` below); says so in the frame instead of a
-     broken/blocked `file://` load if it isn't. Clicking a node **in the
-     graph** now does the same thing symmetrically (`cy.on('tap', 'node',
-     ...)` also calls `showDocPage()` and sets the same highlight) — full
-     two-way sync between graph and doc list, not just list-to-graph.
+  its methods land under it for free). **Crate/class headers are
+  collapsible** (`collapsedCrates`/`collapsedClasses`, two `Set`s of keys
+  -- class keys are `${crate}::${class}` since a bare class name like
+  "(free functions)" repeats across crates). One function,
+  `updateDocListVisibility()`, combines that collapse state with the
+  search filter into final `display` values -- deliberately not two
+  independent mechanisms fighting over the same style property (a
+  collapsed class re-appearing because a filter keystroke touched it, or
+  vice versa). A header shows if it has >=1 filter-matching descendant
+  regardless of its *own* collapse state (so you can still find and
+  re-expand it), but a class header additionally hides if its parent
+  crate is collapsed. `revealInDocList(id)` runs the other direction: a
+  node clicked *in the graph* un-collapses (only) the crate/class this
+  specific id needs and scrolls to it -- previously the doc list was
+  untouched by a graph click, so a match sitting under a collapsed group
+  was invisible with no way to tell where it went; two independent
+  `Set.delete()` calls (not `||`-chained, which would've short-circuited
+  the second one) so collapsing state for both levels is checked
+  regardless of whether the first one hit. A no-op if the id was never in
+  the doc index to begin with. Clicking an entry (current state, after
+  four rounds of revision below) does two things, and a graph node click
+  does the symmetric reverse:
+  1. `focusOnNode()`: animates to `Math.max(cy.zoom(), FOCUS_ZOOM)` (2.2),
+     centered on the node, and gives it a persistent highlight
+     (`.doc-focused`, an overlay halo — composes with untraced/visited/
+     current/last-step instead of fighting them over the same style
+     properties) until the next focus or "Show full graph". If the node is
+     hidden (untraced, "Hide untraced" on), reveals it *and its immediate
+     neighborhood* first (§ below) — revealing just the node alone
+     wouldn't show anything useful, an edge stays hidden if either
+     endpoint is.
+  2. `docLinkHtml()` makes the name itself (`#info`'s `<b>`/`<a>`) a real
+     `<a target="_blank">` to that item's native `cargo doc` page whenever
+     `sourceIndex[id].docPage` exists — see the "Fourth round" below for
+     why it's a plain link and not an iframe/button.
+  `revealInDocList()` runs the graph-to-list direction: un-collapses (only)
+  the crate/class a clicked node's id needs and scrolls to it.
+
+  **Replaced** an earlier version (`focusOnCallees()`) that instead did a
+  depth-limited BFS over outgoing edges and hid everything outside the
+  reached set — dropped once the large-graph layout fixes (below) made the
+  *whole* graph usable at once: isolating a subtree stopped being
+  necessary, and the real ask that emerged instead was full sync between
+  the graph and the doc list, in both directions — which an isolating
+  filter actively worked against, since it had to hide most of the graph
+  to do its job. The "Max call depth" setting went with it.
 
   Follow-up fixes once the reporter tried this against the bulk-scale
   fixture (§2.7), in two rounds -- the first round's zoom fix
@@ -362,6 +382,23 @@ so each crate's items resolve against that crate's own `src/`.
   `visited`, alongside the `current`/`last-step` states it already listed
   (their un-visited default was in there since the beginning; the
   post-visit state never was).
+
+  **Fifth round**: focusing an untraced node while "Hide untraced" is on
+  used to move the viewport to the right place and then show... nothing,
+  since the target itself was still `.hide()`-den. `focusOnNode()` now
+  checks `!node.visible()` first and, if so, calls
+  `node.closedNeighborhood().show()` -- the node *and* its direct
+  neighbors, since an edge with either endpoint hidden stays hidden too;
+  revealing the node alone would still show a connectionless dot. Scoped
+  to just that neighborhood, not a global toggle flip: every *other*
+  untraced node stays exactly as hidden as "Hide untraced" says (checked
+  directly -- focus a deeply-untraced node in the bulk fixture, confirm
+  dozens of *unrelated* untraced nodes elsewhere stay hidden). The
+  override doesn't accumulate across clicks: every `focusOnNode()` call
+  starts by re-running `applyUntracedVisibility(showUntraced)` -- cheap
+  (one class-selector hide/show pass), a no-op if there was nothing to
+  undo, and it's what a *previous* focus's reveal actually gets undone by
+  before the new one applies. "Show full graph" does the same reset.
   This closes the "not yet a separate doc frame with real rustdoc
   navigation" gap noted below, and the abandoned crate/class/trait
   *graph*-hierarchy idea (§4) landed here instead, scoped to the *list*
@@ -728,6 +765,49 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
   graphs). That's what motivated the doc-driven graph focus feature (§2.5) —
   navigate in from a specific public function instead of trying to make the
   whole graph legible at once.
+
+  **Revisited again**: on the reporter's real, larger library, showing
+  everything at once still crowded the horizontal axis so badly that dense
+  edge crossings visually merged into solid filled shapes. Root cause:
+  rectangular `breadthfirst` puts each BFS level on its own horizontal row,
+  so the widest level sets the component's *width* directly and its height
+  barely grows — confirmed on a synthetic 2000-node single-level fan-out,
+  which came out `114989 x 230` (ratio 500:1); the same shape on the
+  dummy-cli fixture's real 685-node component measured `26387 x 2104`
+  (ratio ~12.5:1). First attempt: `breadthfirst`'s own `circle: true` option,
+  which places each BFS level on a ring instead of a row, turning "widest
+  level" into a *radius* that both axes absorb equally (confirmed: same
+  2000-fan-out case dropped to `705 x 687`, ratio ~1:1). But `avoidOverlap`
+  under `circle` mode turned out to be cosmetic, not a real collision-avoidance
+  pass — it just scales every ring's radius by the same `spacingFactor`, so
+  the innermost ring (fewest nodes, smallest radius, and exactly where
+  several independent zero-indegree roots pile up together) kept genuine
+  node-vs-node overlap no matter how far that factor was pushed: measured
+  353 overlapping node pairs at `spacingFactor: 1.5` on the 685-node
+  component, still 37 left at `spacingFactor: 5`, by which point its overall
+  footprint had roughly tripled trying to fix it. Switched to Cytoscape's
+  `concentric` layout instead, which is purpose-built for genuinely
+  non-overlapping rings via `minNodeSpacing` (a real measured gap, not a
+  blanket multiplier). It doesn't take a `directed`/`roots` option of its
+  own, so BFS depth from every zero-indegree root at once (same multi-root
+  reasoning as the fix two paragraphs up, just needed by hand here) is
+  computed manually and fed in via `concentric: n => -depth[n.id()]`
+  (shallower call depth -> higher value -> nearer the center). Result on the
+  685-node component: `9321 x 9215` (ratio ~1:1), **zero** overlapping node
+  pairs at every `minNodeSpacing` tried (10 through 50); the synthetic
+  2000-fan-out case dropped to `44619 x 44604` — same zero-overlap
+  guarantee `circle` mode was chasing, at less than half the single-axis
+  footprint `breadthfirst`/`circle` needed to *not even fully achieve it*.
+  Verified in a real browser (Playwright/Chromium) against the dummy-cli
+  fixture: overall canvas aspect ratio went from ~4.7:1 to ~0.76:1, and a
+  pairwise bounding-box check across the biggest component's nodes came back
+  0 overlaps (both before-fix confirmation of the problem — 22 overlapping
+  pairs at the innermost ring under the old code — and after-fix
+  verification). All prior layout-adjacent regression tests (untraced-node
+  focus reveal, doc-list reveal-on-click) re-run and still pass unchanged.
+  The `grid` fallback for disproportionate components is unchanged and kept
+  as a safety net, though `concentric`'s footprint came in well under its
+  budget in every case measured here.
 
 ## 4. Points to decide
 
