@@ -297,8 +297,9 @@ class LoggingHandler(http.server.SimpleHTTPRequestHandler):
         try:
             payload = json.loads(body.decode("utf-8", errors="replace"))
         except ValueError:
-            payload = {"context": "?", "message": body.decode("utf-8", errors="replace")}
-        print(f"\n[browser error] {payload.get('context', '?')}: {payload.get('message', '')}", flush=True)
+            payload = {"context": "?", "message": body.decode("utf-8", errors="replace"), "level": "error"}
+        tag = "[browser error]" if payload.get("level") == "error" else "[browser]"
+        print(f"{tag} {payload.get('context', '?')}: {payload.get('message', '')}", flush=True)
         if payload.get("stack"):
             print(payload["stack"], flush=True)
         self.send_response(204)
@@ -306,6 +307,13 @@ class LoggingHandler(http.server.SimpleHTTPRequestHandler):
 
 
 def cmd_serve(args):
+    # Browser-supplied log/error text (see LoggingHandler.do_POST) can
+    # contain arbitrary Unicode. The default console encoding on Windows
+    # (cp1252, not UTF-8) throws UnicodeEncodeError on print() for
+    # anything outside it -- which kills that request's handler thread
+    # silently (the server keeps running, but that one message never
+    # appears). Reconfigure so it's replaced with '?' instead of crashing.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     directory = str(Path(args.dir).resolve())
     handler = functools.partial(LoggingHandler, directory=directory)
     with http.server.ThreadingHTTPServer(("", args.port), handler) as httpd:

@@ -372,10 +372,25 @@
         let animPlay = 700, animStep = 280, animHold = 550;
         let loopAnimRunning = false, loopAnimEdges = null;
 
-        // Report a client-side error to the server's own terminal (see
-        // LoggingHandler in codemap/__main__.py) -- easier to spot there
-        // than in the browser console while iterating on a load/render
-        // failure. Best-effort: never throws, never blocks the caller.
+        // Log to the server's own terminal (see LoggingHandler in
+        // codemap/__main__.py) -- easier to watch there than the browser
+        // console while iterating on a load/render problem. logToServer is
+        // for systematic step-by-step progress (so a *silent hang* --
+        // e.g. a huge graph freezing the tab with no thrown error at all
+        // -- still shows exactly which step never printed its "done"); the
+        // one that never got followed by its own completion log is where
+        // it's stuck. reportError is for actual thrown/rejected errors.
+        // Both are best-effort: never throw, never block the caller.
+        function logToServer(context, message, level = 'info') {
+            (level === 'error' ? console.error : console.log)(`[${context}]`, message);
+            try {
+                fetch('/__codemap_log', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ context, message, level }),
+                }).catch(() => { });
+            } catch { /* fetch itself unavailable/blocked -- nothing more we can do */ }
+        }
         function reportError(context, err) {
             const message = (err && err.message) ? err.message : String(err);
             const stack = (err && err.stack) ? err.stack : null;
@@ -384,7 +399,7 @@
                 fetch('/__codemap_log', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ context, message, stack }),
+                    body: JSON.stringify({ context, message, stack, level: 'error' }),
                 }).catch(() => { });
             } catch { /* fetch itself unavailable/blocked -- nothing more we can do */ }
         }
@@ -400,6 +415,8 @@
             // so fall back to Cytoscape's own root detection (nodes with no
             // incoming edges) rather than assuming "main" always exists.
             const rootId = elems.some(e => e.data && e.data.nodeType && e.data.id === 'main') ? 'main' : undefined;
+            logToServer('initCy', `constructing cytoscape instance (${elems.length} elements total) + running breadthfirst layout...`);
+            const tCy = performance.now();
             cy = cytoscape({
                 container: document.getElementById('cy'),
                 elements: elems,
@@ -440,6 +457,7 @@
                 layout: { name: 'breadthfirst', directed: true, roots: rootId ? [rootId] : undefined, spacingFactor: 2.8, avoidOverlap: true, padding: 60, animate: false },
                 wheelSensitivity: 0.15
             });
+            logToServer('initCy', `cytoscape construction + layout done after ${Math.round(performance.now() - tCy)}ms -- post-processing (untraced/legend)...`);
             // "traced" is computed by the generator straight from the MIR body
             // (presence of tracing Callsite scaffolding = #[instrument] expanded here).
             // A node with traced===false never produces a span, on any input — it
@@ -461,6 +479,7 @@
             });
             const n = elems.filter(e => e.data.nodeType).length, ed = elems.filter(e => e.data.edgeType).length;
             document.getElementById('status').textContent = `${n} nodes | ${ed} edges`;
+            logToServer('initCy', `done (${n} nodes, ${ed} edges)`);
         }
 
         let showUntraced = false;
@@ -602,10 +621,16 @@
                 '<p style="padding:8px 10px;color:#6c7086;font-size:11px">Click Play to load & animate.</p>';
             document.getElementById('info').innerHTML = 'Click a node for details.';
             const n = g.nodes ? g.nodes.length : 0, ed = g.edges ? g.edges.length : 0;
+            const label = `loadGraph (${n} nodes, ${ed} edges)`;
+            logToServer(label, 'building elements array...');
+            const elems = [...g.nodes, ...g.edges];
+            logToServer(label, 'calling initCy (cytoscape construction + layout)...');
+            const t0 = performance.now();
             try {
-                initCy([...g.nodes, ...g.edges]);
+                initCy(elems);
+                logToServer(label, `initCy returned after ${Math.round(performance.now() - t0)}ms`);
             } catch (err) {
-                reportError(`loadGraph (initCy, ${n} nodes, ${ed} edges)`, err);
+                reportError(label, err);
                 document.getElementById('status').textContent =
                     `ERROR while rendering (${n} nodes, ${ed} edges) — see server terminal for details`;
             }
@@ -620,8 +645,11 @@
             const file = e.target.files[0];
             e.target.value = '';
             if (!file) return;
+            logToServer('Load graph…', `selected ${file.name} (${file.size} bytes) -- reading file...`);
             const reader = new FileReader();
+            reader.onerror = () => reportError('Load graph… (FileReader)', reader.error);
             reader.onload = () => {
+                logToServer('Load graph…', `file read (${reader.result.length} chars) -- parsing JSON...`);
                 let g;
                 try { g = JSON.parse(reader.result); }
                 catch (err) {
@@ -629,6 +657,7 @@
                     document.getElementById('status').textContent = `ERROR: ${file.name} is not valid JSON`;
                     return;
                 }
+                logToServer('Load graph…', `parsed: ${g.nodes?.length ?? 0} nodes, ${g.edges?.length ?? 0} edges -- handing off to loadGraph...`);
                 loadGraph(g); // sets #status to the new node/edge count
             };
             reader.readAsText(file);
@@ -641,14 +670,18 @@
             const file = e.target.files[0];
             e.target.value = '';
             if (!file) return;
+            logToServer('Load doc index…', `selected ${file.name} (${file.size} bytes) -- reading file...`);
             const reader = new FileReader();
+            reader.onerror = () => reportError('Load doc index… (FileReader)', reader.error);
             reader.onload = () => {
+                logToServer('Load doc index…', `file read (${reader.result.length} chars) -- parsing JSON...`);
                 try { sourceIndex = JSON.parse(reader.result); }
                 catch (err) {
                     reportError(`Load doc index… (parsing ${file.name})`, err);
                     document.getElementById('status').textContent = `ERROR: ${file.name} is not valid JSON`;
                     return;
                 }
+                logToServer('Load doc index…', `parsed: ${Object.keys(sourceIndex).length} entries`);
                 document.getElementById('status').textContent = `Loaded doc index: ${file.name}`;
             };
             reader.readAsText(file);
