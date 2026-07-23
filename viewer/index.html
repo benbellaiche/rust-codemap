@@ -439,13 +439,25 @@
                 // nodes (isolated components of size 1) -- skip the layout
                 // algorithm for those entirely, it has nothing to do anyway.
                 if (nodesInComp.length > 1) {
-                    const rootId = nodesInComp.some(n => n.id() === 'main') ? 'main'
-                        : nodesInComp.filter(n => n.indegree(true) === 0).map(n => n.id())[0];
-                    comp.layout({
-                        name: 'breadthfirst', directed: true,
-                        roots: rootId ? [rootId] : undefined,
-                        spacingFactor: 1.15, avoidOverlap: true, animate: false,
-                    }).run();
+                    // breadthfirst is nice to look at (it shows call depth),
+                    // but its width grows with however many nodes share the
+                    // *widest single BFS level* -- unbounded for a large,
+                    // flat/fan-out-heavy component (confirmed: a 2163-node
+                    // component came out ~1.2M units wide). grid has no such
+                    // failure mode -- its width/height are always ~sqrt(N),
+                    // so it's the safe choice once a component is big enough
+                    // for that kind of level to plausibly occur.
+                    if (nodesInComp.length <= 50) {
+                        const rootId = nodesInComp.some(n => n.id() === 'main') ? 'main'
+                            : nodesInComp.filter(n => n.indegree(true) === 0).map(n => n.id())[0];
+                        comp.layout({
+                            name: 'breadthfirst', directed: true,
+                            roots: rootId ? [rootId] : undefined,
+                            spacingFactor: 1.15, avoidOverlap: true, animate: false,
+                        }).run();
+                    } else {
+                        comp.layout({ name: 'grid', avoidOverlap: true, avoidOverlapPadding: 20, condense: true, animate: false }).run();
+                    }
                 }
                 const bb = comp.boundingBox();
                 if (idx < 5) {

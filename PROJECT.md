@@ -388,9 +388,28 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
   ourselves. Verified with a headless Cytoscape script (synthetic graph,
   same node/edge shape: small clusters + many singletons) outside the repo,
   comparing old vs new bounding-box width on the identical input — new
-  approach came out ~1270x smaller. Not yet confirmed at the reporter's
-  actual scale/graph (pending: reload and re-check the same diagnostic log
-  line).
+  approach came out ~1270x smaller.
+
+  Turned out to be necessary but not sufficient: on the reporter's actual
+  graph, tiling barely moved the zoom (`~0.0015` -> `~0.00073`, same order of
+  magnitude). Added per-component logging (component count/sizes, each of
+  the top 5's own post-layout bbox) and found the graph is dominated by one
+  2163-node component whose *own* `breadthfirst` bbox was `w=1,166,970
+  h=3,841` on its own -- i.e. the blow-up isn't "many small components"
+  (which tiling fixes) but "one component whose internal breadthfirst
+  layout is itself huge" (which tiling cannot fix, since there's nothing to
+  tile). `breadthfirst`'s width is driven by however many nodes land on its
+  single widest BFS level/ring, which is structure-dependent and has no
+  general upper bound. Fixed by switching components above 50 nodes to a
+  `grid` layout instead, which ignores edges for positioning and is always
+  ~sqrt(N) x sqrt(N) regardless of graph shape -- confirmed on a synthetic
+  2163-node component (headless Cytoscape, outside the repo): `grid` came
+  out `969 x 969` vs `breadthfirst`'s structure-dependent blow-up.
+  `breadthfirst` is kept for components at or below 50 nodes, where it's
+  bounded in practice and shows call depth, which `grid` doesn't. Not yet
+  confirmed visually by the reporter (their setup makes copying server log
+  output impractical, so the ask going forward is just "do you see the
+  graph now", not another log dump).
 
 ## 4. Points to decide
 
