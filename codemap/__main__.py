@@ -281,12 +281,36 @@ def cmd_trace(args) -> Path:
 
 # ── serve ────────────────────────────────────────────────────────────────
 
+class LoggingHandler(http.server.SimpleHTTPRequestHandler):
+    """Static file serving (inherited, unchanged) plus one endpoint the
+    viewer posts to when a client-side error happens during load/render
+    (see index.html) -- printed straight to this process's terminal, since
+    that's what's actually being watched while iterating, not the browser
+    console."""
+
+    def do_POST(self):
+        if self.path != "/__codemap_log":
+            self.send_error(404)
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+        try:
+            payload = json.loads(body.decode("utf-8", errors="replace"))
+        except ValueError:
+            payload = {"context": "?", "message": body.decode("utf-8", errors="replace")}
+        print(f"\n[browser error] {payload.get('context', '?')}: {payload.get('message', '')}", flush=True)
+        if payload.get("stack"):
+            print(payload["stack"], flush=True)
+        self.send_response(204)
+        self.end_headers()
+
+
 def cmd_serve(args):
     directory = str(Path(args.dir).resolve())
-    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=directory)
+    handler = functools.partial(LoggingHandler, directory=directory)
     with http.server.ThreadingHTTPServer(("", args.port), handler) as httpd:
-        print(f"Serving {directory} at http://localhost:{args.port}/")
-        print("Press Ctrl+C to stop.")
+        print(f"Serving {directory} at http://localhost:{args.port}/", flush=True)
+        print("Press Ctrl+C to stop.", flush=True)
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:

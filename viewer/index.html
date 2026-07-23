@@ -372,6 +372,25 @@
         let animPlay = 700, animStep = 280, animHold = 550;
         let loopAnimRunning = false, loopAnimEdges = null;
 
+        // Report a client-side error to the server's own terminal (see
+        // LoggingHandler in codemap/__main__.py) -- easier to spot there
+        // than in the browser console while iterating on a load/render
+        // failure. Best-effort: never throws, never blocks the caller.
+        function reportError(context, err) {
+            const message = (err && err.message) ? err.message : String(err);
+            const stack = (err && err.stack) ? err.stack : null;
+            console.error(`[${context}]`, err);
+            try {
+                fetch('/__codemap_log', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ context, message, stack }),
+                }).catch(() => { });
+            } catch { /* fetch itself unavailable/blocked -- nothing more we can do */ }
+        }
+        window.addEventListener('error', e => reportError('window.onerror', e.error || e.message));
+        window.addEventListener('unhandledrejection', e => reportError('unhandledrejection', e.reason));
+
         // sourceIndex starts empty; populated only via "Load doc index..."
         // (see below) -- no automatic fetch, for the same reason as graph.json.
 
@@ -582,7 +601,14 @@
             document.getElementById('trace-list').innerHTML =
                 '<p style="padding:8px 10px;color:#6c7086;font-size:11px">Click Play to load & animate.</p>';
             document.getElementById('info').innerHTML = 'Click a node for details.';
-            initCy([...g.nodes, ...g.edges]);
+            const n = g.nodes ? g.nodes.length : 0, ed = g.edges ? g.edges.length : 0;
+            try {
+                initCy([...g.nodes, ...g.edges]);
+            } catch (err) {
+                reportError(`loadGraph (initCy, ${n} nodes, ${ed} edges)`, err);
+                document.getElementById('status').textContent =
+                    `ERROR while rendering (${n} nodes, ${ed} edges) — see server terminal for details`;
+            }
         }
 
         document.getElementById('status').textContent = 'No graph loaded — use "Load graph…".';
@@ -598,7 +624,11 @@
             reader.onload = () => {
                 let g;
                 try { g = JSON.parse(reader.result); }
-                catch { document.getElementById('status').textContent = `ERROR: ${file.name} is not valid JSON`; return; }
+                catch (err) {
+                    reportError(`Load graph… (parsing ${file.name})`, err);
+                    document.getElementById('status').textContent = `ERROR: ${file.name} is not valid JSON`;
+                    return;
+                }
                 loadGraph(g); // sets #status to the new node/edge count
             };
             reader.readAsText(file);
@@ -614,7 +644,11 @@
             const reader = new FileReader();
             reader.onload = () => {
                 try { sourceIndex = JSON.parse(reader.result); }
-                catch { document.getElementById('status').textContent = `ERROR: ${file.name} is not valid JSON`; return; }
+                catch (err) {
+                    reportError(`Load doc index… (parsing ${file.name})`, err);
+                    document.getElementById('status').textContent = `ERROR: ${file.name} is not valid JSON`;
+                    return;
+                }
                 document.getElementById('status').textContent = `Loaded doc index: ${file.name}`;
             };
             reader.readAsText(file);
