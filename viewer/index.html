@@ -119,12 +119,29 @@
 
         #doc-list {
             flex: 1;
+            min-height: 80px;
             overflow-y: auto;
             padding: 3px 0
         }
 
+        .doc-group-crate {
+            padding: 5px 10px 2px;
+            font-size: 10px;
+            font-weight: bold;
+            color: #89b4fa;
+            text-transform: uppercase;
+            letter-spacing: .5px
+        }
+
+        .doc-group-class {
+            padding: 2px 10px 2px 18px;
+            font-size: 10px;
+            color: #94e2d5;
+            font-family: monospace
+        }
+
         .doc-item {
-            padding: 3px 10px;
+            padding: 3px 10px 3px 26px;
             font-size: 11px;
             font-family: monospace;
             cursor: pointer;
@@ -141,6 +158,13 @@
         #btn-clear-focus {
             margin: 8px 10px;
             font-size: 11px
+        }
+
+        #doc-frame {
+            flex: 1;
+            min-height: 120px;
+            border: 0;
+            background: #fff
         }
 
         .pt {
@@ -382,6 +406,8 @@
             <input type="text" id="doc-search" placeholder="Filter functions…">
             <div id="doc-list"><p style="padding:8px 10px;color:#6c7086;font-size:11px">Load a doc index to browse the public API.</p></div>
             <button id="btn-clear-focus">Show full graph</button>
+            <div class="pt">Doc page</div>
+            <iframe id="doc-frame"></iframe>
         </div>
         <div class="rh" id="rh-left"></div>
         <div id="cy"></div>
@@ -832,25 +858,91 @@
         });
 
         // ── Doc-driven focus: click a public function in the doc index,
-        // show only what it calls (recursively), instead of the whole graph.
+        // show only what it calls (recursively) instead of the whole graph,
+        // and load its native `cargo doc` page in the frame below the list.
+        // Grouped by crate, then by class/type -- both come straight from
+        // doc_index.py's output (`crate`/`kind` fields), no new mapping: a
+        // method's class is the `Type` half of its `Type::method` id, a
+        // free fn has no class, and a type's own entry (struct/enum/trait)
+        // acts as its own class heading, which is why its methods land
+        // right under it.
+        function classKeyFor(id, entry) {
+            if (entry.kind === 'method') return id.split('::')[0];
+            if (entry.kind === 'fn') return '(free functions)';
+            return id;
+        }
         function renderDocList() {
             const listEl = document.getElementById('doc-list');
-            const ids = Object.keys(sourceIndex).sort();
+            const ids = Object.keys(sourceIndex);
             if (!ids.length) {
                 listEl.innerHTML = '<p style="padding:8px 10px;color:#6c7086;font-size:11px">Doc index is empty.</p>';
                 return;
             }
-            listEl.innerHTML = ids.map(id => `<div class="doc-item" data-id="${id}">${id}</div>`).join('');
+            const tree = {}; // crate -> class -> [ids]
+            ids.forEach(id => {
+                const entry = sourceIndex[id];
+                const crateKey = entry.crate || '(unknown crate)';
+                const classKey = classKeyFor(id, entry);
+                (tree[crateKey] ??= {});
+                (tree[crateKey][classKey] ??= []).push(id);
+            });
+            let html = '';
+            Object.keys(tree).sort().forEach(crateKey => {
+                html += `<div class="doc-group-crate">${crateKey}</div>`;
+                const classes = tree[crateKey];
+                Object.keys(classes).sort().forEach(classKey => {
+                    html += `<div class="doc-group-class">${classKey}</div>`;
+                    classes[classKey].sort().forEach(id => {
+                        const entry = sourceIndex[id];
+                        const label = entry.kind === 'method' ? id.split('::').slice(1).join('::') : id;
+                        html += `<div class="doc-item" data-id="${id}">${label}</div>`;
+                    });
+                });
+            });
+            listEl.innerHTML = html;
             listEl.querySelectorAll('.doc-item').forEach(el => {
-                el.addEventListener('click', () => focusOnCallees(el.dataset.id));
+                el.addEventListener('click', () => {
+                    focusOnCallees(el.dataset.id);
+                    showDocPage(el.dataset.id);
+                });
             });
         }
+        // Hides a class/crate group header too once none of its items match
+        // the filter, instead of leaving a heading floating over nothing.
         document.getElementById('doc-search').addEventListener('input', e => {
             const q = e.target.value.toLowerCase();
-            document.querySelectorAll('#doc-list .doc-item').forEach(el => {
-                el.style.display = el.dataset.id.toLowerCase().includes(q) ? '' : 'none';
+            const listEl = document.getElementById('doc-list');
+            let classEl = null, crateEl = null, classHasMatch = false, crateHasMatch = false;
+            const flushClass = () => { if (classEl) classEl.style.display = classHasMatch ? '' : 'none'; };
+            const flushCrate = () => { if (crateEl) crateEl.style.display = crateHasMatch ? '' : 'none'; };
+            Array.from(listEl.children).forEach(el => {
+                if (el.classList.contains('doc-group-crate')) {
+                    flushClass(); flushCrate();
+                    crateEl = el; classEl = null; crateHasMatch = false; classHasMatch = false;
+                } else if (el.classList.contains('doc-group-class')) {
+                    flushClass();
+                    classEl = el; classHasMatch = false;
+                } else {
+                    const show = el.dataset.id.toLowerCase().includes(q);
+                    el.style.display = show ? '' : 'none';
+                    if (show) { classHasMatch = true; crateHasMatch = true; }
+                }
             });
+            flushClass(); flushCrate();
         });
+
+        function showDocPage(id) {
+            const frame = document.getElementById('doc-frame');
+            const entry = sourceIndex[id];
+            if (!entry || !entry.docPage) {
+                frame.src = 'about:blank';
+                frame.srcdoc = '<p style="font-family:sans-serif;color:#888;padding:10px">' +
+                    `No native doc page for "${id}" (docs weren't served with --docs, or this entry predates it).</p>`;
+                return;
+            }
+            frame.removeAttribute('srcdoc');
+            frame.src = '/docs/' + entry.docPage + (entry.anchor ? '#' + entry.anchor : '');
+        }
 
         let maxCallDepth = 0; // 0 = unlimited
         document.getElementById('cfg-depth').addEventListener('input', e => {
@@ -1067,7 +1159,9 @@
                     closeStats[name].count++;
                     closeStats[name].total_us += us;
                 } else {
-                    newEvents.push({ name, depth: spanStack.length, stack: spanStack.map(s => s.name || '') });
+                    const spanFields = {};
+                    for (const k of Object.keys(spanInfo)) if (k !== 'name') spanFields[k] = spanInfo[k];
+                    newEvents.push({ name, depth: spanStack.length, stack: spanStack.map(s => s.name || ''), fields: spanFields });
                 }
             }
             const seen = new Set(), deduped = [];
@@ -1086,22 +1180,45 @@
         document.getElementById('btn-load-trace').addEventListener('click', () => {
             document.getElementById('trace-file-input').click();
         });
+        // A raw log is parsed server-side (trace_log.py) when this viewer is
+        // running under `codemap serve`/`run` -- the *one* real
+        // implementation of the dedup/iteration/duration logic, instead of
+        // the JS reimplementation below drifting out of sync with it again
+        // (see PROJECT.md §3: it already had, silently dropping `fields`).
+        // parseTraceJsonl() stays as a fallback for when there's no server
+        // to ask (e.g. index.html opened straight off disk).
+        async function parseTraceViaServer(text) {
+            try {
+                const res = await fetch('/__codemap_parse_trace', { method: 'POST', body: text, cache: 'no-store' });
+                if (!res.ok) return null;
+                const data = await res.json();
+                return Array.isArray(data.spans) ? data.spans : null;
+            } catch {
+                return null; // no server listening (offline/file://) -- fall back to JS parsing
+            }
+        }
         document.getElementById('trace-file-input').addEventListener('change', e => {
             const file = e.target.files[0];
             e.target.value = '';
             if (!file) return;
             const reader = new FileReader();
-            reader.onload = () => {
+            reader.onload = async () => {
                 const text = reader.result;
                 let spans = null;
                 try {
                     const parsed = JSON.parse(text);
                     if (parsed && Array.isArray(parsed.spans)) spans = parsed.spans;
-                } catch { /* not a single JSON object -> try JSONL below */ }
-                if (!spans) spans = parseTraceJsonl(text);
+                } catch { /* not a single JSON object -> it's a raw log, parse below */ }
+                let usedFallback = false;
+                if (!spans) {
+                    spans = await parseTraceViaServer(text);
+                    if (!spans) { spans = parseTraceJsonl(text); usedFallback = true; }
+                }
                 stopPlay();
                 applyTraceSpans(spans);
-                document.getElementById('status').textContent = `Loaded ${file.name}: ${spans.length} spans`;
+                document.getElementById('status').textContent =
+                    `Loaded ${file.name}: ${spans.length} spans` + (usedFallback ? ' (parsed client-side -- no server)' : '');
+                logToServer('Load trace…', `${file.name}: ${spans.length} spans, client-side fallback=${usedFallback}`);
             };
             reader.readAsText(file);
         });

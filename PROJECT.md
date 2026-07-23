@@ -91,8 +91,16 @@ A generic, project-agnostic tool that, for **any Rust codebase**:
   the method's doc anchor (`#method.<name>`) inside its type's page and
   extracts the same signature/doc/source-line info.
 - Output (`source_index.json`) is a flat `{ name_or_node_id: {signature,
-  docHtml, file, line, vscodePath} }` map, entirely derived from what cargo
-  doc + graph.json actually contain.
+  docHtml, file, line, vscodePath, crate, kind, docPage, anchor} }` map,
+  entirely derived from what cargo doc + graph.json actually contain.
+  `crate`/`kind` (struct/enum/trait/fn/method) come from data `build_index`
+  already had in hand but used to discard; `docPage` is the native HTML
+  page's path relative to the shared `target/doc/` root (not any one
+  crate's own subdirectory within it — that's the mount point relative
+  asset links on the page itself resolve against), and `anchor` (methods
+  only) is the `#method.<name>`/`#tymethod.<name>` fragment so a viewer can
+  jump straight to it instead of the top of the owning type's page. Added
+  for the viewer's doc-driven focus feature, §2.5.
 - **Fixed during the move**: the source-link regex used to hardcode the
   crate name (`src/tools_codemap/...`) directly in the pattern — a second,
   less obvious hardcoded mapping found while generalizing. Now matches
@@ -230,8 +238,40 @@ so each crate's items resolve against that crate's own `src/`.
 - **Doc cross-links in the info panel**: a node's signature renders with
   capitalized identifiers turned into clickable spans only when that exact
   identifier exists as a key in `source_index.json` — clicking re-renders
-  the info panel for that type. Not yet a separate "doc frame" with real
-  rustdoc navigation — see §4.
+  the info panel for that type.
+- **Doc-driven graph focus + native doc frame** (left `#doc-sidebar`,
+  added in response to the large-graph readability problem below): lists
+  every `source_index.json` entry, grouped by crate then by class/type
+  (`classKeyFor()` — a method's class is the `Type` half of its
+  `Type::method` id, straight off the id, no new mapping; a free fn has no
+  class; a type's own struct/enum/trait entry is its own class heading, so
+  its methods land under it for free). Clicking an entry does two things:
+  1. `focusOnCallees()`: a depth-limited BFS over outgoing edges only
+     (`outgoers('node')`, not Cytoscape's own `successors()`, specifically
+     so it can be capped — see "Max call depth" in Settings, 0 =
+     unlimited), hides everything outside the reached set, `cy.fit()`s to
+     it. If the depth cap actually excluded real callees, the info panel
+     and status bar say `truncated` explicitly rather than showing a
+     smaller graph with no indication anything was cut — "Show full graph"
+     clears it. Verified headless (Cytoscape, outside this repo) against
+     `dummy-api`'s real generated graph+doc output: correct reachable sets
+     including cross-crate trait-dispatch edges, correct truncation
+     flagging at every depth, graceful (no throw) on both a doc entry with
+     no matching graph node (e.g. a bare struct/enum/trait's own entry —
+     only its *methods* are graph nodes) and a nonexistent id.
+  2. Loads the actual `cargo doc` HTML page for that item into an `<iframe
+     id="doc-frame">` stacked below the list (`/docs/<docPage>`, `#<anchor>`
+     for methods) — the real rustdoc page, not just the extracted
+     signature/doc text the info panel already showed. Needs the doc HTML
+     served (see `--docs` below); says so in the frame instead of a
+     broken/blocked `file://` load if it isn't.
+  This closes the "not yet a separate doc frame with real rustdoc
+  navigation" gap noted below, and the abandoned crate/class/trait
+  *graph*-hierarchy idea (§4) landed here instead, scoped to the *list*
+  only — much cheaper: class/type is free (already in the id), crate came
+  from data `doc_index.py` already had and previously discarded (`crate`/
+  `kind` fields, see §2.2), and doesn't touch node-id merging/collision
+  behavior at all.
 - `cache: 'no-store'` on all internal `fetch()` calls (avoids stale-browser-
   cache surprises hit repeatedly during development).
 - **Removed during the move**: the dead `#doc-panel`/`#doc-iframe`/
@@ -277,6 +317,10 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
   `[lib] name` overridden from its package name (bug #6 below). See its own
   `README.md`. Analyzing it one crate at a time (before any cross-crate
   merging existed) is what surfaced MIR-parsing bugs #1-3 in §3.
+  `dummy-core/src/edge_cases.rs` additionally covers, one function each:
+  generics/monomorphization, recursion, nested closures, chained iterator
+  combinators, and `async fn` -- added specifically to close out the
+  "genuinely untested" list in §3 bug entry (surfaced bugs #7-8 there).
 - `be-quant/dummy-cli` — a trivial standalone binary (deliberately **not**
   a member of the `dummy-lib` workspace, and deliberately **without** a
   `[lib] name` override, unlike everything it depends on) whose `main()`
@@ -289,10 +333,24 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
 
 ## 3. Points to fix
 
-- **Duplicated trace-parsing logic**: `trace_log.py` (Python) and the
-  in-browser `parseTraceJsonl()` (JS) implement the same
-  dedup/iteration/duration logic independently. Risk of the two drifting
-  apart. Not resolved in this move — still an open cleanup.
+- ~~Duplicated trace-parsing logic~~ **Fixed.** `trace_log.py` (Python) and
+  the in-browser `parseTraceJsonl()` (JS) had already drifted apart in a
+  real, live way by the time this was picked up: the JS version silently
+  dropped each span's `fields` (e.g. `#[instrument]`-captured function
+  arguments), while the Python one kept them — meaning the exact same raw
+  log rendered differently in the info panel depending on whether it was
+  parsed via `codemap trace` first or loaded raw straight in the browser,
+  with zero indication anything was missing. Fixed two ways: (1) parity —
+  `parseTraceJsonl()` now captures `fields` too, verified byte-for-byte
+  identical output against `trace_log.parse_trace()` on the same input
+  (extracted the JS function and ran it under Node against the same
+  sample). (2) unified at the source — `codemap serve`/`run` now expose a
+  `POST /__codemap_parse_trace` endpoint that calls `trace_log.parse_trace()`
+  directly; "Load trace…" tries that first and only falls back to the local
+  JS parser if there's no server to ask (e.g. `index.html` opened straight
+  off disk). So the common case (`codemap run`) now has exactly one real
+  implementation; the JS one is kept correct too, but demoted to an
+  explicit fallback rather than an equal, silently-drifting peer.
 - **Regex-based MIR parsing is fragile by construction** — confirmed by the
   dummy-lib fixture (§2.7), which surfaced three real bugs, all now fixed:
   1. An `impl` block at crate root (no enclosing module) prints as
@@ -356,16 +414,76 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
      including a mixed case (`dummy-cli`, no override, depending on three
      crates that do have one).
 
-  Still genuinely untested: generics/monomorphization noise, async fns,
-  deeply nested/chained closures, recursive functions, iterator chains
-  beyond a single `.map()`. Should still be treated as a known risk area
-  before calling the tool "works on any Rust code" -- dummy-lib covers
-  cross-crate wiring and the module-qualification issues above, not these.
-- **Vendored dependencies aren't excluded**: the crate-scoping heuristic
-  (§2.1) relies on dependency source paths resolving through `.cargo`/
-  `registry`; a `cargo vendor`-based project would have its dependencies
-  copied into a local, non-external-looking path, and they'd currently be
-  (wrongly) treated as part of the target crate.
+  **Now tested** -- added `dummy-core/src/edge_cases.rs`, one function per
+  previously-untested shape (generics/monomorphization, recursion, nested
+  closures, chained iterator combinators beyond `.map()`, `async fn`),
+  generated its real MIR, and inspected the resulting graph node-by-node.
+  Two more real bugs turned up, both fixed:
+  7. **A generic fn's monomorphized call sites carry a turbofish**
+     (`generic_max::<i32>`, `generic_max::<f64>` -- same definition, two
+     concrete instantiations). `normalize_call` didn't know about this
+     shape and mistook the `<i32>`/`<f64>` segment for a nested module/
+     free-fn name, silently losing the real callee name -- `use_generic_
+     twice` came out with *zero* outgoing edges despite calling
+     `generic_max` twice. Fixed: strip any `::<...>` turbofish before the
+     rest of `normalize_call`'s logic runs, so every monomorphization of a
+     generic fn collapses back to the one bare node its definition already
+     normalizes to (consistent with `RE_FREE_FN`).
+  8. **Genuine recursion produced no self-edge at all.** Every call-edge
+     insertion point had a `callee_id != current_fn_id` guard -- harmless
+     for the shapes tested before (nothing called itself), but it silently
+     ate the one case that's *supposed* to be a self-edge: plain recursion
+     (`factorial(n - 1)` inside `factorial` itself). No comment explained
+     why self-edges specifically were excluded, and removing the guard
+     didn't reintroduce any noise on the existing fixture (checked the full
+     merged `dummy-api` graph before/after: only the 3 new edges from these
+     fixtures appeared, nothing else changed) -- fixed by dropping the
+     guard on the direct-call path (kept, deliberately, on the dyn-dispatch
+     over-approximation path, which is a different, separately-judged
+     case).
+
+  `async fn` and nested/chained closures/iterator combinators turned out to
+  already work correctly with no changes needed -- `async_outer -> async_
+  inner` resolved correctly across the `.await`, and none of the closure/
+  iterator-heavy functions produced a wrong or missing edge (they also
+  don't call any *other* named fn directly, so "no edges" from them was
+  itself the correct answer, not a gap). Verified across the full merged
+  `dummy-api` graph and `dummy-cli` (reverse-dependency fixture), not just
+  `dummy-core` in isolation, to catch any cross-crate-merge regression.
+- ~~Vendored dependencies aren't excluded~~ **Fixed the mechanism, but
+  couldn't force a real repro to confirm it matters in practice.** Added
+  `find_vendor_dirs()` (`__main__.py`): reads any `.cargo/config.toml` in
+  scope (walking up from the manifest, plus `$CARGO_HOME`, mirroring how
+  cargo itself discovers config) for a `[source.*] directory = "..."`
+  override -- whatever that table is named (`cargo vendor` defaults to
+  "vendored-sources", but nothing enforces it) -- and passes the
+  directory's bare name (e.g. `"vendor"`) into `mir_graph` as an extra
+  external-path marker, the same *shape* of check `EXTERNAL_PATH_MARKERS`
+  already does for `.cargo`/`registry` (a bare substring, not a resolved
+  path -- a vendor dir normally lives *inside* the workspace, so rustc
+  prints it as a workspace-relative path like any genuinely local crate,
+  not an absolute one, which is why a resolved-path marker would have
+  silently never matched -- caught by testing against a synthetic MIR line
+  shaped like a real one, not just an absolute path in isolation).
+
+  Tried to reproduce for real first: added a genuine external dependency
+  (`itoa`) to `dummy-core`, called its generic `Buffer::format` method,
+  vendored it (`cargo vendor` + real `.cargo/config.toml`), rebuilt with
+  `--emit=mir`. The dependency's body never appeared as a local `<impl at
+  ...>` block in `dummy-core`'s own MIR at all -- vendored or not, calling
+  it stayed a purely opaque call reference. So on this toolchain, at least
+  under a plain debug build, external generic fns don't get MIR-level-
+  inlined into the caller's own `--emit=mir` dump the way the original
+  `is_local_impl` heuristic's docstring assumes they might. Verified the
+  fix logic directly instead (`mir_graph.is_local_impl()` given a synthetic
+  `<impl at vendor\itoa\src\lib.rs:...>` line: wrongly local without the
+  marker, correctly excluded with it; a genuinely local impl stays local
+  either way). Reverted the itoa/vendor experiment from `dummy-lib`
+  afterward -- it doesn't exercise anything the fix actually changes, so
+  keeping a permanent `vendor/` directory + workspace-wide `.cargo/
+  config.toml` around for it wasn't worth the clutter. Kept the fix itself:
+  cheap, harmless when nothing's vendored, and might matter under a
+  different rustc version/optimization level even if not observed here.
 - **Large graphs (thousands of nodes) rendered nothing, silently**: reported
   on a real ~6300-node/6300-edge crate — the status bar showed the right
   counts, no error appeared anywhere (browser or server log), and zooming in
@@ -406,20 +524,29 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
   2163-node component (headless Cytoscape, outside the repo): `grid` came
   out `969 x 969` vs `breadthfirst`'s structure-dependent blow-up.
   `breadthfirst` is kept for components at or below 50 nodes, where it's
-  bounded in practice and shows call depth, which `grid` doesn't. Not yet
-  confirmed visually by the reporter (their setup makes copying server log
-  output impractical, so the ask going forward is just "do you see the
-  graph now", not another log dump).
+  bounded in practice and shows call depth, which `grid` doesn't.
+
+  Confirmed fixed by the reporter -- the graph renders now. Their very next
+  feedback, though: rendering ~everything at once is still unreadable at
+  that scale (too many nodes/edges to make sense of, `grid` least of all,
+  since it throws away the call-depth cues `breadthfirst` gave on smaller
+  graphs). That's what motivated the doc-driven graph focus feature (§2.5) —
+  navigate in from a specific public function instead of trying to make the
+  whole graph legible at once.
 
 ## 4. Points to decide
 
-- **Doc frame — real rustdoc navigation vs. scraped inline text?**
-  Two mechanisms exist in embryonic form: (a) a real rustdoc HTML page in an
-  iframe, giving free navigation via rustdoc's own links (removed as dead
-  code from the viewer during this move — would need to be rebuilt once
-  this direction is chosen); (b) `doc_index.py`, which scrapes
-  signature/doc fragments into JSON and renders them inline in the info
-  panel (kept, currently the only doc mechanism in the viewer). Still open.
+- ~~Doc frame — real rustdoc navigation vs. scraped inline text?~~
+  **Settled: both, side by side.** `doc_index.py`'s scraped signature/doc
+  fragments still render inline (info panel, doc list). The real rustdoc
+  HTML page (removed as dead code earlier in this move) came back as an
+  `<iframe>` in the left `#doc-sidebar`, loaded from a `/docs/` mount
+  (`codemap serve --docs`, auto-wired by `run`) rather than `file://` —
+  see §2.5. Not full "free navigation via rustdoc's own links" yet: clicking
+  a link *inside* the iframe (e.g. to another type's page) navigates the
+  iframe, but doesn't sync the graph focus or the doc list's own selection
+  to wherever that link went — still one-directional (list -> iframe, not
+  iframe -> list/graph).
 - **The tracing log format contract.** README.md now documents *what the
   parser currently accepts* as a pragmatic baseline, explicitly marked "not
   yet a final spec." Still open:
@@ -472,7 +599,7 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
 
 - Write down the tracing log format contract as an actual document/schema,
   once §4's open questions on it are settled.
-- Build the doc frame (direction depends on §4's decision).
+- ~~Build the doc frame~~ **Done** — see §2.5 and §4.
 - Build the dedicated call-stack/timing frame (direction depends on §4).
 - Unify the duplicated trace-parsing logic (§3) — likely by having the
   viewer's client-side parser be the only implementation, with the CLI's

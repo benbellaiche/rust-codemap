@@ -76,17 +76,27 @@ def extract_fn_name(line: str):
     return None
 
 
-def is_local_impl(fn_prefix: str) -> bool:
+def is_local_impl(fn_prefix: str, extra_external_markers=()) -> bool:
     """True if a module-qualified `<impl at PATH:...>` resolves to a source
-    file inside the target crate rather than a dependency/toolchain cache."""
+    file inside the target crate rather than a dependency/toolchain cache.
+
+    `extra_external_markers`: absolute paths (or path fragments) that are
+    external even though they don't look like a normal `.cargo`/`.rustup`
+    cache -- e.g. a `cargo vendor` directory, which copies dependency source
+    into the workspace itself. A vendored dependency's generic code still
+    gets monomorphized straight into whatever local crate's MIR uses it, so
+    without this it looks exactly like the target crate's own code (see
+    codemap.find_vendor_dirs, which is what actually discovers these paths
+    -- this module stays a pure MIR-text parser with no filesystem/cargo-
+    config knowledge of its own)."""
     m = RE_IMPL_SOURCE.search(fn_prefix)
     if not m:
         return False
     path = m.group(1)
-    return not any(marker in path for marker in EXTERNAL_PATH_MARKERS)
+    return not any(marker in path for marker in (*EXTERNAL_PATH_MARKERS, *extra_external_markers))
 
 
-def should_include(line: str) -> bool:
+def should_include(line: str, extra_external_markers=()) -> bool:
     fn_name = extract_fn_name(line)
     if fn_name is None: return False
     if fn_name in EXCLUDE_NAMES: return False
@@ -97,7 +107,7 @@ def should_include(line: str) -> bool:
         if excl in fn_prefix: return False
     if RE_FREE_FN.match(line): return True
     if "<impl at " in fn_prefix:
-        return is_local_impl(fn_prefix)
+        return is_local_impl(fn_prefix, extra_external_markers)
     return False
 
 
@@ -138,6 +148,14 @@ def normalize_call(raw: str):
     if "<dyn " in raw: return None
     m = re.match(r"<([^>]+) as [^>]+>::(\w+)$", raw)
     if m: return f"{m.group(1).split('::')[-1]}::{m.group(2)}"
+    # A generic fn's call site carries its monomorphized type argument(s) as
+    # a turbofish (`generic_max::<i32>`, `generic_max::<f64>` for the same
+    # definition) -- strip it, or the `<i32>` segment gets mistaken for a
+    # nested module/free-fn name below and the real name is lost entirely.
+    # One definition normalizes to one bare id (RE_FREE_FN strips generics
+    # the same way), so every monomorphization correctly collapses back to
+    # that same node instead of appearing to have no callers at all.
+    raw = re.sub(r"::<[^<>]*>", "", raw)
     parts = raw.split("::")
     if not parts: return None
     if len(parts) == 1: return parts[0]
@@ -153,7 +171,7 @@ def normalize_call(raw: str):
     return last_two[-1]
 
 
-def parse_mir(text: str):
+def parse_mir(text: str, extra_external_markers=()):
     """Returns (local_ids: set[str], edges: list[(str, str)], traced: dict[str, bool])."""
     local_ids = set()
     fn_def_lines = {}
@@ -164,7 +182,7 @@ def parse_mir(text: str):
         if not (raw.startswith("fn ") or re.match(r"fn \w+::", raw)):
             continue
         if "{" not in raw: continue
-        if not should_include(raw): continue
+        if not should_include(raw, extra_external_markers): continue
         norm = normalize_def_line(raw)
         if norm:
             fn_def_lines[raw] = norm
@@ -219,7 +237,10 @@ def parse_mir(text: str):
                 continue
 
             callee_id = normalize_call(raw_callee)
-            if callee_id and callee_id in local_ids and callee_id != current_fn_id:
+            # callee_id == current_fn_id is genuine recursion (e.g. a plain
+            # `factorial(n - 1)` inside `factorial` itself) -- a real,
+            # meaningful self-edge, not noise to filter out.
+            if callee_id and callee_id in local_ids:
                 key = (current_fn_id, callee_id)
                 if key not in edge_set:
                     edge_set.add(key); edges.append(key)
@@ -227,9 +248,9 @@ def parse_mir(text: str):
     return local_ids, edges, traced
 
 
-def build_graph(mir_text: str) -> dict:
+def build_graph(mir_text: str, extra_external_markers=()) -> dict:
     """Parse a MIR text dump into a Cytoscape-ready {nodes, edges} dict."""
-    local_ids, edges, traced = parse_mir(mir_text)
+    local_ids, edges, traced = parse_mir(mir_text, extra_external_markers)
     all_nodes = set(local_ids)
     for s, t in edges:
         all_nodes.update([s, t])

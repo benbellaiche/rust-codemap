@@ -95,6 +95,50 @@ def crate_name(manifest: Path) -> str:
     return read_package_name(manifest).replace("-", "_")
 
 
+def find_vendor_dirs(manifest: Path) -> list:
+    """Bare directory-name marker(s) (e.g. "vendor") for wherever any
+    `.cargo/config.toml` in scope (walking upward from the manifest the way
+    cargo itself discovers config, plus $CARGO_HOME) redirects a
+    `[source.*]` to via `directory = "..."` -- i.e. wherever `cargo vendor`
+    put its copy of external dependency source, whatever that source-
+    replacement table happens to be named (`cargo vendor` itself defaults
+    to "vendored-sources", but nothing enforces that name).
+
+    Passed to mir_graph as extra "this path is external, not the target
+    crate" markers, the same way EXTERNAL_PATH_MARKERS's existing entries
+    (".cargo", "registry", ...) are: a bare recognizable fragment, not a
+    resolved path -- a vendor directory normally lives *inside* the
+    workspace, so rustc prints it as a workspace-relative path (matching
+    every genuinely local crate's own path shape), not an absolute one
+    `.cargo`/`registry`/`.rustup` paths get simply for living outside the
+    workspace. Only the last path segment of the configured `directory` is
+    used (e.g. "vendor" out of "third_party/vendor"), so nesting choices
+    don't matter."""
+    candidates = []
+    cur = manifest.parent.resolve()
+    while True:
+        candidates.append(cur / ".cargo" / "config.toml")
+        candidates.append(cur / ".cargo" / "config")
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    cargo_home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
+    candidates += [cargo_home / "config.toml", cargo_home / "config"]
+
+    markers = []
+    for config_path in candidates:
+        if not config_path.exists():
+            continue
+        text = config_path.read_text(encoding="utf-8", errors="ignore")
+        for m in re.finditer(r'^\[source\.[^\]]+\]\s*$(.*?)(?=^\[|\Z)', text, re.MULTILINE | re.DOTALL):
+            dm = re.search(r'^\s*directory\s*=\s*"([^"]+)"', m.group(1), re.MULTILINE)
+            if dm:
+                name = Path(dm.group(1).replace("\\", "/")).name
+                if name and name not in markers:
+                    markers.append(name)
+    return markers
+
+
 def local_dependency_closure(manifest: Path) -> list:
     """Every package in the target crate's own transitive dependency graph
     that's local (a path dependency, not crates.io/a git registry) --
@@ -208,7 +252,8 @@ def cmd_graph(args) -> Path:
     # every member's MIR and parsing once naturally merges nodes/edges
     # across crates (including cross-crate calls, once resolvable) with no
     # separate "merge N graphs" step needed.
-    graph = mir_graph.build_graph("\n".join(mir_texts))
+    vendor_dirs = find_vendor_dirs(manifest)
+    graph = mir_graph.build_graph("\n".join(mir_texts), vendor_dirs)
     write_json(out_path, graph)
     traced = sum(1 for n in graph["nodes"] if n["data"]["traced"])
     print(f"OK {out_path}  ({len(graph['nodes'])} nodes, {len(graph['edges'])} edges, "
@@ -242,7 +287,7 @@ def cmd_doc(args) -> Path:
         cname = crate_name(Path(pkg["manifest_path"]))
         doc_root = target_dir / "doc" / cname
         if doc_root.exists():
-            crates.append((doc_root, Path(pkg["manifest_path"]).parent / "src"))
+            crates.append((doc_root, Path(pkg["manifest_path"]).parent / "src", cname))
         else:
             print(f"  WARNING: no doc output for {pkg['name']} ({cname}) -- skipping")
     if not crates:
@@ -286,9 +331,36 @@ class LoggingHandler(http.server.SimpleHTTPRequestHandler):
     viewer posts to when a client-side error happens during load/render
     (see index.html) -- printed straight to this process's terminal, since
     that's what's actually being watched while iterating, not the browser
-    console."""
+    console.
+
+    Also optionally serves a second, unrelated directory (the target
+    crate's own `target/doc/`) under the `/docs/` prefix, so the viewer can
+    embed the native `cargo doc` HTML pages in an iframe -- same-origin,
+    which a `file://` src would not be. `doc_index.py` already emits each
+    entry's `docPage` relative to that shared target/doc/ root (not any
+    single crate's own subdirectory within it), so that root is exactly
+    what --docs should point at: page-relative asset links (css/fonts under
+    a sibling static.files/ dir) resolve correctly through this same prefix
+    without any rewriting."""
+
+    def __init__(self, *args, docs_root=None, **kwargs):
+        self.docs_root = docs_root
+        super().__init__(*args, **kwargs)
+
+    def translate_path(self, path):
+        if self.docs_root and (path == "/docs" or path.startswith("/docs/")):
+            original_directory = self.directory
+            self.directory = self.docs_root
+            try:
+                return super().translate_path(path[len("/docs"):] or "/")
+            finally:
+                self.directory = original_directory
+        return super().translate_path(path)
 
     def do_POST(self):
+        if self.path == "/__codemap_parse_trace":
+            self._handle_parse_trace()
+            return
         if self.path != "/__codemap_log":
             self.send_error(404)
             return
@@ -305,6 +377,32 @@ class LoggingHandler(http.server.SimpleHTTPRequestHandler):
         self.send_response(204)
         self.end_headers()
 
+    def _handle_parse_trace(self):
+        # Routes a raw trace log through the one real parser (trace_log.py)
+        # instead of the viewer's own JS reimplementation of the same
+        # dedup/iteration/duration logic -- the two had already drifted
+        # (the JS version silently dropped span `fields`, see PROJECT.md
+        # §3). The viewer still carries a client-side fallback for when it's
+        # opened without this server running (e.g. straight off disk) --
+        # this endpoint is what makes that fallback path the exception
+        # rather than the rule.
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+        try:
+            spans = trace_log.parse_trace(body.decode("utf-8", errors="replace"))
+            response = json.dumps({"spans": spans}).encode("utf-8")
+        except Exception as exc:
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(exc)}).encode("utf-8"))
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response)))
+        self.end_headers()
+        self.wfile.write(response)
+
 
 def cmd_serve(args):
     # Browser-supplied log/error text (see LoggingHandler.do_POST) can
@@ -315,9 +413,12 @@ def cmd_serve(args):
     # appears). Reconfigure so it's replaced with '?' instead of crashing.
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     directory = str(Path(args.dir).resolve())
-    handler = functools.partial(LoggingHandler, directory=directory)
+    docs_root = str(Path(args.docs).resolve()) if getattr(args, "docs", None) else None
+    handler = functools.partial(LoggingHandler, directory=directory, docs_root=docs_root)
     with http.server.ThreadingHTTPServer(("", args.port), handler) as httpd:
         print(f"Serving {directory} at http://localhost:{args.port}/", flush=True)
+        if docs_root:
+            print(f"Serving {docs_root} at http://localhost:{args.port}/docs/", flush=True)
         print("Press Ctrl+C to stop.", flush=True)
         try:
             httpd.serve_forever()
@@ -328,8 +429,10 @@ def cmd_serve(args):
 # ── run (graph + doc + serve) ──────────────────────────────────────────────
 
 def cmd_run(args):
+    manifest = require_manifest(args.project)
     graph_path = cmd_graph(SimpleNamespace(project=args.project, out=None))
     doc_path = cmd_doc(SimpleNamespace(project=args.project, graph=None, out=None))
+    docs_root = Path(cargo_metadata(manifest)["target_directory"]) / "doc"
 
     print()
     print("Generated:")
@@ -342,7 +445,7 @@ def cmd_run(args):
     if not args.no_browser:
         webbrowser.open(url)
 
-    cmd_serve(SimpleNamespace(dir="viewer", port=args.port))
+    cmd_serve(SimpleNamespace(dir="viewer", port=args.port, docs=str(docs_root) if docs_root.exists() else None))
 
 
 # ── CLI wiring ───────────────────────────────────────────────────────────
@@ -379,6 +482,8 @@ def main():
 
     s = sub.add_parser("serve", help="Serve the viewer directory over HTTP")
     s.add_argument("--dir", default="viewer", help="Directory to serve (should contain index.html)")
+    s.add_argument("--docs", default=None, help="Also serve this directory (a target/doc/ root) under /docs/, "
+                                                  "so the viewer can embed native cargo-doc pages")
     s.add_argument("--port", type=int, default=8787)
     s.set_defaults(func=cmd_serve)
 

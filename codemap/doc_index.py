@@ -58,48 +58,65 @@ def extract_method(html: str, anchor: str):
 
 
 def build_index(crates, graph: dict) -> dict:
-    """crates: an iterable of (doc_root, src_root) pairs -- one per crate
-    whose docs should be cross-referenced (e.g. every member of the
-    workspace the call-graph was merged from, see mir_graph.build_graph).
-    doc_root is that crate's target/doc/<crate>/ ; src_root is that same
-    crate's own src/ dir (needed so a source link resolves against the
-    right crate, not whichever one happens to be the "primary" target).
+    """crates: an iterable of (doc_root, src_root, crate_name) triples --
+    one per crate whose docs should be cross-referenced (e.g. every member
+    of the dependency closure the call-graph was merged from, see
+    mir_graph.build_graph). doc_root is that crate's target/doc/<crate>/ ;
+    src_root is that same crate's own src/ dir (needed so a source link
+    resolves against the right crate, not whichever one happens to be the
+    "primary" target); crate_name is what `cargo doc` named that directory
+    (see codemap.crate_name -- may differ from the package name).
 
     graph: a parsed graph.json (only its node ids are used). Node ids
     aren't crate-qualified (see mir_graph), so if the same name exists in
     two crates' docs, the same collision the call-graph itself has applies
     here too -- last crate processed wins, silently."""
 
-    def to_entry(sig, doc, file_, line, src_root):
+    def to_entry(sig, doc, file_, line, src_root, cname, kind, html_path, doc_root, anchor=""):
         abs_path = str((src_root / file_).resolve()).replace("\\", "/") if file_ else ""
         vscode_url = f"vscode://file/{abs_path}:{line}:1" if line and abs_path else ""
+        # Path of the actual `cargo doc` HTML page, relative to the shared
+        # target/doc/ root (doc_root's own parent) -- e.g. "dapi/fn.foo.html".
+        # A viewer showing this natively needs it served from that same
+        # root (see `codemap serve --docs`), since relative asset links on
+        # the page itself (css/fonts under a shared static.files/ dir one
+        # level up) only resolve correctly when the mount point lines up
+        # with doc_root's parent, not doc_root itself. `anchor` (methods
+        # only -- their own page is the *type's* page) lets the viewer jump
+        # straight to that method instead of the top of the type's page.
+        doc_page = str(Path(cname) / html_path.relative_to(doc_root)).replace("\\", "/")
         return {
             "signature": sig,
             "docHtml": doc,
             "file": f"src/{file_}" if file_ else "",
             "line": line,
             "vscodePath": vscode_url,
+            "crate": cname,
+            "kind": kind,
+            "docPage": doc_page,
+            "anchor": anchor,
         }
 
     # Discover every doc page cargo actually generated, across every crate,
-    # keyed by item name -> (html path, that crate's own src/ dir).
+    # keyed by item name -> (html path, crate's src/ dir, crate name, kind,
+    # that crate's own doc_root).
     pages = {}
-    for doc_root, src_root in crates:
+    for doc_root, src_root, cname in crates:
         for html_path in doc_root.rglob("*.html"):
             m = ITEM_FILE_RE.match(html_path.name)
             if not m: continue
-            _kind, name = m.groups()
-            pages[name] = (html_path, src_root)
+            kind, name = m.groups()
+            pages[name] = (html_path, src_root, cname, kind, doc_root)
 
     index = {}
 
     # Whole-item doc (struct/enum/trait/free fn), keyed by its own name --
     # this is what makes a type name found inside another signature clickable.
-    for name, (path, src_root) in pages.items():
+    for name, (path, src_root, cname, kind, doc_root) in pages.items():
         html = path.read_text(encoding="utf-8", errors="ignore")
         sig, doc, file_, line = extract_top(html)
         if sig or doc:
-            index[name] = to_entry(sig, doc, file_, line, src_root)
+            index[name] = to_entry(sig, doc, file_, line, src_root, cname, kind, path, doc_root)
 
     # Method doc ("Type::method"), for every such node actually present in graph.json.
     for node in graph.get("nodes", []):
@@ -108,12 +125,14 @@ def build_index(crates, graph: dict) -> dict:
         type_name, method = nid.split("::", 1)
         entry = pages.get(type_name)
         if not entry: continue
-        path, src_root = entry
+        path, src_root, cname, _type_kind, doc_root = entry
         html = path.read_text(encoding="utf-8", errors="ignore")
-        sig, doc, file_, line = extract_method(html, f"method.{method}")
+        anchor = f"method.{method}"
+        sig, doc, file_, line = extract_method(html, anchor)
         if not (sig or doc):
-            sig, doc, file_, line = extract_method(html, f"tymethod.{method}")
+            anchor = f"tymethod.{method}"
+            sig, doc, file_, line = extract_method(html, anchor)
         if sig or doc:
-            index[nid] = to_entry(sig, doc, file_, line, src_root)
+            index[nid] = to_entry(sig, doc, file_, line, src_root, cname, "method", path, doc_root, anchor)
 
     return index

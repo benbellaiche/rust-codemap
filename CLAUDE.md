@@ -141,16 +141,30 @@ behavior, not on any specific project):
 - A module-qualified impl method (`fn mod::<impl at PATH:...>::name(...)`)
   is treated as local **unless** `PATH` resolves through cargo's dependency
   or toolchain caches (`is_local_impl`, checked via `.cargo`/`registry`/
-  `.rustup`/`toolchains` substrings). This replaced an earlier hardcoded
-  list of "our" module names — do not reintroduce a name-based allowlist
-  here; extend the path-based heuristic instead. Known gap: `cargo vendor`
-  dependencies aren't excluded by this (their path doesn't look external).
+  `.rustup`/`toolchains` substrings, plus whatever `find_vendor_dirs()` in
+  `__main__.py` found in a `.cargo/config.toml` `[source.*] directory =
+  "..."` override). This replaced an earlier hardcoded list of "our" module
+  names — do not reintroduce a name-based allowlist here; extend the
+  path-based heuristic instead. `find_vendor_dirs()` returns *bare
+  directory-name* markers (e.g. `"vendor"`), not resolved paths — a vendor
+  dir lives inside the workspace, so rustc prints a workspace-relative
+  path for it, the same shape a genuinely local crate's own path has, not
+  an absolute one the way `.cargo`/`.rustup` naturally are. A resolved
+  absolute path here would silently never match anything.
 - `normalize_call` tells a "module::free_fn" call-site reference apart from
   a genuine "Type::method" one by Rust's own naming convention (lowercase
   first segment = module/crate qualifier -> drop it; uppercase = a real
   Type -> keep "Type::method"). This is why case matters if you're ever
   tempted to loosen this: it's not a stylistic nicety here, it's the only
-  signal distinguishing the two shapes.
+  signal distinguishing the two shapes. It also strips a generic call's
+  monomorphized turbofish (`generic_max::<i32>` -> `generic_max`) *before*
+  that case check runs — do this stripping first if you touch this
+  function, or a turbofish segment gets mistaken for one of the two shapes
+  above and the real callee name is lost.
+- Call-edge insertion has no `callee_id != current_fn_id` guard on the
+  direct-call path — genuine recursion (`factorial` calling itself) is a
+  real, meaningful self-edge, not noise. (The dyn-dispatch over-
+  approximation path still excludes self, a separate judgment call.)
 - Closures compile to their own top-level MIR item
   (`...::{closure#N}`). Calls made inside a closure body are reattributed to
   the *enclosing* function (`closure_owner_path`), so a call hidden inside
