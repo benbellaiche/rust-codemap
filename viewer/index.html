@@ -97,6 +97,52 @@
             flex-shrink: 0
         }
 
+        #doc-sidebar {
+            width: 250px;
+            background: #181825;
+            border-right: 1px solid #313244;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            flex-shrink: 0
+        }
+
+        #doc-search {
+            margin: 6px 10px;
+            padding: 4px 6px;
+            background: #11111b;
+            border: 1px solid #313244;
+            border-radius: 4px;
+            color: #cdd6f4;
+            font-size: 11px
+        }
+
+        #doc-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 3px 0
+        }
+
+        .doc-item {
+            padding: 3px 10px;
+            font-size: 11px;
+            font-family: monospace;
+            cursor: pointer;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis
+        }
+
+        .doc-item:hover {
+            background: #313244;
+            color: #89b4fa
+        }
+
+        #btn-clear-focus {
+            margin: 8px 10px;
+            font-size: 11px
+        }
+
         .pt {
             font-size: 10px;
             color: #6c7086;
@@ -325,8 +371,19 @@
             <input type="range" id="cfg-hold" min="150" max="1500" step="50" value="550">
             <span class="cfg-val" id="cfg-hold-val">550 ms</span>
         </div>
+        <div class="cfg-group">
+            <label>Max call depth (doc focus)</label>
+            <input type="number" id="cfg-depth" min="0" step="1" placeholder="unlimited" style="width:70px">
+        </div>
     </div>
     <div id="main">
+        <div id="doc-sidebar">
+            <div class="pt">Public API (doc index)</div>
+            <input type="text" id="doc-search" placeholder="Filter functions…">
+            <div id="doc-list"><p style="padding:8px 10px;color:#6c7086;font-size:11px">Load a doc index to browse the public API.</p></div>
+            <button id="btn-clear-focus">Show full graph</button>
+        </div>
+        <div class="rh" id="rh-left"></div>
         <div id="cy"></div>
         <div class="rh" id="rh-right"></div>
         <div id="sidebar">
@@ -769,8 +826,98 @@
                 }
                 logToServer('Load doc index…', `parsed: ${Object.keys(sourceIndex).length} entries`);
                 document.getElementById('status').textContent = `Loaded doc index: ${file.name}`;
+                renderDocList();
             };
             reader.readAsText(file);
+        });
+
+        // ── Doc-driven focus: click a public function in the doc index,
+        // show only what it calls (recursively), instead of the whole graph.
+        function renderDocList() {
+            const listEl = document.getElementById('doc-list');
+            const ids = Object.keys(sourceIndex).sort();
+            if (!ids.length) {
+                listEl.innerHTML = '<p style="padding:8px 10px;color:#6c7086;font-size:11px">Doc index is empty.</p>';
+                return;
+            }
+            listEl.innerHTML = ids.map(id => `<div class="doc-item" data-id="${id}">${id}</div>`).join('');
+            listEl.querySelectorAll('.doc-item').forEach(el => {
+                el.addEventListener('click', () => focusOnCallees(el.dataset.id));
+            });
+        }
+        document.getElementById('doc-search').addEventListener('input', e => {
+            const q = e.target.value.toLowerCase();
+            document.querySelectorAll('#doc-list .doc-item').forEach(el => {
+                el.style.display = el.dataset.id.toLowerCase().includes(q) ? '' : 'none';
+            });
+        });
+
+        let maxCallDepth = 0; // 0 = unlimited
+        document.getElementById('cfg-depth').addEventListener('input', e => {
+            maxCallDepth = parseInt(e.target.value, 10) || 0;
+        });
+
+        // Shows rootId plus everything it calls, recursively (outgoing edges
+        // only), capped at maxCallDepth layers (0 = no cap -- full transitive
+        // closure). Always reports what happened, in the page itself, not
+        // just the server log -- including when the depth cap actually cut
+        // something off, so a smaller-looking graph is never mistaken for
+        // "that's really everything this function calls".
+        function focusOnCallees(rootId) {
+            if (!cy) {
+                document.getElementById('info').innerHTML = `Load a graph first — "${rootId}" has no graph to focus on yet.`;
+                return;
+            }
+            const root = cy.getElementById(rootId);
+            if (!root.length) {
+                document.getElementById('info').innerHTML =
+                    `<b>${rootId}</b> has documentation but is not a node in the loaded graph ` +
+                    `(never calls anything traceable, or isn't in this graph's dependency closure).`;
+                logToServer('focusOnCallees', `${rootId}: no matching node in loaded graph`);
+                return;
+            }
+            const visited = new Set([rootId]);
+            let frontier = [rootId];
+            let truncated = false;
+            let depth = 0;
+            while (frontier.length) {
+                if (maxCallDepth > 0 && depth >= maxCallDepth) {
+                    truncated = frontier.some(id =>
+                        cy.getElementById(id).outgoers('node').some(n => !visited.has(n.id())));
+                    break;
+                }
+                const next = [];
+                frontier.forEach(id => {
+                    cy.getElementById(id).outgoers('node').forEach(n => {
+                        if (!visited.has(n.id())) { visited.add(n.id()); next.push(n.id()); }
+                    });
+                });
+                frontier = next;
+                depth++;
+            }
+            const nodes = cy.collection(Array.from(visited).map(id => cy.getElementById(id)[0]).filter(Boolean));
+            const edges = nodes.edgesWith(nodes);
+            cy.elements().hide();
+            nodes.union(edges).show();
+            cy.fit(nodes, 60);
+            const depthLabel = maxCallDepth > 0 ? `depth &le; ${maxCallDepth}` : 'unlimited depth';
+            document.getElementById('info').innerHTML =
+                `Focused on <b>${rootId}</b>: showing ${nodes.length} node(s), ${edges.length} edge(s) (${depthLabel})` +
+                (truncated ? ` — <b>truncated</b>: more callees exist beyond this depth, not shown.` : '.');
+            document.getElementById('status').textContent =
+                `${nodes.length} nodes | ${edges.length} edges — focused on ${rootId}${truncated ? ' (truncated)' : ''}`;
+            logToServer('focusOnCallees',
+                `${rootId}: ${nodes.length} nodes, ${edges.length} edges, maxDepth=${maxCallDepth || 'unlimited'}, truncated=${truncated}`);
+        }
+
+        document.getElementById('btn-clear-focus').addEventListener('click', () => {
+            if (!cy) return;
+            cy.elements().show();
+            applyUntracedVisibility(showUntraced);
+            cy.fit(undefined, 60);
+            document.getElementById('status').textContent = `${cy.nodes().length} nodes | ${cy.edges().length} edges`;
+            document.getElementById('info').innerHTML = 'Click a node for details.';
+            logToServer('btn-clear-focus', 'restored full graph view');
         });
 
         function renderTrace(spans) {
@@ -1159,6 +1306,7 @@
             });
         }
         makeResizable('rh-right', 'sidebar', 'right');
+        makeResizable('rh-left', 'doc-sidebar', 'left');
     </script>
 </body>
 
