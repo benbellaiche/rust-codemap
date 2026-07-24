@@ -170,22 +170,27 @@ are) still opens its native doc page, but can't pan the graph to it
 
 ### Navigating a large graph by hand
 
-Focusing a node (any of the ways above, or the mechanisms below) dims
-everything outside its immediate neighborhood and colors its own edges by
-direction — **orange** for what it calls, **green** for what calls it —
-instead of leaving the whole graph at uniform brightness. Each outgoing
-edge also carries a small number right next to the node it leaves from:
-that's `callOrder`, the position of that call in its caller's own source
-(see "Command reference" / `mir_graph.py` for how it's derived — it's a
-static, MIR-order approximation, not a guarantee about real execution
-order for code with branches or loops).
+Every edge carries a small number at its midpoint: that's `callOrder`, the
+position of that call in its caller's own source (see "Command reference" /
+`mir_graph.py` for how it's derived — it's a static, MIR-order
+approximation, not a guarantee about real execution order for code with
+branches or loops). Focusing a node dims everything outside its immediate
+neighborhood and colors its own edges by direction — **orange** for what it
+calls, **green** for what calls it — instead of leaving the whole graph at
+uniform brightness, and additionally repeats that same number right next to
+the node itself (at whichever end it's the node's own call), since the
+midpoint can be far away on a long or curved edge and it's easy to lose
+track of which of several numbers belongs to which. Edges leaving/entering
+close together are nudged apart a little so their near-node numbers don't
+stack on top of each other.
 
 Three ways to move from a focused node to one of its neighbors without
 touching the doc list:
 
-- **Click one of its edges** — jumps to whichever end isn't the currently
-  focused node (the target if it's an outgoing call, the source if
-  incoming).
+- **Click any edge** — jumps to whichever end isn't the currently focused
+  node (the target if it's an outgoing call, the source if incoming); with
+  no node focused yet, or on an edge unrelated to the current focus, it
+  just follows the arrow to its target.
 - **Press a number key** (`1`–`9`) — jumps straight to the outgoing call
   with that `callOrder`, without needing to click a specific thin edge in a
   dense area. Only single digits: a function with a tenth-or-later call has

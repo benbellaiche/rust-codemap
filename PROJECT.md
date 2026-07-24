@@ -468,6 +468,43 @@ so each crate's items resolve against that crate's own `src/`.
   zoom/pan measured unchanged to the pixel, a second empty click with
   nothing focused doesn't error, and focusing a fresh node afterward still
   works normally.
+
+  **Three more refinements, requested together right after**: (1) The
+  midpoint `callOrder` label (moved entirely to `source-label` two entries
+  up) needed to come back -- readable at a glance without focusing anything
+  first was the point of putting it there originally, and losing that to
+  gain the near-node version was a net loss, not a trade worth making.
+  Fixed by keeping both: the midpoint `label` shows `callOrder`+`iterLabel`
+  again unconditionally, and a *second*, endpoint-anchored copy only
+  appears on the currently focused node's own edges (`.nav-outgoing`/
+  `.nav-incoming`) -- unconditional on every edge, this doubled the label
+  count graph-wide for a benefit that only matters right around whatever
+  node is actually focused. (2) That reintroduced a real direction bug
+  caught before it shipped: `source-label` always anchors at an edge's
+  *source*, which for an *incoming* edge is the caller, not the focused
+  node -- using it for both directions would've put an incoming call's
+  number at the wrong end entirely. Incoming edges use `target-label`
+  instead (anchored at the target, i.e. the focused node), outgoing edges
+  keep `source-label`. (3) "Numbers overlap when edges are packed close
+  together" -- addressed with a per-edge stagger
+  (`source-text-margin-y`/`target-text-margin-y`, alternating a small
+  vertical nudge by position: 1st unmoved, 2nd up, 3rd down, 4th further
+  up, ...) applied in `applyNavHighlight()` across just the focused node's
+  own edges (a *fixed* offset in the stylesheet can't do this -- it would
+  shift every edge identically, doing nothing for overlap between them). A
+  previous focus's stagger values are reset before applying new ones, or
+  they'd persist as stale inline styles on edges that are plain again. (4)
+  Separately: clicking an edge no longer requires a node to already be
+  focused -- with nothing focused (or an edge unrelated to whatever is),
+  it now just follows the arrow to its target, the same as clicking a link
+  goes where it points; only an edge actually touching the current focus
+  keeps the direction-aware in/out behavior. Verified: incoming edges get
+  `target-label` (not `source-label`) with the right value; a synthetic
+  6-edge hub gets distinct (non-identical) stagger values, not all stacked
+  at one offset; a real click on an edge with nothing focused first lands
+  on its target; all prior regression tests re-run clean (one, checking
+  `source-label` unconditionally, updated to match the new focus-gated
+  behavior instead of describing a regression).
 - **Dynamic legend**: only lists edge types / states actually present in
   the currently loaded graph, grouped by shape (squares first, then lines).
 - **Doc cross-links in the info panel**: a node's signature renders with

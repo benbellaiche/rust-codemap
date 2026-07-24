@@ -892,19 +892,23 @@
                             'width': 2,
                             'opacity': 0.75,
                             'arrow-scale': 1.2,
-                            // iterLabel (replay's actual iteration count for
-                            // this call) sits at the edge's midpoint, same as
-                            // always. callOrder ("the Nth call made from this
+                            // callOrder ("the Nth call made from this
                             // caller", MIR-textual-order, see mir_graph.py)
-                            // moved to source-label -- Cytoscape's built-in
-                            // mechanism for a label anchored at a specific
-                            // endpoint rather than the midpoint -- so it
-                            // reads as "this numbered call, from this node"
-                            // even when several edges leave the same node
-                            // and their midpoints are scattered all over.
-                            'label': e => e.data('iterLabel') || '',
-                            'source-label': e => e.data('callOrder') != null ? String(e.data('callOrder')) : '',
-                            'source-text-offset': 16,
+                            // stays on the midpoint label, same as the very
+                            // first version of this -- kept for reading the
+                            // graph at a glance without needing to focus
+                            // anything first. A *second*, identical copy
+                            // additionally appears as a source-label (an
+                            // endpoint-anchored label, Cytoscape's own
+                            // mechanism for this) but only on the currently
+                            // focused node's own edges (`.nav-outgoing`/
+                            // `.nav-incoming` below) -- unconditionally on
+                            // every edge, this doubled the label count graph-
+                            // wide for a benefit ("which numbered call is
+                            // this, from this specific node") that only
+                            // matters right around whichever node you're
+                            // actually looking at.
+                            'label': e => [e.data('callOrder'), e.data('iterLabel')].filter(x => x != null).join(' '),
                             // 9px (the old iterLabel-only size, back when
                             // this only ever appeared on a few edges near an
                             // active replay step) was unreadable now that
@@ -924,8 +928,40 @@
                     // this call" and "what calls this" are visually distinct
                     // at a glance, not just "highlighted" as one undifferentiated
                     // group. z-index above the dimmed rest so they draw on top.
-                    { selector: 'edge.nav-outgoing', style: { 'line-color': '#fab387', 'target-arrow-color': '#fab387', 'width': 3, 'opacity': 1, 'z-index': 999 } },
-                    { selector: 'edge.nav-incoming', style: { 'line-color': '#a6e3a1', 'target-arrow-color': '#a6e3a1', 'width': 3, 'opacity': 1, 'z-index': 999 } },
+                    // Duplicates the midpoint callOrder right next to the
+                    // *focused* node specifically -- which endpoint that is
+                    // differs by direction, so outgoing uses source-label
+                    // (focused node is the source) and incoming uses
+                    // target-label (focused node is the target); using
+                    // source-label for both would anchor an incoming call's
+                    // number at the *caller*, not the node being looked at.
+                    // The *-text-margin-y properties are set per-edge in
+                    // applyNavHighlight() to stagger labels that would
+                    // otherwise land on top of each other when several of
+                    // the focused node's edges leave/arrive at similar
+                    // angles -- a plain fixed offset here can't do that, it'd
+                    // shift every one of them the same way.
+                    {
+                        selector: 'edge.nav-outgoing, edge.nav-incoming', style: {
+                            'font-size': '14px', 'font-weight': 'bold',
+                            'text-background-color': '#1e1e2e', 'text-background-opacity': 0.85,
+                            'text-background-padding': '2px',
+                        }
+                    },
+                    {
+                        selector: 'edge.nav-outgoing', style: {
+                            'line-color': '#fab387', 'target-arrow-color': '#fab387', 'width': 3, 'opacity': 1, 'z-index': 999, 'color': '#fab387',
+                            'source-label': e => e.data('callOrder') != null ? String(e.data('callOrder')) : '',
+                            'source-text-offset': 16,
+                        }
+                    },
+                    {
+                        selector: 'edge.nav-incoming', style: {
+                            'line-color': '#a6e3a1', 'target-arrow-color': '#a6e3a1', 'width': 3, 'opacity': 1, 'z-index': 999, 'color': '#a6e3a1',
+                            'target-label': e => e.data('callOrder') != null ? String(e.data('callOrder')) : '',
+                            'target-text-offset': 16,
+                        }
+                    },
                 ],
                 layout: { name: 'preset' },
                 wheelSensitivity: 0.15
@@ -982,15 +1018,15 @@
                     `<b style="color:#89b4fa">${d.source}</b> -> ${d.target}<br>Type: <b>${d.edgeType}</b>` +
                     (d.callOrder != null ? `<br>Call #${d.callOrder} from ${d.source}` : '') +
                     (d.iterLabel ? '<br>' + d.iterLabel : '');
-                // Clicking an edge attached to the currently focused node
-                // navigates *through* it -- to the callee if it's one of the
-                // focused node's outgoing calls, back to the caller if it's
-                // one of its incoming ones. An edge with neither endpoint
-                // focused (e.g. still visible from a previous focus that
-                // hasn't been cleared) is just informational, no jump.
-                if (!focusedNodeId) return;
+                // Clicking an edge always navigates through it: to the
+                // callee if it's one of the focused node's outgoing calls,
+                // back to the caller if it's one of its incoming ones --
+                // and, with no node focused yet (or an edge unrelated to
+                // whatever currently is), it just follows the arrow to its
+                // target, same as clicking a link goes where it points.
                 if (d.source === focusedNodeId) focusOnNode(d.target);
                 else if (d.target === focusedNodeId) focusOnNode(d.source);
+                else focusOnNode(d.target);
             });
             // Clicking empty canvas (not a node/edge -- `e.target === cy`
             // is Cytoscape's own way of telling a background tap apart from
@@ -1360,11 +1396,28 @@
         // the rest is what makes the highlighted ones readable.
         function applyNavHighlight(id) {
             cy.elements().removeClass('nav-dimmed nav-outgoing nav-incoming');
+            // Inline styles from a *previous* focus's staggering (below)
+            // aren't touched by removeClass -- reset them here or an edge
+            // that was, say, the 3rd outgoing edge last time keeps that
+            // offset even once it's plain again.
+            cy.edges().style({ 'source-text-margin-y': 0, 'target-text-margin-y': 0 });
             const node = cy.getElementById(id);
             if (!node.length) return;
             cy.elements().not(node.closedNeighborhood()).addClass('nav-dimmed');
-            node.outgoers('edge').addClass('nav-outgoing');
-            node.incomers('edge').addClass('nav-incoming');
+            const outgoing = node.outgoers('edge'), incoming = node.incomers('edge');
+            outgoing.addClass('nav-outgoing');
+            incoming.addClass('nav-incoming');
+            // Stagger: when several of the focused node's edges leave (or
+            // arrive) close enough together that their labels would overlap,
+            // alternate a small vertical nudge by position instead of
+            // stacking them all at the same spot -- 1st unmoved, 2nd up,
+            // 3rd down, 4th further up, etc.
+            const stagger = (edges, prop) => edges.forEach((e, i) => {
+                const step = Math.ceil(i / 2) * 14;
+                e.style(prop, i % 2 === 0 ? step : -step);
+            });
+            stagger(outgoing, 'source-text-margin-y');
+            stagger(incoming, 'target-text-margin-y');
         }
 
         function clearNavHighlight() {
