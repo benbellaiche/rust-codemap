@@ -745,27 +745,67 @@
                     // rank with unrelated nodes in between, purely by luck of
                     // scan order). No need to compute our own roots/depth for
                     // this -- dagre works straight off the edges.
-                    comp.layout({
-                        name: 'dagre', rankDir: 'TB',
-                        nodeSep: 50, rankSep: 70, ranker: 'network-simplex',
-                        animate: false, fit: false,
-                    }).run();
-                    const dBox = comp.boundingBox();
-                    const widthBudget = Math.max(3000, nodesInComp.length * 40);
-                    if (dBox.w > widthBudget || dBox.h > widthBudget) {
-                        // dagre still puts every node of a rank on one row,
-                        // same as plain breadthfirst -- a genuinely
-                        // fan-out-heavy component (confirmed: a synthetic
-                        // 2000-node one-level fan-out) is just as unbounded
-                        // in width under dagre as it was before. Falls back
-                        // to the hand-placed per-depth square-grid this
-                        // function used exclusively before dagre existed --
-                        // still bounded in both axes, just without dagre's
-                        // crossing-minimization.
+                    //
+                    // BUT: dagre's ranking (network-simplex) does not scale
+                    // gracefully, not just "gets ugly" like breadthfirst's
+                    // width blow-up -- measured on a synthetic call-graph-
+                    // shaped component (moderate fan-out + cross-branch
+                    // edges, i.e. shared callees, not a pure tree; unique
+                    // node/edge IDs, not overlapping the real graph's own --
+                    // an earlier pass at this measurement collided its
+                    // synthetic edge IDs with the real graph's, silently
+                    // dropped most of them, and produced meaningless
+                    // numbers): a roughly-quadratic curve, not a sudden
+                    // cliff -- 300 nodes -> ~0.5s, 500 -> ~1.3s, 1000 ->
+                    // ~3.7s, 2000 -> ~12.5s, 3000 -> ~28s. That's not "ugly,"
+                    // that's a frozen tab with no error and nothing in the
+                    // log (reported exactly this way against a real large
+                    // library) -- dagre.layout() is synchronous, so once
+                    // it's running there's no way to time out or cancel it.
+                    // The post-hoc widthBudget check below can't save us
+                    // here: by the time it could measure the result, the
+                    // multi-second-to-minute cost is already paid. This has
+                    // to be a pre-emptive guard on node count, not an
+                    // adaptive "try it and see" -- unlike the (cheap)
+                    // breadthfirst/grid choice this codebase preferred
+                    // everywhere else (see comments elsewhere in this
+                    // function), speed here isn't something you can measure
+                    // your way out of after the fact. 300 is chosen to stay
+                    // comfortably under a second even in the densest shape
+                    // measured -- a real crate's component could be denser
+                    // still, so this errs conservative rather than cutting
+                    // it close.
+                    const DAGRE_NODE_LIMIT = 300;
+                    if (nodesInComp.length > DAGRE_NODE_LIMIT) {
                         logToServer('layoutComponents',
-                            `component of ${nodesInComp.length} nodes: dagre came out ` +
-                            `w=${dBox.w.toFixed(0)} h=${dBox.h.toFixed(0)} (budget ${widthBudget}) -- redoing with a hand-placed per-depth grid`);
+                            `component of ${nodesInComp.length} nodes exceeds the ${DAGRE_NODE_LIMIT}-node dagre safety limit ` +
+                            `(its ranking algorithm gets very slow on dense graphs well below what breadthfirst/grid handle fine) -- ` +
+                            `using the hand-placed per-depth grid directly`);
                         layoutAsLevelGrid(comp, nodesInComp);
+                    } else {
+                        comp.layout({
+                            name: 'dagre', rankDir: 'TB',
+                            nodeSep: 50, rankSep: 70, ranker: 'network-simplex',
+                            animate: false, fit: false,
+                        }).run();
+                        const dBox = comp.boundingBox();
+                        const widthBudget = Math.max(3000, nodesInComp.length * 40);
+                        if (dBox.w > widthBudget || dBox.h > widthBudget) {
+                            // dagre still puts every node of a rank on one
+                            // row, same as plain breadthfirst -- a genuinely
+                            // fan-out-heavy component (confirmed: a synthetic
+                            // 2000-node one-level fan-out) is just as
+                            // unbounded in width under dagre as it was
+                            // before. Falls back to the hand-placed
+                            // per-depth square-grid this function used
+                            // exclusively before dagre existed -- still
+                            // bounded in both axes, just without dagre's
+                            // crossing-minimization.
+                            logToServer('layoutComponents',
+                                `component of ${nodesInComp.length} nodes: dagre came out ` +
+                                `w=${dBox.w.toFixed(0)} h=${dBox.h.toFixed(0)} (budget ${widthBudget}) -- redoing with a hand-placed per-depth grid`);
+                            layoutAsLevelGrid(comp, nodesInComp);
+                        }
                     }
                 }
                 const bb = comp.boundingBox();

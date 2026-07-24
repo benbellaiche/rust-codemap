@@ -364,6 +364,47 @@ so each crate's items resolve against that crate's own `src/`.
   `call_order`, node-click-focus) re-run clean, plus a new check confirming
   both CDN scripts actually load and expose their expected globals
   (`window.dagre`, `window.cytoscapeDagre`) with zero JS errors.
+
+  **Reported immediately after against a real large library: the viewer
+  loads but the graph never renders, no button responds, and nothing shows
+  up in the server log.** No exception ever reaches the page's own
+  `window.onerror`/`unhandledrejection` handler (which does log to the
+  server) -- consistent with the main thread being stuck *inside* a still-
+  running synchronous call, not with anything actually throwing. Prime
+  suspect: `comp.layout({name: 'dagre', ...}).run()` is synchronous and
+  can't be timed out or cancelled once started. First attempt at measuring
+  dagre's cost at scale gave misleadingly reassuring numbers (a "cliff"
+  around 6000 nodes, fine below that) -- turned out to be a bug in the
+  measurement itself: the synthetic test graph's edges reused `e0`, `e1`,
+  ... IDs that collided with the *real* dummy-cli graph's own edge IDs
+  already in `cy`, so `cy.add()` silently dropped most of them, and dagre
+  was actually laying out a fragmented, much-smaller-than-intended graph.
+  Re-measured with a uniquely-namespaced synthetic component (`stress_`
+  prefix) and got a very different, much more damning picture: smooth
+  polynomial growth from the very start, no cliff needed -- 300 nodes
+  -> ~0.5s, 500 -> ~1.3s, 1000 -> ~3.7s, 2000 -> ~12.5s, 3000 -> ~28s. Real
+  call graphs are denser than a plain tree (shared callees create cross-
+  branch edges), so a component with even a few hundred nodes can already
+  cost real, noticeable time, and a genuinely large one can hang the tab
+  for a minute or more with zero feedback. Unlike the `widthBudget` quality
+  check (cheap to try-then-measure-then-redo), this can't be solved
+  adaptively -- by the time a post-hoc check could measure how slow it was,
+  the cost is already paid. Added a pre-emptive `DAGRE_NODE_LIMIT` (300,
+  chosen to stay under ~1s even in the densest shape measured, erring
+  conservative since a real crate could be denser still) that skips dagre
+  entirely and goes straight to `layoutAsLevelGrid()` above that size --
+  this now also catches the dummy-cli fixture's own 685-node pathological
+  component *before* even trying dagre (previously it tried dagre first and
+  fell back afterward via `widthBudget`; the end result is the same grid
+  layout either way, just without spending ~2s+ on a dagre attempt that was
+  always going to be thrown out for that component specifically). Verified
+  the guard actually fires (log line + timing) on both the 685-node fixture
+  component and a fresh 3000-node synthetic one embedded in the same graph,
+  completing in ~3.3s total for the *whole* re-layout (all 250+ components,
+  not just the one being stress-tested) rather than the 28s a bare dagre
+  call took on that size alone. Confirmed the `run_report` cluster (well
+  under 300 nodes) is unaffected and still gets dagre's sibling-clustering.
+  All prior regression tests re-run clean.
   `node.visited` during replay, so a never-visited node and an actually-
   visited one were indistinguishable. Changed the default to blue
   (`#89b4fa`); `visited` keeps the green (unchanged, along with `current`/
