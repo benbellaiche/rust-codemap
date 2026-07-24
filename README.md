@@ -148,10 +148,10 @@ clicking a node **in the graph** does the same pair of things in reverse:
 
 1. **Pans/zooms the graph** to that node (a fixed, strong zoom level,
    consistent regardless of how many other functions call it) and
-   highlights it (a soft halo, distinct from the untraced/visited/current/
-   last-step colors so it never conflicts with them) until the next click
-   or **"Show full graph"** (which now just resets the viewport — nothing
-   is ever hidden by this).
+   highlights it (a soft halo, distinct from the untraced/visited/current
+   colors so it never conflicts with them) until the next click or **"Show
+   full graph"** (which now just resets the viewport — nothing is ever
+   hidden by this).
 2. **Updates the "Selected" panel** right below the doc list — the same
    function name/signature/source-link/doc-comment info a graph node's
    click already showed, now living in one place instead of two, plus an
@@ -177,7 +177,16 @@ approximation, not a guarantee about real execution order for code with
 branches or loops). This is the *static* navigation layer — it's a
 deliberately separate thing from replaying a trace (below); loading one
 suppresses all of the following so it doesn't fight with replay's own
-visited/current/last-step colors.
+visited/current colors — a loaded trace keeps that suppression active until
+you do something about it. Two toolbar buttons hand control back:
+**"Switch to static"** hides the replay overlay (and un-suppresses this
+layer) without touching the trace itself — click **"Switch to replay"**
+(same button, relabeled) to bring the exact same step right back, no
+progress lost; stepping again (`Step >`/`Play`) also switches back to
+replay automatically, since stepping only makes sense if you want to see
+it. **"Unload trace"** is the one-way version — clears the trace
+completely, for when you're done with that run rather than just looking
+away from it for a moment.
 
 Focusing a node (clicking it, a doc-list entry, an edge, or a number key)
 dims everything outside its immediate neighborhood and colors its own edges
@@ -236,23 +245,69 @@ produces out of the box:
 tracing_subscriber::fmt()
     .json()
     .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW | tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+    .with_file(true)
+    .with_line_number(true)
     .init();
 ```
 
 Each line is either a span **entry** event or a span **close** event:
 
-- **Entry**: `{"span": {"name": "my_span", ...fields}, "spans": [ {"name": "caller"}, ... ]}`
-  — `span.name` identifies the call; `spans` is the ordered list of
-  enclosing spans (the call stack at that point, root first).
+- **Entry**: `{"filename": "...", "line_number": N, "span": {"name": "my_span", ...fields}, "spans": [ {"name": "caller"}, ... ]}`
+  — `span.name` identifies the call (see "How a span is matched to a graph
+  node" below — its literal text isn't actually load-bearing); `spans` is
+  the ordered list of enclosing spans (the call stack at that point, root
+  first); `filename`/`line_number` are `#[instrument]`'s own source
+  location and only appear with `.with_file(true).with_line_number(true)`
+  set (recommended — see below for why).
 - **Close**: same shape, but `fields` additionally contains `"time.busy"`
   (a duration string like `"1.23ms"`, `"450µs"`, `"2.1s"`) — this is where
   per-call duration and iteration counts come from.
 
-Known current limitation: spans are deduplicated **by name**. If the same
-function is called from genuinely different call sites, they currently
-collapse into a single graph node/trace entry rather than being
-distinguished — acceptable for a first pass, called out here so it isn't a
-surprise.
+### How a span is matched to a graph node
+
+`span.name` is **not** trusted as the match key by itself, for two reasons
+confirmed by direct testing, not just theory: a method's *default*
+instrumented name is just its bare name (`grand_total`), never this tool's
+own `Type::method` node id (`Batch::grand_total`) — so plain name-matching
+already fails for every method, with no customization involved at all —
+and `#[instrument(name = "...")]` can rename a span to anything, free
+functions included.
+
+With `.with_file(true).with_line_number(true)` set (and `--doc`/`source_index.json`
+generated, which is where the graph side of this comes from), `trace_log.py`
+instead resolves each span by real source location: `#[instrument]` always
+reports the line *it itself* starts on — never the `fn`/method line, and
+never shifted by a multi-line attribute, further attributes stacked after
+it, or comments of any kind in between (measured directly across all of
+those shapes; the gap to the real item line ranged from 1 to 11 lines in
+small test cases alone, ruling out a fixed tolerance window as a fix). The
+resolver scans the actual source file forward from that line, skipping
+exactly what Rust allows between an attribute and its item, to the true
+`fn`/method line — which lines up exactly with what `source_index.json`
+already records for that same item via `cargo doc`'s own source link. This
+only works server-side (`trace_log.py`, via `/__codemap_parse_trace`) since
+it needs to read the target project's own `.rs` files directly, something
+the browser can't do for a file it wasn't handed directly — the viewer's
+`parseTraceJsonl()` client-side fallback (used only if the server is
+unreachable, e.g. `index.html` opened straight off disk) still matches by
+name only, with the limitations above.
+
+Known current limitations:
+
+- If a span still doesn't resolve (no `source_index.json`, an unreadable
+  source file, or a macro-generated `fn` with no literal source line to
+  scan to), it falls back to matching by name — an ancestor-span entry in
+  `spans` will only resolve if that same span also appeared elsewhere in
+  the trace with its own `filename`/`line_number` (true for any span
+  tracing itself emitted, since every span gets its own top-level entry
+  when entered) to resolve from.
+- Spans are still deduplicated by (resolved) node id. If the same function
+  is called from genuinely different call sites, they currently collapse
+  into a single graph node/trace entry rather than being distinguished —
+  acceptable for a first pass, called out here so it isn't a surprise. This
+  is unrelated to (and not fixed by) the file+line resolution above, which
+  only changes *which* node id a span maps to, not how many distinct
+  entries a repeatedly-called function gets.
 
 ## Command reference
 

@@ -387,11 +387,22 @@ class LoggingHandler(http.server.SimpleHTTPRequestHandler):
         # §3). The viewer still carries a client-side fallback for when it's
         # opened without this server running (e.g. straight off disk) --
         # this endpoint is what makes that fallback path the exception
-        # rather than the rule.
+        # rather than the rule. It's also the *only* place span-to-node
+        # reconciliation by real source location (file+line, not span name)
+        # can happen at all: that needs reading the target project's own
+        # .rs files directly, which only this server process (running
+        # locally alongside the project) can do -- the browser can't reach
+        # an arbitrary path on disk just because it knows one.
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
+        source_index = None
+        if self.doc_path:
+            try:
+                source_index = json.loads(Path(self.doc_path).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pass  # no source_index.json (yet) -- span/node matching just falls back to name-only
         try:
-            spans = trace_log.parse_trace(body.decode("utf-8", errors="replace"))
+            spans = trace_log.parse_trace(body.decode("utf-8", errors="replace"), source_index)
             response = json.dumps({"spans": spans}).encode("utf-8")
         except Exception as exc:
             self.send_response(500)

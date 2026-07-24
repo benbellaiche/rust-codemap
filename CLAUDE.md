@@ -215,13 +215,23 @@ found and fixed once already — see PROJECT.md §7).
 
 ### `codemap/trace_log.py` vs. the viewer's inline JS parser
 
-The exact same tracing-log parsing logic (dedup by span name, `time.busy`
+The core tracing-log parsing logic (dedup by resolved span id, `time.busy`
 duration parsing, iteration counting) is implemented twice: once here in
-Python, once as `parseTraceJsonl()` inside `viewer/index.html` (used by the
-"Load trace…" file picker, so a raw log can be loaded without invoking the
-CLI first). This duplication is known and tracked in PROJECT.md, not an
-oversight — if you fix a bug in one, check whether it also applies to the
-other.
+Python, once as `parseTraceJsonl()` inside `viewer/index.html`. This
+duplication is known and tracked in PROJECT.md, not an oversight — if you
+fix a bug in one, check whether it also applies to the other. The two are
+no longer equivalent, though, and won't become so: only `trace_log.py` can
+resolve a span to its true graph node id by real source location
+(file+line, scanned past the `#[instrument]` attribute to the actual item
+— see README.md "Tracing log format") rather than by span name, because
+that needs reading the target project's own `.rs` files directly, which
+only a local server process can do — a browser can't reach an arbitrary
+path on disk just because it knows one. `parseTraceJsonl()` stays a
+name-only fallback for when there's no server to ask (e.g. `index.html`
+opened straight off disk); "Load trace…" already prefers a round trip to
+`/__codemap_parse_trace` (`_handle_parse_trace` in `__main__.py`, which
+loads `source_index.json` fresh per request) and only falls back to the
+client-side parser if that request fails.
 
 ### `viewer/index.html` — the pieces that aren't obvious from a skim
 
@@ -245,8 +255,11 @@ other.
   a replay-from-scratch model: `stepTo(idx)` always clears everything and
   rebuilds state for spans `0..idx`, it never mutates incrementally. Stepping
   backward is therefore just `stepTo(idx - 1)`.
-- Reaching the last span of a trace is a distinct state ("last-step",
-  styled violet) from an ordinary "current" step; a further `Step >` (or
+- Reaching the last span of a trace looks like an ordinary "current" step
+  (a separate violet "last-step" state existed once but never actually
+  showed -- `finishTraceToRoot`, below, overwrote it to "visited" the
+  moment you tried to go one step further, which is the natural next thing
+  to do, so it was removed rather than fixed); a further `Step >` (or
   letting `Play` run out) triggers `finishTraceToRoot()`, which animates an
   unwind all the way back to the `main` node and only then settles that
   path to the normal "visited" green. `main` here is not a hardcoded

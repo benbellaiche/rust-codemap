@@ -466,6 +466,8 @@
             <button id="btn-step">Step &gt;</button>
             <button id="btn-reset">Reset</button>
             <button id="btn-relayout">Re-layout</button>
+            <button id="btn-toggle-static" title="Hide the replay overlay and use normal graph navigation, without losing your place in the trace">Switch to static</button>
+            <button id="btn-unload-trace" title="Unload the trace entirely">Unload trace</button>
         </div>
         <div id="toolbar-right">
             <button id="btn-load-trace">Load trace&hellip;</button>
@@ -532,9 +534,6 @@
                 <div class="leg">
                     <div class="dot" style="background:#f38ba8"></div> current (active step)
                 </div>
-                <div class="leg">
-                    <div class="dot" style="background:#cba6f7"></div> last step (end of trace)
-                </div>
                 <div class="leg" id="legend-untraced" style="display:none">
                     <div class="dot" style="background:#45475a;border:1px dashed #6c7086;opacity:.7"></div> untraced
                 </div>
@@ -545,9 +544,6 @@
                 </div>
                 <div class="leg">
                     <div class="arr" style="background:#f38ba8"></div> current (active step)
-                </div>
-                <div class="leg">
-                    <div class="arr" style="background:#cba6f7"></div> last step (end of trace)
                 </div>
                 <div class="leg">
                     <div class="arr" style="background:#f9e2af;height:2px"></div> return
@@ -571,6 +567,19 @@
             edge: { call: '#cdd6f4', dispatch: '#89b4fa', loop_call: '#cdd6f4', trampoline: '#f38ba8' }
         };
         let cy = null, traceData = [], traceIdx = -1, playActive = false, playTimeout = null, sourceIndex = {};
+        // True while a trace is loaded but its replay overlay (visited/
+        // current colors, edge styling) is deliberately hidden so the
+        // static-navigation highlight/dim can be used instead -- distinct
+        // from actually unloading the trace (traceData = []): switching
+        // back just re-renders traceIdx's current step exactly as it was.
+        // Any actual step (stepTo) turns this off automatically, since
+        // stepping only makes sense as "I want to see replay progress."
+        let staticModeActive = false;
+        function replayViewSuppressed() { return traceData.length > 0 && !staticModeActive; }
+        function updateStaticToggleButton() {
+            document.getElementById('btn-toggle-static').textContent =
+                staticModeActive ? 'Switch to replay' : 'Switch to static';
+        }
         let animPlay = 700, animStep = 280, animHold = 550;
         let loopAnimRunning = false, loopAnimEdges = null;
 
@@ -869,11 +878,10 @@
                     { selector: 'node.untraced', style: { 'background-color': '#45475a', 'border-style': 'dashed', 'border-color': '#6c7086', 'border-width': 3, 'opacity': 0.6 } },
                     { selector: 'node.visited', style: { 'background-color': '#a6e3a1', 'border-color': '#1e1e2e' } },
                     { selector: 'node.current', style: { 'background-color': '#f38ba8', 'border-color': '#fab387', 'border-width': 3 } },
-                    { selector: 'node.last-step', style: { 'background-color': '#cba6f7', 'border-color': '#fab387', 'border-width': 3 } },
                     // An overlay halo, not a border/background override --
                     // composes with whatever else is already applied
-                    // (untraced/visited/current/last-step) instead of
-                    // fighting over the same border-width property.
+                    // (untraced/visited/current) instead of fighting over
+                    // the same border-width property.
                     { selector: 'node.doc-focused', style: { 'overlay-color': '#f9e2af', 'overlay-opacity': 0.5, 'overlay-padding': 6 } },
                     // Everything not in the focused node's own neighborhood
                     // fades back -- "highlighted" alone didn't read clearly
@@ -1438,9 +1446,11 @@
         function expandNeighborhood(id) {
             // Physically moving nodes would fight replay's own fixed
             // positions (its return-path/step animations assume nodes stay
-            // put) -- disabled entirely once a trace is loaded, same as the
-            // static highlight/dim above.
-            if (traceData.length || !cy) return;
+            // put) -- disabled whenever the replay overlay is actually
+            // showing, same as the static highlight/dim below; switching to
+            // static view (trace still loaded, overlay just hidden) lifts
+            // this the same way it lifts that.
+            if (replayViewSuppressed() || !cy) return;
             restoreExpansion(); // only one expansion active at a time
             const node = cy.getElementById(id);
             const neighbors = node.openNeighborhood('node');
@@ -1555,14 +1565,16 @@
             cy.animate({ zoom: Math.max(cy.zoom(), FOCUS_ZOOM), center: { eles: node } }, { duration: 400 });
             showNodeInfo(node);
             // The static-navigation highlight/dim is a distinct visual
-            // language from replay's (visited/current/last-step colors,
-            // return-path flashes) -- mixing them (e.g. dimming a node
-            // replay just marked "current" to near-invisibility) fights the
-            // thing that's actually the priority once a trace is loaded.
-            // Once one is, clicking around the graph keeps zooming/
-            // centering/showing info as normal, it just stops touching
-            // dim/highlight at all.
-            if (traceData.length) clearNavHighlight();
+            // language from replay's (visited/current colors, return-path
+            // flashes) -- mixing them (e.g. dimming a node replay just
+            // marked "current" to near-invisibility) fights the thing
+            // that's actually the priority whenever the replay overlay is
+            // showing. Clicking around the graph always keeps zooming/
+            // centering/showing info as normal either way, it just stops
+            // touching dim/highlight while replay's own colors are visible
+            // -- switching to static view (see btn-toggle-static) hides
+            // those without unloading the trace, which lifts this too.
+            if (replayViewSuppressed()) clearNavHighlight();
             else applyNavHighlight(id);
             restoreExpansion(); // collapse any double-click neighborhood expansion -- this is a new focus
             revealInDocList(id);
@@ -1658,11 +1670,18 @@
 
         function stepTo(idx) {
             if (!cy || !traceData.length) return;
+            if (staticModeActive) { staticModeActive = false; updateStaticToggleButton(); }
+            // A node click while static view was showing (trace still
+            // loaded, overlay just hidden) applies the static nav-highlight
+            // classes same as always -- clear them here too, not just the
+            // replay classes below, or they'd survive into the replay view
+            // and mix with its own visited/current colors right back into
+            // the exact problem keeping the two separate was meant to avoid.
+            clearNavHighlight();
             clearAll();
             for (let i = 0; i <= idx; i++) {
                 const span = traceData[i], isCur = i === idx;
-                const isLast = isCur && idx === traceData.length - 1;
-                cy.getElementById(span.name).addClass(isLast ? 'last-step' : isCur ? 'current' : 'visited');
+                cy.getElementById(span.name).addClass(isCur ? 'current' : 'visited');
                 document.getElementById(`sp-${i}`)?.classList.add(isCur ? 'current' : 'visited');
                 const fullPath = [...(span.stack || []), span.name];
                 const loopCurEdges = [];
@@ -1678,7 +1697,7 @@
                             e.style({ 'line-color': '#a6e3a1', 'target-arrow-color': '#a6e3a1', 'line-style': 'solid', 'opacity': 1, 'width': 3 });
                         }
                     } else {
-                        const col = isLast ? '#cba6f7' : isCur ? '#f38ba8' : '#a6e3a1';
+                        const col = isCur ? '#f38ba8' : '#a6e3a1';
                         e.style({ 'line-color': col, 'target-arrow-color': col, 'opacity': 1, 'width': isCur ? 5 : 3 });
                     }
                 }
@@ -1700,7 +1719,7 @@
 
         function clearAll() {
             stopLoopFlow(false);
-            cy?.nodes().removeClass('visited current last-step');
+            cy?.nodes().removeClass('visited current');
             cy?.edges().removeStyle();
             document.querySelectorAll('.sp').forEach(el => el.classList.remove('visited', 'current'));
         }
@@ -1892,7 +1911,7 @@
                     const e = cy.edges().filter(ed => ed.data('source') === parent && ed.data('target') === child);
                     if (e.length) e.style({ 'line-color': '#a6e3a1', 'target-arrow-color': '#a6e3a1', 'opacity': 1, 'width': 3 });
                 }
-                cy.getElementById(last.name).removeClass('last-step current').addClass('visited');
+                cy.getElementById(last.name).removeClass('current').addClass('visited');
                 document.getElementById(`sp-${traceIdx}`)?.classList.add('visited');
                 traceIdx = traceData.length; // sentinel: fully unwound, nothing more to step through
             };
@@ -1967,6 +1986,48 @@
             if (!cy) return;
             layoutComponents(cy);
             cy.animate({ fit: { padding: 60 }, duration: 300 });
+        });
+
+        // Toggles the replay overlay on and off *without* unloading the
+        // trace, so switching back and forth between "look at the static
+        // graph" and "see where I am in the replay" is cheap and reversible
+        // -- unlike unload (below), traceIdx/traceData are left completely
+        // untouched, so switching back just re-renders the exact same step.
+        document.getElementById('btn-toggle-static').addEventListener('click', () => {
+            if (!cy) return;
+            staticModeActive = !staticModeActive;
+            updateStaticToggleButton();
+            if (staticModeActive) {
+                clearAll(); // hide the overlay only -- traceData/traceIdx untouched
+            } else if (traceIdx >= 0 && traceIdx < traceData.length) {
+                stepTo(traceIdx); // restore exactly where playback was
+            }
+            logToServer('btn-toggle-static', staticModeActive
+                ? 'switched to static view (trace still loaded)'
+                : 'switched back to replay view');
+        });
+
+        // Unloads the trace entirely and hands the graph back to normal
+        // static navigation for good -- unlike the toggle above, there's no
+        // going back to the same point afterward. Needed because a loaded
+        // trace (traceData.length > 0) suppresses the static-navigation
+        // highlight/dim on every click (see focusOnNode -- deliberate, so
+        // it doesn't fight replay's own visited/current colors) -- with no
+        // way to unload a trace before this, that suppression was permanent
+        // for the rest of the session once any trace had been loaded, even
+        // long after playback finished, making normal node clicks look
+        // unresponsive by comparison.
+        document.getElementById('btn-unload-trace').addEventListener('click', () => {
+            if (!cy) return;
+            stopPlay();
+            traceData = [];
+            traceIdx = -1;
+            staticModeActive = false;
+            updateStaticToggleButton();
+            clearAll();
+            document.getElementById('trace-list').innerHTML =
+                '<p style="padding:8px 10px;color:#6c7086;font-size:11px">Click Play to load & animate.</p>';
+            logToServer('btn-unload-trace', 'unloaded trace, back to static analysis mode');
         });
 
         // ── Config bar ────────────────────────────────────────────────────────

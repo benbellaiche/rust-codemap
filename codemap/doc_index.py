@@ -90,6 +90,14 @@ def build_index(crates, graph: dict) -> dict:
             "docHtml": doc,
             "file": f"src/{file_}" if file_ else "",
             "line": line,
+            # Same absolute path already computed for vscodePath, exposed on
+            # its own -- lets trace_log.py match a tracing span back to this
+            # node by real source location (file + line, scanned forward
+            # past the #[instrument] attribute to the actual fn) instead of
+            # by span name, which a method's default instrumented name
+            # never matches (bare method name, no "Type::" qualifier) and
+            # a custom `#[instrument(name = "...")]` can be anything at all.
+            "absPath": abs_path,
             "vscodePath": vscode_url,
             "crate": cname,
             "kind": kind,

@@ -640,6 +640,179 @@ so each crate's items resolve against that crate's own `src/`.
   edges now resolve to the identical `rgb(137,180,250)` as dimmed nodes,
   and the elevated 0.35 opacity is in effect (not the default 0.75 or the
   node's 0.12). All other regression tests re-run clean.
+- **Trace span -> graph node matching, by real source location instead of
+  span name.** Raised while planning how to actually test replay: the real
+  target project's `#[instrument]` calls use custom `name = "..."` values
+  for nicer log output, unrelated to the function's real identifier. Before
+  writing any fix, generated an actual trace to see the real damage rather
+  than guessing: stripped the fixture's synthetic `bulk/` stress module out
+  of all three `dummy-lib` crates (unrelated to this feature, just noise
+  for it -- `pub mod bulk;` removed from each crate's own `lib.rs`, cutting
+  the merged graph from ~1046 nodes down to a clean 24), wired
+  `tracing-subscriber` into `dummy-cli` (previously had none at all,
+  despite `#[instrument]` already being used throughout the fixture -- see
+  README.md's format contract for the exact setup used), and renamed two
+  spans (`run_report` -> `"run_report_entrypoint"`,
+  `Report::generate` -> `"Building the financial report"`) to reproduce the
+  reported scenario. Loading the resulting real trace confirmed 4 of 8
+  spans failed to match any graph node -- but only 2 were the ones
+  deliberately renamed; the other 2 (`grand_total`, `total`) were never
+  touched at all. Root cause: `#[instrument]`'s *default* name for a method
+  is just its bare name, with no `Type::` qualifier -- it never matched this
+  tool's own `Type::method` node ids to begin with, custom naming or not.
+  The problem was broader than the one reported.
+
+  Considered and rejected requiring a manual custom field on every
+  `#[instrument]` call (e.g. `fields(codemap_id = "Type::method")`) as the
+  fix -- directly against this project's own "no target-project mapping"
+  principle (see CLAUDE.md): manual, per-call-site, silently wrong on a
+  typo, and would need touching every already-written instrumentation site
+  in a real codebase that doesn't want to. `file`+`line` was the structural
+  alternative -- intrinsic to where `#[instrument]` is physically written,
+  unaffected by its own `name` argument -- but a first pass assuming a
+  small fixed tolerance for the gap between `#[instrument]`'s reported line
+  and the item's real line turned out to be unfounded: measured directly
+  with a disposable scratch crate covering the shapes that would actually
+  produce a gap (a multi-line `#[instrument(...)]`, several attributes
+  stacked after it, a 10-line `//` block, a `/* */` block, a doc comment
+  placed unusually *below* the attribute), `#[instrument]` reports *exactly*
+  its own first line in every case, never shifted by any of that -- but the
+  gap to the true item line ranged from 1 to 11 lines even in these small
+  examples, ruling out any fixed window (real doc comments run much
+  longer). `cargo doc`'s own source-link line (already captured for every
+  node via `doc_index.py`, used for the info panel's source link) matched
+  the item's true line exactly in every one of those same cases, confirmed
+  by parsing the generated HTML source-line anchors directly rather than
+  assuming cargo doc's convention.
+
+  Landed on scanning the actual source file forward from `#[instrument]`'s
+  reported line, skipping exactly what Rust allows between an attribute and
+  its item (blank lines; `//`/`///`/`//!` line comments; `/* */` block
+  comments, tracked across lines; further attributes, tracked for their own
+  possible multi-line `(`/`[` nesting) until the first real code line --
+  which is the true item line, exactly, not approximately, confirmed against
+  the real trace and every scratch-crate case. This only works server-side:
+  the browser can't read an arbitrary file on disk just because it knows
+  the path, only the one file the user handed it via a picker -- but
+  `trace_log.py` already runs locally alongside the target project, the
+  same access `doc_index.py` already relies on for its own vscode:// links.
+  Exposed the absolute path each node's `doc_index.py` entry already
+  computes (previously only embedded inside its `vscodePath` string) as its
+  own `absPath` field, giving `trace_log.py` a `(file, line) -> node id`
+  reverse index to resolve into. Normalizes paths with `os.path.normcase`
+  (not a blanket lowercase) specifically so this stays correct on
+  case-sensitive filesystems too, not just the Windows machine it was
+  measured on.
+
+  A single unified mechanism, not name-matching-with-a-fallback, per
+  explicit request: every span (free function or method, default-named or
+  customized) resolves the same way. A span's own name is resolved from its
+  own `filename`/`line_number`; an ancestor name inside its `spans` stack
+  has neither, so a first pass over the whole trace builds a raw-name ->
+  resolved-id map from whatever entries *do* carry their own location (every
+  span gets one, on its own "new" event), and a second pass applies that map
+  everywhere a name appears, own span or ancestor alike -- name-only
+  matching remains only as the fallback when nothing resolves (no
+  `source_index.json`, unreadable file, or a macro-generated `fn` with no
+  literal line to scan to), never as a separate first-class path.
+
+  Verified end-to-end, not just unit-level: the real captured trace (8
+  spans) went from 4 unmatched to 8 resolving correctly, including the 2
+  never-renamed method spans and every ancestor stack entry, confirmed by
+  direct Python call, then again through the actual live
+  `/__codemap_parse_trace` HTTP endpoint, then again by loading that trace
+  in a real browser and stepping through the *entire* replay (Play/Step),
+  confirming every resolved node actually gets visited with the right
+  current/visited classes (see next entry for why there's no "last-step"
+  anymore). All prior regression tests re-run clean; several older ones
+  turned out to hardcode the pre-bulk-removal
+  graph's exact node/edge counts (`1046`, `990`, `1958`, `> 500` doc items)
+  and were updated to measure a baseline dynamically instead of asserting a
+  number tied to fixture contents that had just changed for an unrelated
+  reason.
+- **"Last step" (violet) removed.** Reported after actually testing replay
+  with the fix above: it never visually appeared as violet. Root cause
+  found in the code, not fixed -- `finishTraceToRoot()` (triggered by
+  pressing Step/Play once more after reaching the true final span) unwinds
+  the path back to `main` and, as part of settling, immediately did
+  `removeClass('last-step current').addClass('visited')` on that node --
+  so the violet state was real but transient, overwritten to green the
+  moment you tried to go one step further, which is the natural thing to
+  do when testing "what happens at the end." Decided not worth fixing (a
+  ~1-2 frame flash before the very next interaction erases it isn't worth
+  preserving) -- removed instead: the `isLast`/`.last-step` distinction is
+  gone from `stepTo()`, the standalone `node.last-step` style rule is gone,
+  `finishTraceToRoot()`'s cleanup simplified to `removeClass('current')`
+  (no `.last-step` to also strip anymore), and its 4 legend entries (dot +
+  arrow, since it appeared in both the node and edge sections) removed. The
+  final span now simply stays `.current` (pink) like any other current
+  step until you explicitly step past it. Also used as the prompt to
+  audit the rest of the legend for accuracy: `EDGE_LEGEND` still lists
+  `dispatch`/`loop_call`/`trampoline` entries that **no code path actually
+  produces** (`edgeType` is only ever read as `'loop_call'`, never
+  assigned that value anywhere in the viewer, and `mir_graph.py` only ever
+  emits `"call"`) -- but `buildLegend()`'s existing `present.has(t)` filter
+  already keeps them out of a real legend, so this is dead code, not a
+  legend bug; left as-is rather than deleting speculative-but-inert
+  scaffolding that isn't actually causing a wrong legend today.
+- **"Static analysis mode" button.** Reported right after testing replay
+  end-to-end: once a trace had been loaded, clicking a graph node stopped
+  looking like it did anything. Not actually broken -- `focusOnNode` still
+  zoomed/centered/showed info exactly as before -- but the *dim/highlight*
+  half (the visually loud part) is deliberately suppressed the whole time
+  `traceData.length > 0` (see the entry two above this one, added
+  specifically so replay's own visited/current colors don't fight with a
+  dim overlay), and there was no way to *un*load a trace once loaded short
+  of loading an entirely new graph -- meaning that suppression, once
+  triggered, was permanent for the rest of the session, long after
+  playback had actually finished. Added a new toolbar button next to
+  Re-layout that clears `traceData`/`traceIdx`, runs the same `clearAll()`
+  replay-visual cleanup Reset uses, and resets the trace-list panel back to
+  its original placeholder -- handing the graph back to normal static
+  navigation, at which point `focusOnNode`'s `traceData.length` check
+  naturally re-enables highlighting on the very next click, no separate
+  flag needed. Verified: stepping through the whole real trace then
+  clicking this button drops `traceData` to empty, clears every
+  visited/current class, resets the trace-list text, and confirms a
+  subsequent node click applies the normal dim/highlight again -- all in
+  one Playwright run alongside the last-step-removal checks above. All
+  prior regression tests re-run clean, including the ones this same round
+  had to update for the no-more-`.last-step` change.
+
+  **Split into two buttons right after**: unloading was too blunt for
+  "let me glance at the static graph and go right back to where I was in
+  the replay" -- a real workflow once both views exist side by side.
+  Replaced the single button with `btn-toggle-static` (hides the replay
+  overlay via the same `clearAll()` as before, but leaves `traceData`/
+  `traceIdx` completely untouched, and relabels itself "Switch to
+  replay"; clicking again re-renders that exact step via `stepTo(traceIdx)`
+  -- a real toggle, not a one-way door) and `btn-unload-trace` (the
+  original behavior, unchanged, for when you're actually done with that
+  run). A new `staticModeActive` flag, not `traceData.length` alone, now
+  gates the dim/highlight suppression (`replayViewSuppressed()` = trace
+  loaded *and* not in static view) and the double-click expansion guard --
+  both lift the instant you switch to static view, without needing the
+  trace unloaded first. Any real step (`stepTo`, so `Step >`/`Play`/
+  clicking a trace-list row all get this for free) clears the flag
+  automatically, on the reasoning that stepping only makes sense if you
+  want to see replay progress, so there's no need to manually "switch
+  back" before doing so. Caught one real bug while testing the round trip:
+  switching to static, clicking a node (applying the static nav-highlight
+  classes), then switching back to replay left those classes sitting on
+  top of the freshly-restored replay colors -- `stepTo()` cleared the
+  *replay* classes it's always cleared, but never the *static* ones, since
+  before this change the two states were mutually exclusive by
+  construction and it never had to. Fixed by having `stepTo()` call
+  `clearNavHighlight()` itself, guaranteeing no static-view artifact can
+  survive into a replay frame regardless of which sequence of
+  clicks/toggles/steps got there. Verified the full round trip: toggle to
+  static keeps `traceIdx`/`traceData` intact and clears the overlay; a
+  node click in static view applies normal highlighting; toggling back
+  restores the identical step with zero static leftovers; stepping while
+  in static view auto-switches back; and unload still clears everything
+  the toggle deliberately doesn't. All prior regression tests re-run
+  clean, including one from the previous round that needed its button id
+  updated to match the split.
 - **Dynamic legend**: only lists edge types / states actually present in
   the currently loaded graph, grouped by shape (squares first, then lines).
 - **Doc cross-links in the info panel**: a node's signature renders with
@@ -867,7 +1040,17 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
   `dummy-lib/README.md` doesn't cover this -- it's explicitly a stress-
   test add-on, not part of the curated fixture the README documents.
 
-## 3. Points to fix
+  **Removed** once the large-graph layout work it existed for (§3) was
+  settled and its own scale was actively getting in the way of a *different*
+  investigation (the trace/replay reconciliation work in §2.5) that needed
+  a small, easy-to-read-by-hand graph instead -- `pub mod bulk;` and its
+  `src/bulk/` directory deleted from all three `dummy-{core,ops,api}`
+  crates, dropping the merged `dummy-cli` graph from ~1046 nodes back down
+  to 24. The large-graph layout fixes it drove (dagre, the `layoutAsLevelGrid`
+  fallback, the `DAGRE_NODE_LIMIT` safety guard) don't depend on this
+  fixture continuing to exist -- they're exercised by synthetic components
+  built ad hoc in test scripts instead (see §2.5's dagre entries), so
+  nothing there was lost by removing it.
 
 - ~~Duplicated trace-parsing logic~~ **Fixed.** `trace_log.py` (Python) and
   the in-browser `parseTraceJsonl()` (JS) had already drifted apart in a
@@ -1234,11 +1417,22 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
     the tool detect/accept variants?
   - Is a single root span (like `main`) required, and what happens without
     one?
-  - Span `name` is used as the *unique* dedup key — breaks if the same
-    function is called from genuinely different call sites and the graph
-    needs to distinguish them. Accept as a known limitation, or fix?
   - Should this become a written spec/schema (JSON Schema), or stay as
     documentation + a reference `tracing_subscriber` snippet?
+  - ~~Span `name` is used as the *unique* dedup key — breaks if the same
+    function is called from genuinely different call sites and the graph
+    needs to distinguish them.~~ **Partially settled, see §2.5's
+    "click-to-navigate" entries below for the full story**: `name` is no
+    longer trusted as the *match* key at all (resolved by real source
+    location instead, when `.with_file(true).with_line_number(true)` is
+    set) — this fixed the actual reported problem, which turned out to be
+    broader than "only custom names break": a method's bare default
+    instrumented name never matched this tool's own `Type::method` node
+    ids either, with zero customization involved. What's *not* fixed, and
+    remains a real open limitation: spans are still deduplicated by
+    (resolved) node id, so two genuinely different call sites of the same
+    function still collapse into one trace entry -- a different problem
+    from name-matching, unaddressed by this fix.
 - **MIR as the only extraction source, or an alternative/complement?**
   MIR text dumps can be large/slow on real-world crates, and are an
   unstable, version-tied rustc implementation detail. Still open whether to
