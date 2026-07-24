@@ -879,8 +879,18 @@
                     // fades back -- "highlighted" alone didn't read clearly
                     // enough in a dense graph, since a couple of brighter
                     // lines among hundreds of identical ones barely stand
-                    // out. Applies to both nodes and edges (same class, one
-                    // rule) -- see applyNavHighlight().
+                    // out. A node is a filled shape with real area, so at
+                    // 0.12 opacity it still reads clearly as a muted dark
+                    // shape; a 2px edge line at the same opacity all but
+                    // disappears instead -- edge.nav-dimmed (below, placed
+                    // *after* the generic 'edge' rule -- Cytoscape's
+                    // cascade is "later in the array wins," not CSS
+                    // specificity, so listing it here before 'edge' would
+                    // have it silently overridden by that rule's own
+                    // line-color/opacity) overrides with a higher opacity,
+                    // using the *node* blue (not a grey) so a dimmed edge
+                    // and a dimmed node read as the same muted color rather
+                    // than two different de-emphasized looks side by side.
                     { selector: '.nav-dimmed', style: { 'opacity': 0.12 } },
                     {
                         selector: 'edge', style: {
@@ -928,40 +938,17 @@
                     // this call" and "what calls this" are visually distinct
                     // at a glance, not just "highlighted" as one undifferentiated
                     // group. z-index above the dimmed rest so they draw on top.
-                    // Duplicates the midpoint callOrder right next to the
-                    // *focused* node specifically -- which endpoint that is
-                    // differs by direction, so outgoing uses source-label
-                    // (focused node is the source) and incoming uses
-                    // target-label (focused node is the target); using
-                    // source-label for both would anchor an incoming call's
-                    // number at the *caller*, not the node being looked at.
-                    // The *-text-margin-y properties are set per-edge in
-                    // applyNavHighlight() to stagger labels that would
-                    // otherwise land on top of each other when several of
-                    // the focused node's edges leave/arrive at similar
-                    // angles -- a plain fixed offset here can't do that, it'd
-                    // shift every one of them the same way.
-                    {
-                        selector: 'edge.nav-outgoing, edge.nav-incoming', style: {
-                            'font-size': '14px', 'font-weight': 'bold',
-                            'text-background-color': '#1e1e2e', 'text-background-opacity': 0.85,
-                            'text-background-padding': '2px',
-                        }
-                    },
-                    {
-                        selector: 'edge.nav-outgoing', style: {
-                            'line-color': '#fab387', 'target-arrow-color': '#fab387', 'width': 3, 'opacity': 1, 'z-index': 999, 'color': '#fab387',
-                            'source-label': e => e.data('callOrder') != null ? String(e.data('callOrder')) : '',
-                            'source-text-offset': 16,
-                        }
-                    },
-                    {
-                        selector: 'edge.nav-incoming', style: {
-                            'line-color': '#a6e3a1', 'target-arrow-color': '#a6e3a1', 'width': 3, 'opacity': 1, 'z-index': 999, 'color': '#a6e3a1',
-                            'target-label': e => e.data('callOrder') != null ? String(e.data('callOrder')) : '',
-                            'target-text-offset': 16,
-                        }
-                    },
+                    // (Used to also duplicate callOrder as a source-/target-
+                    // label right next to the focused node, with a per-edge
+                    // stagger to keep close-together ones from overlapping --
+                    // dropped once double-click neighborhood expansion
+                    // (below) existed: physically pulling the node's
+                    // neighbors into view reads more clearly than cramming a
+                    // second copy of the same number next to a node that may
+                    // still have several tightly-angled edges.)
+                    { selector: 'edge.nav-dimmed', style: { 'opacity': 0.35, 'line-color': '#89b4fa', 'target-arrow-color': '#89b4fa' } },
+                    { selector: 'edge.nav-outgoing', style: { 'line-color': '#fab387', 'target-arrow-color': '#fab387', 'width': 3, 'opacity': 1, 'z-index': 999 } },
+                    { selector: 'edge.nav-incoming', style: { 'line-color': '#a6e3a1', 'target-arrow-color': '#a6e3a1', 'width': 3, 'opacity': 1, 'z-index': 999 } },
                 ],
                 layout: { name: 'preset' },
                 wheelSensitivity: 0.15
@@ -1011,6 +998,7 @@
                 // shortcut all go through too.
                 focusOnNode(e.target.id());
             });
+            cy.on('dbltap', 'node', e => expandNeighborhood(e.target.id()));
             cy.on('tap', 'edge', e => {
                 const edge = e.target;
                 const d = edge.data();
@@ -1036,10 +1024,11 @@
             // done looking at this node" that doesn't fight with wherever
             // you'd manually panned/zoomed to.
             cy.on('tap', e => {
-                if (e.target !== cy || !focusedNodeId) return;
+                if (e.target !== cy || (!focusedNodeId && !expandedPositions)) return;
                 setFocusedNode(null);
                 applyUntracedVisibility(showUntraced);
                 clearNavHighlight();
+                restoreExpansion();
                 document.getElementById('info').innerHTML = 'Click a node for details.';
                 logToServer('background-tap', 'cleared focus/highlight (view unchanged)');
             });
@@ -1396,32 +1385,107 @@
         // the rest is what makes the highlighted ones readable.
         function applyNavHighlight(id) {
             cy.elements().removeClass('nav-dimmed nav-outgoing nav-incoming');
-            // Inline styles from a *previous* focus's staggering (below)
-            // aren't touched by removeClass -- reset them here or an edge
-            // that was, say, the 3rd outgoing edge last time keeps that
-            // offset even once it's plain again.
-            cy.edges().style({ 'source-text-margin-y': 0, 'target-text-margin-y': 0 });
             const node = cy.getElementById(id);
             if (!node.length) return;
             cy.elements().not(node.closedNeighborhood()).addClass('nav-dimmed');
-            const outgoing = node.outgoers('edge'), incoming = node.incomers('edge');
-            outgoing.addClass('nav-outgoing');
-            incoming.addClass('nav-incoming');
-            // Stagger: when several of the focused node's edges leave (or
-            // arrive) close enough together that their labels would overlap,
-            // alternate a small vertical nudge by position instead of
-            // stacking them all at the same spot -- 1st unmoved, 2nd up,
-            // 3rd down, 4th further up, etc.
-            const stagger = (edges, prop) => edges.forEach((e, i) => {
-                const step = Math.ceil(i / 2) * 14;
-                e.style(prop, i % 2 === 0 ? step : -step);
-            });
-            stagger(outgoing, 'source-text-margin-y');
-            stagger(incoming, 'target-text-margin-y');
+            node.outgoers('edge').addClass('nav-outgoing');
+            node.incomers('edge').addClass('nav-incoming');
         }
 
         function clearNavHighlight() {
             cy.elements().removeClass('nav-dimmed nav-outgoing nav-incoming');
+        }
+
+        // Double-click a node to pull its 1st-degree neighbors into a
+        // circle around it and hide everything else -- a dim (0.12 opacity,
+        // the single-click behavior) still left enough of the rest of the
+        // graph visible to clutter the view and, worse, to have those very
+        // visible-but-dim nodes sitting exactly where a repositioned
+        // neighbor needed to land. Single click stays as-is (just zoom/
+        // center/dim/highlight, no repositioning or hiding) since the rapid
+        // click-through-edges/keyboard-digit navigation built earlier
+        // benefits from staying light; doing all this on every single hop
+        // would make that feel sluggish. `expandedPositions`/
+        // `hiddenByExpansion`/`preExpandView` (all null when nothing is
+        // expanded) remember exactly what was moved, hidden, and where the
+        // camera was, so restoring is exact, not a re-layout guess.
+        let expandedPositions = null, hiddenByExpansion = null, preExpandView = null;
+        function restoreExpansion() {
+            if (!expandedPositions) return;
+            const toRestore = expandedPositions;
+            expandedPositions = null;
+            // Jump any still-running expand animation to its end first --
+            // without this, restoring right on the heels of expanding (a
+            // quick double-click immediately followed by a background
+            // click, faster than the 400ms expand animation) queues the
+            // restore's animate() calls behind the still-in-flight expand
+            // ones instead of replacing them, so the first restore click
+            // visually did nothing (the queued expand animation was still
+            // winning) and only a second click, after things had settled,
+            // actually looked like it worked.
+            cy.stop();
+            cy.elements().stop(true, true);
+            toRestore.forEach((pos, id) => {
+                const n = cy.getElementById(id);
+                if (n.length) n.animate({ position: pos }, { duration: 300 });
+            });
+            if (hiddenByExpansion) { hiddenByExpansion.show(); hiddenByExpansion = null; }
+            if (preExpandView) {
+                cy.animate({ zoom: preExpandView.zoom, pan: preExpandView.pan }, { duration: 300 });
+                preExpandView = null;
+            }
+        }
+        function expandNeighborhood(id) {
+            // Physically moving nodes would fight replay's own fixed
+            // positions (its return-path/step animations assume nodes stay
+            // put) -- disabled entirely once a trace is loaded, same as the
+            // static highlight/dim above.
+            if (traceData.length || !cy) return;
+            restoreExpansion(); // only one expansion active at a time
+            const node = cy.getElementById(id);
+            const neighbors = node.openNeighborhood('node');
+            if (!node.length || !neighbors.length) return;
+            cy.stop();
+            cy.elements().stop(true, true);
+            preExpandView = { zoom: cy.zoom(), pan: { ...cy.pan() } };
+            expandedPositions = new Map();
+            neighbors.forEach(n => expandedPositions.set(n.id(), { ...n.position() }));
+            // Only hide what was actually visible already -- an untraced
+            // node the "Hide untraced" toggle had hidden stays hidden on
+            // restore too, rather than this feature un-hiding it by mistake.
+            const neighborhood = node.closedNeighborhood();
+            hiddenByExpansion = cy.elements().not(neighborhood).filter(':visible');
+            hiddenByExpansion.hide();
+            // Radius sized off real node dimensions, not the viewport --
+            // sizing off the viewport (the previous approach) could pack
+            // neighbors tightly enough to overlap and hide the very edges
+            // this feature exists to make visible, especially at FOCUS_ZOOM
+            // where the visible model-space area is small. cy.animate's
+            // fit (below) handles "everything visible," so the radius here
+            // only has to solve "nothing overlaps."
+            const center = node.position();
+            const count = neighbors.length;
+            const maxDim = Math.max(node.width(), node.height(), ...neighbors.map(n => Math.max(n.width(), n.height())));
+            const gap = 30;
+            const radius = Math.max((count * (maxDim + gap)) / (2 * Math.PI), maxDim * 1.5);
+            neighbors.forEach((n, i) => {
+                const angle = (2 * Math.PI * i) / count;
+                n.animate({
+                    position: { x: center.x + radius * Math.cos(angle), y: center.y + radius * Math.sin(angle) }
+                }, { duration: 400 });
+            });
+            // A bounding box computed from where neighbors are *going*, not
+            // `eles: neighborhood`'s live positions -- fit would otherwise
+            // read their current (pre-move) coordinates the instant this
+            // animation starts, since it runs concurrently with the
+            // position animations above rather than waiting for them.
+            const halfNode = maxDim / 2;
+            const targetBox = {
+                x1: center.x - radius - halfNode, x2: center.x + radius + halfNode,
+                y1: center.y - radius - halfNode, y2: center.y + radius + halfNode,
+            };
+            cy.animate({ fit: { boundingBox: targetBox, padding: 60 } }, { duration: 400 });
+            logToServer('expandNeighborhood', `${id}: pulled ${count} first-degree neighbor(s) into view, hid everything else`);
         }
 
         // Back/forward through previously focused nodes, browser-history
@@ -1490,7 +1554,17 @@
             }
             cy.animate({ zoom: Math.max(cy.zoom(), FOCUS_ZOOM), center: { eles: node } }, { duration: 400 });
             showNodeInfo(node);
-            applyNavHighlight(id);
+            // The static-navigation highlight/dim is a distinct visual
+            // language from replay's (visited/current/last-step colors,
+            // return-path flashes) -- mixing them (e.g. dimming a node
+            // replay just marked "current" to near-invisibility) fights the
+            // thing that's actually the priority once a trace is loaded.
+            // Once one is, clicking around the graph keeps zooming/
+            // centering/showing info as normal, it just stops touching
+            // dim/highlight at all.
+            if (traceData.length) clearNavHighlight();
+            else applyNavHighlight(id);
+            restoreExpansion(); // collapse any double-click neighborhood expansion -- this is a new focus
             revealInDocList(id);
             if (!opts.fromHistory) {
                 navHistory = navHistory.slice(0, navIndex + 1);
@@ -1506,6 +1580,7 @@
             setFocusedNode(null);
             applyUntracedVisibility(showUntraced); // undoes any focus-driven untraced reveal-override
             clearNavHighlight();
+            restoreExpansion();
             cy.animate({ fit: { padding: 60 } }, { duration: 400 });
             logToServer('btn-clear-focus', 'reset view to the full graph');
         });

@@ -505,6 +505,141 @@ so each crate's items resolve against that crate's own `src/`.
   on its target; all prior regression tests re-run clean (one, checking
   `source-label` unconditionally, updated to match the new focus-gated
   behavior instead of describing a regression).
+
+  **Strategy change, requested right after**: rather than keep tuning the
+  same single-click focus interaction, split "static map navigation" from
+  "replay navigation" as two genuinely different things instead of one
+  system stretched to cover both.
+  - **Replay is untouched.** Its own visual language (visited/current/
+    last-step colors, return-path flashes) was always a separate mechanism
+    from the static nav-highlight (`applyNavHighlight`), but the two could
+    still visually collide -- clicking a node mid-replay would dim it to
+    0.12 opacity even if replay had just marked it "current," fighting the
+    thing that's actually the priority once a trace is loaded. Guarded on
+    `traceData.length`: `focusOnNode` skips `applyNavHighlight` entirely
+    (clearing any leftover highlight instead) whenever a trace is loaded,
+    regardless of whether it's actively playing, paused, or reset-to-start
+    -- zoom/center/info/doc-list-reveal still work normally on a click, only
+    the dim/highlight is suppressed. Double-click neighborhood expansion
+    (below) is disabled the same way -- physically moving nodes would fight
+    replay's own animations, which assume fixed positions.
+  - **Static navigation gets neighborhood expansion instead of near-node
+    numbers.** The near-node source-/target-label duplicate (previous
+    entry, with its per-edge stagger to avoid overlap) is gone entirely --
+    once neighbors can be pulled into view and spread out for real, cramming
+    a second copy of the same number next to a node with several tightly-
+    angled edges stopped being the right fix for legibility. Kept: the
+    midpoint label (always on, unconditional on focus) is still the only
+    place `callOrder` shows.
+  - **Double-click** (`cy.on('dbltap', 'node', ...)`) pulls a node's
+    1st-degree neighbors (`node.openNeighborhood('node')`) into a circle
+    around it, radius sized off the *current* viewport (`cy.extent()`) so
+    everything lands inside what's already visible -- no forced zoom or
+    scroll to go chase a neighbor the layout happened to place elsewhere.
+    Single click deliberately stays exactly as it was (zoom/center/dim/
+    highlight only, no repositioning) -- the rapid click-through-edges/
+    keyboard-digit navigation built earlier benefits from staying light;
+    moving nodes on every single hop would make that chain feel sluggish.
+    Original positions are captured into a `Map` before moving anything, so
+    "back to normal" (`restoreExpansion()`) is an exact restore, not a
+    re-layout guess -- wired into "Show full graph", the background-canvas
+    click, and the start of `focusOnNode` itself (so *any* new focus, by
+    whatever means, collapses a stale expansion rather than leaving
+    repositioned nodes stranded once attention has moved elsewhere). Only
+    one expansion is active at a time: double-clicking a second node
+    restores the first's positions before creating its own.
+  - Verified: single click never moves neighbor positions; double click
+    moves all of them and every one lands within `cy.extent()`'s bounds;
+    background click restores exact original coordinates; re-expanding
+    after a restore works, and expanding a second node correctly collapses
+    the first; a loaded trace (simulated by setting `traceData` directly,
+    since exercising this doesn't need a real trace fixture) suppresses
+    both nav-highlight and double-click expansion while leaving normal
+    zoom/focus intact, and both resume once the trace is cleared again. All
+    prior regression tests updated where they specifically asserted the
+    now-removed near-node label and re-run clean otherwise.
+
+  **Two follow-up fixes to the expansion itself.** (1) Dimming the rest of
+  the graph to 0.12 opacity (the single-click behavior, still applied
+  underneath) wasn't enough once neighbors started actually moving --
+  the dim-but-still-visible rest of the graph cluttered the view and could
+  sit exactly where a repositioned neighbor needed to land. Now hides
+  (`.hide()`) everything outside the closed neighborhood outright rather
+  than dimming it, and restores precisely by remembering which elements
+  *were actually visible* beforehand (`cy.elements().not(neighborhood)
+  .filter(':visible')`) -- a node "Hide untraced" had already hidden stays
+  hidden through an expand/restore cycle instead of this feature
+  accidentally un-hiding it. (2) Neighbors were overlapping each other
+  closely enough to obscure the edges between them -- the circle's radius
+  was sized off the current *viewport* (`cy.extent()`), which shrinks at
+  `FOCUS_ZOOM`'s higher zoom level and has nothing to do with how much
+  physical space that many node boxes actually need. Radius is now derived
+  from real node dimensions (`circumference >= count * (maxNodeDim + gap)`)
+  so neighbors can't overlap regardless of how many there are or how
+  zoomed-in the view happened to be; the view is then fit to a manually
+  computed target bounding box (not `fit: {eles: neighborhood}`, whose
+  live bounding box would still reflect the neighbors' pre-move positions
+  the instant the fit animation starts, racing the position animations
+  rather than matching where they're headed) so "everything fits" is
+  restored as a property of the fit step, independent of the sizing step.
+  A restored pre-expansion zoom/pan is also now remembered and animated
+  back on restore, since expanding no longer leaves the original view
+  untouched the way the viewport-sized version did. Verified: after
+  expanding, a pairwise visibility check confirms *zero* elements outside
+  the closed neighborhood remain visible; restoring brings back exactly
+  the pre-expansion visible-element count; a synthetic 10-neighbor hub
+  (deliberately more than the dummy-cli fixture's own examples have) shows
+  zero pairwise bounding-box overlaps across all 45 neighbor pairs after
+  expansion, confirmed both by the automated check and a screenshot.
+
+  **Two more fixes reported immediately after.** (1) Dimmed nodes read
+  fine (a filled shape at 0.12 opacity is still clearly a muted dark-blue
+  box), but dimmed *edges* -- 2px lines at the same opacity -- all but
+  disappeared instead of reading as similarly "there but de-emphasized."
+  Added `edge.nav-dimmed` (opacity 0.35, flat `#45475a` grey line/arrow
+  color, the same grey already used for untraced nodes) so dimmed edges
+  stay visibly present as context instead of vanishing. (2) An intermittent "I
+  have to click a node, then click empty space" to get back to normal --
+  root-caused to an animation race, not a logic bug: `expandNeighborhood`'s
+  position/fit animations run ~400ms; a background click landing before
+  that finishes (a fast double-click immediately followed by a background
+  click, well within realistic clicking speed) queued `restoreExpansion`'s
+  own animate() calls *behind* the still-running expand ones instead of
+  replacing them, so the first restore click visually did nothing -- the
+  queued expand animation was still winning -- and only a second click,
+  after things had settled, actually looked like it worked. Fixed with
+  `cy.stop(); cy.elements().stop(true, true);` at the start of both
+  `expandNeighborhood` and `restoreExpansion`, jumping any in-flight
+  animation to its end before starting a new one (the standard Cytoscape
+  fix for exactly this class of race). Reproduced the failure mode
+  directly with a real double-click immediately followed by a real
+  background click (zero wait in between, rather than the generous waits
+  used everywhere else in this test suite) and confirmed the fix holds:
+  focus/expansion state, full visibility, and nav classes all end up
+  correctly cleared even under that rapid sequence. All prior regression
+  tests re-run clean.
+
+  **The grey chosen for dimmed edges above still wasn't right**: reported
+  as "still light grey, should match the dimmed nodes' dark blue instead."
+  Changed the color to the node's own blue (`#89b4fa`) at the same 0.35
+  opacity -- straightforward in principle, but the fix didn't take effect
+  on the first attempt, and *that* turned out to be the more interesting
+  bug: `edge.nav-dimmed` was listed in the stylesheet array *before* the
+  generic `edge` rule, and Cytoscape's cascade is "later entry in the
+  array wins for that property," not CSS-style specificity -- so the
+  generic rule's own `line-color`/`opacity`, coming later, silently won
+  over the more specific selector every time, exactly the same trap
+  `edge.nav-outgoing`/`nav-incoming` (already correctly placed *after* the
+  generic rule) had already avoided. Moved `edge.nav-dimmed` down next to
+  them. Caught because none of the existing regression tests asserted the
+  actual *resolved* color value for dimmed edges, only that the class was
+  present -- added `test_dimmed_edge_color.js`, which reads
+  `edge.style('line-color')` directly and checks it against the exact
+  expected value, specifically to catch this class of "class applied but
+  the styling silently didn't take" bug in the future. Verified: dimmed
+  edges now resolve to the identical `rgb(137,180,250)` as dimmed nodes,
+  and the elevated 0.35 opacity is in effect (not the default 0.75 or the
+  node's 0.12). All other regression tests re-run clean.
 - **Dynamic legend**: only lists edge types / states actually present in
   the currently loaded graph, grouped by shape (squares first, then lines).
 - **Doc cross-links in the info panel**: a node's signature renders with

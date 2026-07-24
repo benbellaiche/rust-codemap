@@ -174,15 +174,26 @@ Every edge carries a small number at its midpoint: that's `callOrder`, the
 position of that call in its caller's own source (see "Command reference" /
 `mir_graph.py` for how it's derived — it's a static, MIR-order
 approximation, not a guarantee about real execution order for code with
-branches or loops). Focusing a node dims everything outside its immediate
-neighborhood and colors its own edges by direction — **orange** for what it
-calls, **green** for what calls it — instead of leaving the whole graph at
-uniform brightness, and additionally repeats that same number right next to
-the node itself (at whichever end it's the node's own call), since the
-midpoint can be far away on a long or curved edge and it's easy to lose
-track of which of several numbers belongs to which. Edges leaving/entering
-close together are nudged apart a little so their near-node numbers don't
-stack on top of each other.
+branches or loops). This is the *static* navigation layer — it's a
+deliberately separate thing from replaying a trace (below); loading one
+suppresses all of the following so it doesn't fight with replay's own
+visited/current/last-step colors.
+
+Focusing a node (clicking it, a doc-list entry, an edge, or a number key)
+dims everything outside its immediate neighborhood and colors its own edges
+by direction — **orange** for what it calls, **green** for what calls it —
+instead of leaving the whole graph at uniform brightness.
+
+**Double-clicking** a node hides everything else and pulls its direct
+neighbors into a circle around it, spaced so they never overlap regardless
+of how many there are, then fits the view to exactly that — no forced
+zoom-out or scrolling to go find a neighbor the layout happened to place
+elsewhere, and nothing else left on screen to clutter the view. A single
+click never moves or hides anything; double-click is a separate, deliberate
+"show me just this neighborhood" action, so the fast click-through-edges/
+number-key navigation below stays light. Only one neighborhood is expanded
+at a time — double-clicking elsewhere, clicking empty canvas, or "Show full
+graph" all restore the exact original positions, visibility, and view.
 
 Three ways to move from a focused node to one of its neighbors without
 touching the doc list:
@@ -200,10 +211,10 @@ touching the doc list:
   is recorded; navigating to a new node from a "Back" position drops
   whatever was ahead of it, the same as a browser tab's history.
 
-Clicking **empty canvas** clears the highlight/dim and deselects — the same
-"back to normal" state as **"Show full graph"**, but without also resetting
-zoom/pan, for when you just want to stop highlighting without losing your
-place in the view.
+Clicking **empty canvas** clears the highlight/dim, deselects, and collapses
+any expanded neighborhood — the same "back to normal" state as **"Show full
+graph"**, but without also resetting zoom/pan, for when you just want to
+stop highlighting without losing your place in the view.
 
 ## Tracing log format
 
