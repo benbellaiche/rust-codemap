@@ -405,10 +405,69 @@ so each crate's items resolve against that crate's own `src/`.
   call took on that size alone. Confirmed the `run_report` cluster (well
   under 300 nodes) is unaffected and still gets dagre's sibling-clustering.
   All prior regression tests re-run clean.
+- **Default node color**: was `#a6e3a1` -- the *same* green as
   `node.visited` during replay, so a never-visited node and an actually-
   visited one were indistinguishable. Changed the default to blue
   (`#89b4fa`); `visited` keeps the green (unchanged, along with `current`/
   `last-step`/return-path colors -- only the *default* collided).
+- **Click-to-navigate**: requested as a set of related "make a big graph
+  easier to explore manually" asks, all implemented together. (1) Focusing
+  a node (`focusOnNode`, now the single choke point for every way a node
+  gets focused: graph click, doc-list click, edge-click navigation below,
+  keyboard shortcut, back/forward) dims everything outside its closed
+  neighborhood (`.nav-dimmed`, opacity 0.12) and colors its own edges by
+  direction -- outgoing orange (`.nav-outgoing`), incoming green
+  (`.nav-incoming`) -- so "what does this call" and "what calls this" read
+  apart at a glance instead of as one undifferentiated highlighted blob.
+  Plain highlighting without dimming the rest was tried conceptually and
+  rejected before building it -- a couple of brighter lines among hundreds
+  of identical ones doesn't actually stand out. (2) `callOrder` moved off
+  the edge's midpoint label onto Cytoscape's built-in `source-label`
+  (anchored at the caller end specifically) -- was previously easy to lose
+  track of "this number belongs to which of the three edges leaving that
+  node" when the midpoint could be far from the source in a long or curved
+  edge; `iterLabel` (replay's actual per-call iteration count) stays at the
+  midpoint, unrelated to this. (3) Clicking an edge attached to the focused
+  node now navigates through it -- to the target if it's one of the node's
+  outgoing calls, back to the source if incoming -- reusing `focusOnNode`
+  itself rather than a parallel code path, so zoom/center/untraced-reveal/
+  doc-list-reveal all stay consistent with every other way of focusing a
+  node. (4) Keyboard `1`-`9` jumps straight to the correspondingly-numbered
+  outgoing call while a node is focused (ignored while typing in the doc
+  search box) -- faster than clicking a specific thin edge in a dense
+  cluster; capped at single digits, a function with 10+ calls just has no
+  shortcut past 9, judged not worth multi-key-sequence complexity for. A
+  dyn-dispatch fan-out (shares one `callOrder` across several edges, one
+  real call site with an ambiguous target) jumps to the first match on
+  either a click or a keypress. (5) Browser-history-style back/forward
+  (`navHistory`/`navIndex`, two new sidebar buttons) across every
+  `focusOnNode` call regardless of how it was triggered -- navigating to a
+  new node from a "back" position truncates whatever was ahead of it first,
+  same as a real browser tab. Verified: outgoing/incoming edges get the
+  right class and actually render in different colors; unrelated elements
+  get dimmed and the focused node itself doesn't; "Show full graph" clears
+  all three nav classes; a real click on an edge's rendered midpoint
+  navigates to the right endpoint; keyboard digit-jump lands on the right
+  callOrder's target and is inert while `#doc-search` has focus; back/
+  forward buttons enable/disable correctly at both ends of the history and
+  branch-truncation behaves like a real browser's forward button. All
+  prior regression tests re-run clean alongside these.
+
+  **Immediate follow-up**: no way to drop the highlight/dim short of "Show
+  full graph," which also resets zoom/pan -- not always wanted when all you
+  meant was "stop highlighting, I'm done looking at this one." Added a
+  background-canvas tap handler (`cy.on('tap', e => { if (e.target !== cy)
+  return; ... })` -- Cytoscape's own way of telling "the empty canvas was
+  tapped" apart from "a node/edge was tapped and the event bubbled to the
+  core," since a bare `cy.on('tap', ...)` with no element selector fires on
+  both) that clears focus/highlight/dim exactly like "Show full graph"
+  does, minus the viewport reset. Guarded on `focusedNodeId` already being
+  set, so clicking empty space with nothing focused is a silent no-op
+  rather than redundant work/log noise on every idle click. Verified: clears
+  all three nav classes plus the doc-focused halo and resets the info panel,
+  zoom/pan measured unchanged to the pixel, a second empty click with
+  nothing focused doesn't error, and focusing a fresh node afterward still
+  works normally.
 - **Dynamic legend**: only lists edge types / states actually present in
   the currently loaded graph, grouped by shape (squares first, then lines).
 - **Doc cross-links in the info panel**: a node's signature renders with

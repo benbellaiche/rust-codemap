@@ -168,6 +168,38 @@ own doc page — the type itself isn't a call-graph node, only its methods
 are) still opens its native doc page, but can't pan the graph to it
 (reported in the info panel, not a silent no-op).
 
+### Navigating a large graph by hand
+
+Focusing a node (any of the ways above, or the mechanisms below) dims
+everything outside its immediate neighborhood and colors its own edges by
+direction — **orange** for what it calls, **green** for what calls it —
+instead of leaving the whole graph at uniform brightness. Each outgoing
+edge also carries a small number right next to the node it leaves from:
+that's `callOrder`, the position of that call in its caller's own source
+(see "Command reference" / `mir_graph.py` for how it's derived — it's a
+static, MIR-order approximation, not a guarantee about real execution
+order for code with branches or loops).
+
+Three ways to move from a focused node to one of its neighbors without
+touching the doc list:
+
+- **Click one of its edges** — jumps to whichever end isn't the currently
+  focused node (the target if it's an outgoing call, the source if
+  incoming).
+- **Press a number key** (`1`–`9`) — jumps straight to the outgoing call
+  with that `callOrder`, without needing to click a specific thin edge in a
+  dense area. Only single digits: a function with a tenth-or-later call has
+  no shortcut past 9. Ignored while typing in the doc-search box above.
+- **Back / Forward** buttons under the doc list — every focus, however it
+  was triggered (graph click, doc-list click, edge click, number key),
+  is recorded; navigating to a new node from a "Back" position drops
+  whatever was ahead of it, the same as a browser tab's history.
+
+Clicking **empty canvas** clears the highlight/dim and deselects — the same
+"back to normal" state as **"Show full graph"**, but without also resetting
+zoom/pan, for when you just want to stop highlighting without losing your
+place in the view.
+
 ## Tracing log format
 
 > **Status: partially settled.** This is the format the tool currently

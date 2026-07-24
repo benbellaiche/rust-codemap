@@ -182,6 +182,22 @@
             font-size: 11px
         }
 
+        #nav-history {
+            display: flex;
+            gap: 6px;
+            margin: 8px 10px 0
+        }
+
+        #nav-history button {
+            flex: 1;
+            font-size: 11px
+        }
+
+        #nav-history button:disabled {
+            opacity: 0.4;
+            cursor: default
+        }
+
         .pt {
             font-size: 10px;
             color: #6c7086;
@@ -493,6 +509,10 @@
             <div class="pt">Public API (doc index)</div>
             <input type="text" id="doc-search" placeholder="Filter functions…">
             <div id="doc-list"><p style="padding:8px 10px;color:#6c7086;font-size:11px">Load a doc index to browse the public API.</p></div>
+            <div id="nav-history">
+                <button id="btn-nav-back" disabled title="Previously focused node">&larr; Back</button>
+                <button id="btn-nav-forward" disabled title="Undo Back">Forward &rarr;</button>
+            </div>
             <button id="btn-clear-focus">Show full graph</button>
             <div class="pt">Selected</div>
             <div id="info">Click a node for details.</div>
@@ -855,6 +875,13 @@
                     // (untraced/visited/current/last-step) instead of
                     // fighting over the same border-width property.
                     { selector: 'node.doc-focused', style: { 'overlay-color': '#f9e2af', 'overlay-opacity': 0.5, 'overlay-padding': 6 } },
+                    // Everything not in the focused node's own neighborhood
+                    // fades back -- "highlighted" alone didn't read clearly
+                    // enough in a dense graph, since a couple of brighter
+                    // lines among hundreds of identical ones barely stand
+                    // out. Applies to both nodes and edges (same class, one
+                    // rule) -- see applyNavHighlight().
+                    { selector: '.nav-dimmed', style: { 'opacity': 0.12 } },
                     {
                         selector: 'edge', style: {
                             'line-color': e => COLORS.edge[e.data('edgeType')] || '#6c7086',
@@ -865,16 +892,19 @@
                             'width': 2,
                             'opacity': 0.75,
                             'arrow-scale': 1.2,
-                            // callOrder ("the Nth call made from this
+                            // iterLabel (replay's actual iteration count for
+                            // this call) sits at the edge's midpoint, same as
+                            // always. callOrder ("the Nth call made from this
                             // caller", MIR-textual-order, see mir_graph.py)
-                            // is always shown; iterLabel (replay's actual
-                            // iteration count for this call) only exists
-                            // once a trace has run one, and is appended
-                            // alongside rather than replacing it -- they
-                            // answer different questions ("which call is
-                            // this in the source" vs. "how many times did
-                            // this specific call really run").
-                            'label': e => [e.data('callOrder'), e.data('iterLabel')].filter(x => x != null).join(' '),
+                            // moved to source-label -- Cytoscape's built-in
+                            // mechanism for a label anchored at a specific
+                            // endpoint rather than the midpoint -- so it
+                            // reads as "this numbered call, from this node"
+                            // even when several edges leave the same node
+                            // and their midpoints are scattered all over.
+                            'label': e => e.data('iterLabel') || '',
+                            'source-label': e => e.data('callOrder') != null ? String(e.data('callOrder')) : '',
+                            'source-text-offset': 16,
                             // 9px (the old iterLabel-only size, back when
                             // this only ever appeared on a few edges near an
                             // active replay step) was unreadable now that
@@ -889,6 +919,13 @@
                             'text-background-opacity': 0.85, 'text-background-padding': '2px'
                         }
                     },
+                    // Set on the focused node's own edges (applyNavHighlight)
+                    // -- outgoing/incoming colored differently so "what does
+                    // this call" and "what calls this" are visually distinct
+                    // at a glance, not just "highlighted" as one undifferentiated
+                    // group. z-index above the dimmed rest so they draw on top.
+                    { selector: 'edge.nav-outgoing', style: { 'line-color': '#fab387', 'target-arrow-color': '#fab387', 'width': 3, 'opacity': 1, 'z-index': 999 } },
+                    { selector: 'edge.nav-incoming', style: { 'line-color': '#a6e3a1', 'target-arrow-color': '#a6e3a1', 'width': 3, 'opacity': 1, 'z-index': 999 } },
                 ],
                 layout: { name: 'preset' },
                 wheelSensitivity: 0.15
@@ -931,22 +968,44 @@
             applyUntracedVisibility(noTracedNodesAtAll);
             buildLegend();
             cy.on('tap', 'node', e => {
-                const node = e.target;
-                // Same behavior as clicking this node's name in the doc list
-                // (focusOnNode already does setFocusedNode + showNodeInfo +
-                // the zoom/center animation + untraced-neighborhood reveal --
-                // this used to skip straight past all of that and just show
-                // info without moving the view at all) plus the graph-click-
-                // specific half: reveal/scroll it into view in the doc list.
-                focusOnNode(node.id());
-                revealInDocList(node.id());
+                // focusOnNode already does setFocusedNode + showNodeInfo +
+                // the zoom/center animation + untraced-neighborhood reveal +
+                // doc-list reveal + nav-highlight -- same single path a
+                // doc-list click, an edge-click jump, or the keyboard
+                // shortcut all go through too.
+                focusOnNode(e.target.id());
             });
             cy.on('tap', 'edge', e => {
-                const d = e.target.data();
+                const edge = e.target;
+                const d = edge.data();
                 document.getElementById('info').innerHTML =
                     `<b style="color:#89b4fa">${d.source}</b> -> ${d.target}<br>Type: <b>${d.edgeType}</b>` +
                     (d.callOrder != null ? `<br>Call #${d.callOrder} from ${d.source}` : '') +
                     (d.iterLabel ? '<br>' + d.iterLabel : '');
+                // Clicking an edge attached to the currently focused node
+                // navigates *through* it -- to the callee if it's one of the
+                // focused node's outgoing calls, back to the caller if it's
+                // one of its incoming ones. An edge with neither endpoint
+                // focused (e.g. still visible from a previous focus that
+                // hasn't been cleared) is just informational, no jump.
+                if (!focusedNodeId) return;
+                if (d.source === focusedNodeId) focusOnNode(d.target);
+                else if (d.target === focusedNodeId) focusOnNode(d.source);
+            });
+            // Clicking empty canvas (not a node/edge -- `e.target === cy`
+            // is Cytoscape's own way of telling a background tap apart from
+            // one that hit an element) clears the focus/highlight/dim, the
+            // same "back to normal" state "Show full graph" gives you, but
+            // without also resetting zoom/pan -- a lighter action for "I'm
+            // done looking at this node" that doesn't fight with wherever
+            // you'd manually panned/zoomed to.
+            cy.on('tap', e => {
+                if (e.target !== cy || !focusedNodeId) return;
+                setFocusedNode(null);
+                applyUntracedVisibility(showUntraced);
+                clearNavHighlight();
+                document.getElementById('info').innerHTML = 'Click a node for details.';
+                logToServer('background-tap', 'cleared focus/highlight (view unchanged)');
             });
             const n = elems.filter(e => e.data.nodeType).length, ed = elems.filter(e => e.data.edgeType).length;
             logToServer('initCy', `done (${n} nodes, ${ed} edges)`);
@@ -1294,13 +1353,54 @@
             if (id) cy.getElementById(id).addClass('doc-focused');
         }
 
+        // Dims everything outside the focused node's own neighborhood and
+        // colors its edges by direction (outgoing vs incoming) -- plain
+        // "highlight the connected edges" wasn't enough to actually stand
+        // out in a graph with hundreds of identically-styled lines; fading
+        // the rest is what makes the highlighted ones readable.
+        function applyNavHighlight(id) {
+            cy.elements().removeClass('nav-dimmed nav-outgoing nav-incoming');
+            const node = cy.getElementById(id);
+            if (!node.length) return;
+            cy.elements().not(node.closedNeighborhood()).addClass('nav-dimmed');
+            node.outgoers('edge').addClass('nav-outgoing');
+            node.incomers('edge').addClass('nav-incoming');
+        }
+
+        function clearNavHighlight() {
+            cy.elements().removeClass('nav-dimmed nav-outgoing nav-incoming');
+        }
+
+        // Back/forward through previously focused nodes, browser-history
+        // style: navigating to a new node truncates anything ahead of the
+        // current position (so Forward doesn't resurrect a branch you
+        // navigated away from) and appends the new one; navBack/navForward
+        // just move the cursor and re-focus without touching the list.
+        let navHistory = [], navIndex = -1;
+        function updateNavButtons() {
+            document.getElementById('btn-nav-back').disabled = navIndex <= 0;
+            document.getElementById('btn-nav-forward').disabled = navIndex >= navHistory.length - 1;
+        }
+        function navBack() {
+            if (navIndex <= 0) return;
+            navIndex--;
+            focusOnNode(navHistory[navIndex], { fromHistory: true });
+        }
+        function navForward() {
+            if (navIndex >= navHistory.length - 1) return;
+            navIndex++;
+            focusOnNode(navHistory[navIndex], { fromHistory: true });
+        }
+        document.getElementById('btn-nav-back').addEventListener('click', navBack);
+        document.getElementById('btn-nav-forward').addEventListener('click', navForward);
+
         // Always zoom to at least FOCUS_ZOOM, centered on the node itself
         // -- not a fit to its neighborhood, whose size varies wildly node
         // to node and previously made the zoom level inconsistent (weak
         // on some nodes, fine on others). Never zooms *out*: if the user
         // was already more zoomed in than this, that's left alone.
         const FOCUS_ZOOM = 2.2;
-        function focusOnNode(id) {
+        function focusOnNode(id, opts = {}) {
             if (!cy) {
                 document.getElementById('info').innerHTML = `Load a graph first — "${id}" has no graph to focus on yet.`;
                 return;
@@ -1337,6 +1437,14 @@
             }
             cy.animate({ zoom: Math.max(cy.zoom(), FOCUS_ZOOM), center: { eles: node } }, { duration: 400 });
             showNodeInfo(node);
+            applyNavHighlight(id);
+            revealInDocList(id);
+            if (!opts.fromHistory) {
+                navHistory = navHistory.slice(0, navIndex + 1);
+                navHistory.push(id);
+                navIndex = navHistory.length - 1;
+            }
+            updateNavButtons();
             logToServer('focusOnNode', `${id}: centered at zoom >= ${FOCUS_ZOOM}`);
         }
 
@@ -1344,8 +1452,27 @@
             if (!cy) return;
             setFocusedNode(null);
             applyUntracedVisibility(showUntraced); // undoes any focus-driven untraced reveal-override
+            clearNavHighlight();
             cy.animate({ fit: { padding: 60 } }, { duration: 400 });
             logToServer('btn-clear-focus', 'reset view to the full graph');
+        });
+
+        // Keyboard shortcut: with a node focused, press 1-9 to jump straight
+        // to that numbered outgoing call -- faster than clicking a thin edge
+        // precisely in a dense area. Only single digits (no multi-key
+        // sequence for call #10+, a rare case not worth the complexity);
+        // ignored while typing in a text input so it doesn't hijack normal
+        // typing in the filter box. A dyn-dispatch fan-out shares one
+        // call_order across several edges (one real call site, ambiguous
+        // target -- see mir_graph.py); jumps to the first match.
+        document.addEventListener('keydown', e => {
+            if (!focusedNodeId || !cy) return;
+            if (['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
+            if (!/^[1-9]$/.test(e.key)) return;
+            const node = cy.getElementById(focusedNodeId);
+            if (!node.length) return;
+            const match = node.outgoers('edge').filter(ed => String(ed.data('callOrder')) === e.key);
+            if (match.length) focusOnNode(match[0].data('target'));
         });
 
         function renderTrace(spans) {
