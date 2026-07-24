@@ -809,6 +809,43 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
   as a safety net, though `concentric`'s footprint came in well under its
   budget in every case measured here.
 
+  **`concentric` itself rejected, one message later**: the reporter's real
+  library's display hadn't visibly changed at all after the `concentric`
+  fix (still open — possibly the outer per-component row-tiling rather than
+  a single component's own shape is that graph's actual bottleneck, not yet
+  isolated), and separately, a full ring reads fine for one pathological
+  fan-out-heavy component but isn't wanted as the *default* look for every
+  ordinary one — asked for something closer to the original breadthfirst
+  look (depth grows downward, band by band) that only spreads a wide band
+  vertically instead of horizontally, rather than a shape that always
+  reads as circular. Replaced `concentric` with hand-rolled positioning:
+  same BFS-depth-from-every-root computation as before, but each depth
+  band is now placed by hand as its own roughly-square sub-grid (`cols =
+  round(sqrt(band size))`) stacked top-down by depth, using each node's own
+  *real* rendered width/height (`node.width()`/`height()`, resolved from
+  its label by this point) for spacing rather than a guessed constant.
+  Result on the dummy-cli fixture's 685-node component: `1578 x 3994` (taller
+  than wide, vs. the original `26387 x 2104` and `concentric`'s `9321 x
+  9215`), still **0** overlapping pairs across a full pairwise check of all
+  685 nodes (234,570 pairs). Visually confirmed (Playwright screenshot) as a
+  recognizable top-down tree again, not a ring, with the widest levels now
+  wrapping into blocks instead of one long row. Found and fixed a real latent
+  bug while rewriting this: the zero-indegree-root selection had no fallback
+  for a *fully cyclic* component (mutual recursion with no node that isn't
+  itself called from within the same component) — every node stayed at BFS
+  depth `Infinity` and previously all collapsed onto the same ring/band
+  together. Now falls back to the single node with the lowest indegree in
+  the component as an ad-hoc entry point when no zero-indegree node exists;
+  verified on a synthetic 12-node pure-cycle component (no crash, real
+  non-degenerate footprint). All prior regression tests re-run clean.
+  The "real library unchanged" report is still open — next step if it
+  recurs is reading that session's Log panel output (`layoutComponents`
+  entries show component count/sizes) to tell apart "one dominant
+  component's internal shape" (what every fix in this section has targeted
+  so far) from "many components, individually fine, tiled too loosely by
+  the outer row-wrapping logic" (`targetRowWidth` in the same function,
+  untouched by any of this).
+
 ## 4. Points to decide
 
 - ~~Doc frame — real rustdoc navigation vs. scraped inline text?~~

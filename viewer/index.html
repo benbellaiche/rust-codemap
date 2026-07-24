@@ -634,10 +634,10 @@
         // sourceIndex starts empty; populated only via "Load doc index..."
         // (see below) -- no automatic fetch, for the same reason as graph.json.
 
-        // Runs breadthfirst independently on each connected component, then
-        // tiles the components into a compact grid instead of letting a
-        // single breadthfirst run across the whole graph space every tree
-        // apart. A graph with thousands of small/disconnected components
+        // Lays out each connected component independently (own function
+        // below), then tiles the components into a compact grid instead of
+        // letting a single layout run across the whole graph space every
+        // tree apart. A graph with thousands of small/disconnected components
         // (common on a big real crate: lots of never-cross-called pub fns)
         // blows the combined bounding box up to millions of units when laid
         // out together, which forces cy.fit() to zoom out so far that every
@@ -664,42 +664,26 @@
                 // nodes (isolated components of size 1) -- skip the layout
                 // algorithm for those entirely, it has nothing to do anyway.
                 if (nodesInComp.length > 1) {
-                    const rootNodes = nodesInComp.some(n => n.id() === 'main')
+                    let rootNodes = nodesInComp.some(n => n.id() === 'main')
                         ? nodesInComp.filter(n => n.id() === 'main')
                         : nodesInComp.filter(n => n.indegree(true) === 0);
-                    // Plain (rectangular) breadthfirst puts each BFS level on
-                    // its own horizontal row, so the widest level sets the
-                    // component's *width* directly -- unbounded in one axis
-                    // only (confirmed: a synthetic 2000-node single-level
-                    // fan-out came out 114989x230, ratio 500:1). Its own
-                    // circle:true option moves that to a ring instead, which
-                    // sounded like the fix, but avoidOverlap under circle
-                    // mode turned out cosmetic, not real: it just scales
-                    // every ring's radius by the same factor, so the
-                    // innermost ring (fewest nodes, smallest radius, and
-                    // exactly where many independent roots pile up) keeps
-                    // real node-vs-node overlap no matter how far that
-                    // factor is pushed (measured: 353 overlapping pairs at
-                    // spacingFactor 1.5, still 37 left at 5, while the whole
-                    // component's footprint tripled getting there).
-                    // `concentric` is a different, purpose-built layout for
-                    // "place things in genuinely non-overlapping rings" --
-                    // minNodeSpacing grows each ring's radius by an actual
-                    // measured amount instead of a blanket multiplier
-                    // (measured: 0 overlaps at every minNodeSpacing tried,
-                    // ratio ~1:1, and the 2000-fan-out case above dropped to
-                    // 44619x44604 -- same zero-overlap guarantee, less than
-                    // half the old single-axis footprint). It doesn't take a
-                    // `directed`/`roots` option of its own though, so BFS
-                    // depth (== call depth, the reason breadthfirst was
-                    // chosen over grid in the first place -- grid ignores
-                    // edges for positioning entirely) has to be computed by
-                    // hand and fed in via `concentric()`, using every zero-
-                    // indegree node as a source at once for the same reason
-                    // multi-root breadthfirst did: a single root would make
-                    // every *other* independent entry point look like it's
-                    // reachable from it, piling them onto one ring instead
-                    // of each starting its own.
+                    if (!rootNodes.length) {
+                        // A fully cyclic component (mutual recursion, no
+                        // function in it that's never itself called from
+                        // within the same component) has no zero-indegree
+                        // node at all -- BFS needs *some* starting point or
+                        // every node stays at depth Infinity. Whichever node
+                        // has the fewest incoming calls is as good a proxy
+                        // for "entry point" as this component has.
+                        rootNodes = nodesInComp.min(n => n.indegree(true)).ele;
+                    }
+                    // BFS depth (== call depth) from every one of those roots
+                    // at once, not just one -- a component can have several
+                    // independent entry points that only converge further
+                    // downstream (e.g. unrelated top-level functions sharing
+                    // a callee); starting from only one would make every
+                    // *other* entry point look reachable from it too, piling
+                    // them all at shallow depth for no structural reason.
                     const depth = {};
                     const idToNode = {};
                     nodesInComp.forEach(n => { idToNode[n.id()] = n; depth[n.id()] = Infinity; });
@@ -716,19 +700,46 @@
                     }
                     const maxDepth = Math.max(0, ...Object.values(depth).filter(d => d !== Infinity));
                     nodesInComp.forEach(n => { if (depth[n.id()] === Infinity) depth[n.id()] = maxDepth + 1; });
-                    comp.layout({
-                        name: 'concentric',
-                        concentric: n => -depth[n.id()], // shallow call depth -> higher value -> nearer the center
-                        levelWidth: () => 1,
-                        minNodeSpacing: 20,
-                        avoidOverlap: true, animate: false,
-                    }).run();
-                    const cBox = comp.boundingBox();
+
+                    // Lay out top-down by depth like plain breadthfirst does
+                    // (one band per call depth, so depth is still readable
+                    // at a glance) but position each band by hand instead of
+                    // handing it to a canned layout: a band with too many
+                    // nodes wraps into a roughly square sub-grid of its own
+                    // instead of one ever-widening row. This is what plain
+                    // breadthfirst can't do (its width is however many nodes
+                    // share the single widest level, unbounded -- confirmed:
+                    // a synthetic 2000-node one-level fan-out came out
+                    // 114989x230, ratio 500:1) and what circle/concentric
+                    // overcorrected on (a full ring reads fine for one
+                    // pathological component but looks wrong applied to
+                    // every ordinary small one too). Real per-node size
+                    // (label-driven, already resolved by this point) is used
+                    // for spacing rather than a guessed constant, so nodes
+                    // with long names don't overlap their neighbors.
+                    const nodeArr = nodesInComp.toArray();
+                    const cellW = Math.max(...nodeArr.map(n => n.width())) + 30;
+                    const cellH = Math.max(...nodeArr.map(n => n.height())) + 30;
+                    const byDepth = {};
+                    nodeArr.forEach(n => { const d = depth[n.id()]; (byDepth[d] = byDepth[d] || []).push(n); });
+                    let cursorLevelY = 0;
+                    Object.keys(byDepth).map(Number).sort((a, b) => a - b).forEach(d => {
+                        const levelNodes = byDepth[d];
+                        const cols = Math.max(1, Math.round(Math.sqrt(levelNodes.length)));
+                        const levelWidth = cols * cellW;
+                        levelNodes.forEach((n, i) => {
+                            const col = i % cols, row = Math.floor(i / cols);
+                            n.position({ x: col * cellW - levelWidth / 2, y: cursorLevelY + row * cellH });
+                        });
+                        cursorLevelY += Math.ceil(levelNodes.length / cols) * cellH + 40;
+                    });
+
+                    const lBox = comp.boundingBox();
                     const widthBudget = Math.max(3000, nodesInComp.length * 40);
-                    if (cBox.w > widthBudget || cBox.h > widthBudget) {
+                    if (lBox.w > widthBudget || lBox.h > widthBudget) {
                         logToServer('layoutComponents',
-                            `component of ${nodesInComp.length} nodes: concentric came out ` +
-                            `w=${cBox.w.toFixed(0)} h=${cBox.h.toFixed(0)} (budget ${widthBudget}) -- redoing with grid`);
+                            `component of ${nodesInComp.length} nodes: level layout came out ` +
+                            `w=${lBox.w.toFixed(0)} h=${lBox.h.toFixed(0)} (budget ${widthBudget}) -- redoing with grid`);
                         comp.layout({ name: 'grid', avoidOverlap: true, avoidOverlapPadding: 20, condense: true, animate: false }).run();
                     }
                 }
