@@ -190,7 +190,18 @@ def normalize_call(raw: str):
 
 
 def parse_mir(text: str, extra_external_markers=()):
-    """Returns (local_ids: set[str], edges: list[(str, str)], traced: dict[str, bool])."""
+    """Returns (local_ids: set[str], edges: list[dict], traced: dict[str, bool]).
+
+    Each edge dict is {"source", "target", "call_order"}. `call_order`
+    restarts at 1 for every caller, counting call sites in the order they're
+    encountered walking that caller's MIR body top-to-bottom -- this is only
+    as accurate as MIR's own basic-block order is to real execution order,
+    which for straight-line code matches source order but isn't guaranteed
+    for a function with branches/loops (MIR doesn't encode "which branch
+    runs first" statically). A dyn-dispatch call site fanning out to several
+    local implementations (see below) shares one call_order across all of
+    its fan-out edges -- they're one call site in the source, just an
+    ambiguous target, not several separate calls."""
     local_ids = set()
     fn_def_lines = {}
     lines = text.splitlines()
@@ -217,7 +228,7 @@ def parse_mir(text: str, extra_external_markers=()):
     traced = {nid: False for nid in local_ids}
 
     edges = []
-    edge_set = set()
+    call_order = {}  # caller id -> next call-order number to assign there
     current_fn_id = None
     brace_depth = 0
 
@@ -243,25 +254,31 @@ def parse_mir(text: str, extra_external_markers=()):
 
             # Call through a dyn Trait: over-approximate by linking to EVERY
             # local implementation of that method (MIR alone can't tell us
-            # which concrete type is behind the trait object).
+            # which concrete type is behind the trait object). One call site
+            # -> one call_order, shared by every fan-out edge it produces.
             m_dyn = re.match(r"<dyn \w+ as \w+>::(\w+)$", raw_callee)
             if m_dyn:
                 method = m_dyn.group(1)
-                for node_id in local_ids:
-                    if node_id.endswith(f"::{method}") and node_id != current_fn_id:
-                        key = (current_fn_id, node_id)
-                        if key not in edge_set:
-                            edge_set.add(key); edges.append(key)
+                targets = [node_id for node_id in local_ids
+                           if node_id.endswith(f"::{method}") and node_id != current_fn_id]
+                if targets:
+                    order = call_order.get(current_fn_id, 1)
+                    call_order[current_fn_id] = order + 1
+                    for node_id in targets:
+                        edges.append({"source": current_fn_id, "target": node_id, "call_order": order})
                 continue
 
             callee_id = normalize_call(raw_callee)
             # callee_id == current_fn_id is genuine recursion (e.g. a plain
             # `factorial(n - 1)` inside `factorial` itself) -- a real,
-            # meaningful self-edge, not noise to filter out.
+            # meaningful self-edge, not noise to filter out. Every call site
+            # becomes its own edge now (no longer deduplicated by (caller,
+            # callee) pair), so calling the same callee twice from two
+            # different lines shows up as two distinct numbered edges.
             if callee_id and callee_id in local_ids:
-                key = (current_fn_id, callee_id)
-                if key not in edge_set:
-                    edge_set.add(key); edges.append(key)
+                order = call_order.get(current_fn_id, 1)
+                call_order[current_fn_id] = order + 1
+                edges.append({"source": current_fn_id, "target": callee_id, "call_order": order})
 
     return local_ids, edges, traced
 
@@ -270,8 +287,8 @@ def build_graph(mir_text: str, extra_external_markers=()) -> dict:
     """Parse a MIR text dump into a Cytoscape-ready {nodes, edges} dict."""
     local_ids, edges, traced = parse_mir(mir_text, extra_external_markers)
     all_nodes = set(local_ids)
-    for s, t in edges:
-        all_nodes.update([s, t])
+    for e in edges:
+        all_nodes.update([e["source"], e["target"]])
     return {
         "nodes": [
             {"data": {
@@ -283,7 +300,10 @@ def build_graph(mir_text: str, extra_external_markers=()) -> dict:
             for n in sorted(all_nodes)
         ],
         "edges": [
-            {"data": {"id": f"e{i}", "source": s, "target": t, "edgeType": "call"}}
-            for i, (s, t) in enumerate(edges)
+            {"data": {
+                "id": f"e{i}", "source": e["source"], "target": e["target"],
+                "edgeType": "call", "callOrder": e["call_order"],
+            }}
+            for i, e in enumerate(edges)
         ],
     }

@@ -5,6 +5,15 @@
     <meta charset="UTF-8">
     <title>Rust Codemap</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
+    <!-- Layered/hierarchical graph layout (dagre): assigns each node a rank
+         from edge direction (like our own hand-rolled BFS depth did) and,
+         unlike that hand-rolled version, actually orders nodes *within* a
+         rank to minimize edge crossings -- which keeps siblings called from
+         the same function clustered together instead of scattered wherever
+         they landed in a flat per-level scan. See layoutComponents() in the
+         main script for why it's not the *only* layout used. -->
+    <script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
+    <script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
     <style>
         * {
             box-sizing: border-box;
@@ -531,6 +540,7 @@
         </div>
     </div>
     <script>
+        cytoscape.use(cytoscapeDagre);
         const COLORS = {
             // Distinct from node.visited's green (#a6e3a1) on purpose --
             // that green means "visited during replay"; a node still
@@ -634,6 +644,67 @@
         // sourceIndex starts empty; populated only via "Load doc index..."
         // (see below) -- no automatic fetch, for the same reason as graph.json.
 
+        // Fallback for a component dagre laid out disproportionately wide
+        // (or tall): the same hand-placed top-down-by-depth square-grid
+        // layoutComponents() used exclusively before dagre was introduced.
+        // One band per BFS call-depth (computed here from every zero-
+        // indegree node at once -- a component can have several independent
+        // entry points that only converge further downstream, so starting
+        // from just one would make every *other* entry point look reachable
+        // from it too and pile them all at shallow depth for no structural
+        // reason), each band wrapped into a roughly square sub-grid instead
+        // of one ever-widening row once it has too many nodes. Real per-node
+        // size (label-driven, already resolved by this point) is used for
+        // spacing rather than a guessed constant, so nodes with long names
+        // don't overlap their neighbors.
+        function layoutAsLevelGrid(comp, nodesInComp) {
+            let rootNodes = nodesInComp.some(n => n.id() === 'main')
+                ? nodesInComp.filter(n => n.id() === 'main')
+                : nodesInComp.filter(n => n.indegree(true) === 0);
+            if (!rootNodes.length) {
+                // A fully cyclic component (mutual recursion, no function in
+                // it that's never itself called from within the same
+                // component) has no zero-indegree node at all -- BFS needs
+                // *some* starting point or every node stays at depth
+                // Infinity. Whichever node has the fewest incoming calls is
+                // as good a proxy for "entry point" as this component has.
+                rootNodes = nodesInComp.min(n => n.indegree(true)).ele;
+            }
+            const depth = {};
+            const idToNode = {};
+            nodesInComp.forEach(n => { idToNode[n.id()] = n; depth[n.id()] = Infinity; });
+            const queue = [];
+            rootNodes.forEach(r => { depth[r.id()] = 0; queue.push(r.id()); });
+            for (let qi = 0; qi < queue.length; qi++) {
+                const id = queue[qi], d = depth[id];
+                idToNode[id].outgoers('node').forEach(m => {
+                    if (nodesInComp.contains(m) && depth[m.id()] > d + 1) {
+                        depth[m.id()] = d + 1;
+                        queue.push(m.id());
+                    }
+                });
+            }
+            const maxDepth = Math.max(0, ...Object.values(depth).filter(d => d !== Infinity));
+            nodesInComp.forEach(n => { if (depth[n.id()] === Infinity) depth[n.id()] = maxDepth + 1; });
+
+            const nodeArr = nodesInComp.toArray();
+            const cellW = Math.max(...nodeArr.map(n => n.width())) + 30;
+            const cellH = Math.max(...nodeArr.map(n => n.height())) + 30;
+            const byDepth = {};
+            nodeArr.forEach(n => { const d = depth[n.id()]; (byDepth[d] = byDepth[d] || []).push(n); });
+            let cursorLevelY = 0;
+            Object.keys(byDepth).map(Number).sort((a, b) => a - b).forEach(d => {
+                const levelNodes = byDepth[d];
+                const cols = Math.max(1, Math.round(Math.sqrt(levelNodes.length)));
+                const levelWidth = cols * cellW;
+                levelNodes.forEach((n, i) => {
+                    const col = i % cols, row = Math.floor(i / cols);
+                    n.position({ x: col * cellW - levelWidth / 2, y: cursorLevelY + row * cellH });
+                });
+                cursorLevelY += Math.ceil(levelNodes.length / cols) * cellH + 40;
+            });
+        }
+
         // Lays out each connected component independently (own function
         // below), then tiles the components into a compact grid instead of
         // letting a single layout run across the whole graph space every
@@ -664,83 +735,37 @@
                 // nodes (isolated components of size 1) -- skip the layout
                 // algorithm for those entirely, it has nothing to do anyway.
                 if (nodesInComp.length > 1) {
-                    let rootNodes = nodesInComp.some(n => n.id() === 'main')
-                        ? nodesInComp.filter(n => n.id() === 'main')
-                        : nodesInComp.filter(n => n.indegree(true) === 0);
-                    if (!rootNodes.length) {
-                        // A fully cyclic component (mutual recursion, no
-                        // function in it that's never itself called from
-                        // within the same component) has no zero-indegree
-                        // node at all -- BFS needs *some* starting point or
-                        // every node stays at depth Infinity. Whichever node
-                        // has the fewest incoming calls is as good a proxy
-                        // for "entry point" as this component has.
-                        rootNodes = nodesInComp.min(n => n.indegree(true)).ele;
-                    }
-                    // BFS depth (== call depth) from every one of those roots
-                    // at once, not just one -- a component can have several
-                    // independent entry points that only converge further
-                    // downstream (e.g. unrelated top-level functions sharing
-                    // a callee); starting from only one would make every
-                    // *other* entry point look reachable from it too, piling
-                    // them all at shallow depth for no structural reason.
-                    const depth = {};
-                    const idToNode = {};
-                    nodesInComp.forEach(n => { idToNode[n.id()] = n; depth[n.id()] = Infinity; });
-                    const queue = [];
-                    rootNodes.forEach(r => { depth[r.id()] = 0; queue.push(r.id()); });
-                    for (let qi = 0; qi < queue.length; qi++) {
-                        const id = queue[qi], d = depth[id];
-                        idToNode[id].outgoers('node').forEach(m => {
-                            if (nodesInComp.contains(m) && depth[m.id()] > d + 1) {
-                                depth[m.id()] = d + 1;
-                                queue.push(m.id());
-                            }
-                        });
-                    }
-                    const maxDepth = Math.max(0, ...Object.values(depth).filter(d => d !== Infinity));
-                    nodesInComp.forEach(n => { if (depth[n.id()] === Infinity) depth[n.id()] = maxDepth + 1; });
-
-                    // Lay out top-down by depth like plain breadthfirst does
-                    // (one band per call depth, so depth is still readable
-                    // at a glance) but position each band by hand instead of
-                    // handing it to a canned layout: a band with too many
-                    // nodes wraps into a roughly square sub-grid of its own
-                    // instead of one ever-widening row. This is what plain
-                    // breadthfirst can't do (its width is however many nodes
-                    // share the single widest level, unbounded -- confirmed:
-                    // a synthetic 2000-node one-level fan-out came out
-                    // 114989x230, ratio 500:1) and what circle/concentric
-                    // overcorrected on (a full ring reads fine for one
-                    // pathological component but looks wrong applied to
-                    // every ordinary small one too). Real per-node size
-                    // (label-driven, already resolved by this point) is used
-                    // for spacing rather than a guessed constant, so nodes
-                    // with long names don't overlap their neighbors.
-                    const nodeArr = nodesInComp.toArray();
-                    const cellW = Math.max(...nodeArr.map(n => n.width())) + 30;
-                    const cellH = Math.max(...nodeArr.map(n => n.height())) + 30;
-                    const byDepth = {};
-                    nodeArr.forEach(n => { const d = depth[n.id()]; (byDepth[d] = byDepth[d] || []).push(n); });
-                    let cursorLevelY = 0;
-                    Object.keys(byDepth).map(Number).sort((a, b) => a - b).forEach(d => {
-                        const levelNodes = byDepth[d];
-                        const cols = Math.max(1, Math.round(Math.sqrt(levelNodes.length)));
-                        const levelWidth = cols * cellW;
-                        levelNodes.forEach((n, i) => {
-                            const col = i % cols, row = Math.floor(i / cols);
-                            n.position({ x: col * cellW - levelWidth / 2, y: cursorLevelY + row * cellH });
-                        });
-                        cursorLevelY += Math.ceil(levelNodes.length / cols) * cellH + 40;
-                    });
-
-                    const lBox = comp.boundingBox();
+                    // dagre assigns ranks from edge direction (like our own
+                    // hand-rolled BFS depth below) but additionally *orders*
+                    // nodes within a rank to minimize edge crossings -- which
+                    // is exactly what our own depth-grid never did (it filled
+                    // each rank in whatever order a flat scan of the whole
+                    // component visited nodes, so two siblings called from
+                    // the same function could land at opposite ends of a
+                    // rank with unrelated nodes in between, purely by luck of
+                    // scan order). No need to compute our own roots/depth for
+                    // this -- dagre works straight off the edges.
+                    comp.layout({
+                        name: 'dagre', rankDir: 'TB',
+                        nodeSep: 50, rankSep: 70, ranker: 'network-simplex',
+                        animate: false, fit: false,
+                    }).run();
+                    const dBox = comp.boundingBox();
                     const widthBudget = Math.max(3000, nodesInComp.length * 40);
-                    if (lBox.w > widthBudget || lBox.h > widthBudget) {
+                    if (dBox.w > widthBudget || dBox.h > widthBudget) {
+                        // dagre still puts every node of a rank on one row,
+                        // same as plain breadthfirst -- a genuinely
+                        // fan-out-heavy component (confirmed: a synthetic
+                        // 2000-node one-level fan-out) is just as unbounded
+                        // in width under dagre as it was before. Falls back
+                        // to the hand-placed per-depth square-grid this
+                        // function used exclusively before dagre existed --
+                        // still bounded in both axes, just without dagre's
+                        // crossing-minimization.
                         logToServer('layoutComponents',
-                            `component of ${nodesInComp.length} nodes: level layout came out ` +
-                            `w=${lBox.w.toFixed(0)} h=${lBox.h.toFixed(0)} (budget ${widthBudget}) -- redoing with grid`);
-                        comp.layout({ name: 'grid', avoidOverlap: true, avoidOverlapPadding: 20, condense: true, animate: false }).run();
+                            `component of ${nodesInComp.length} nodes: dagre came out ` +
+                            `w=${dBox.w.toFixed(0)} h=${dBox.h.toFixed(0)} (budget ${widthBudget}) -- redoing with a hand-placed per-depth grid`);
+                        layoutAsLevelGrid(comp, nodesInComp);
                     }
                 }
                 const bb = comp.boundingBox();
@@ -800,7 +825,26 @@
                             'width': 2,
                             'opacity': 0.75,
                             'arrow-scale': 1.2,
-                            'label': 'data(iterLabel)', 'font-size': '9px', 'color': '#fab387',
+                            // callOrder ("the Nth call made from this
+                            // caller", MIR-textual-order, see mir_graph.py)
+                            // is always shown; iterLabel (replay's actual
+                            // iteration count for this call) only exists
+                            // once a trace has run one, and is appended
+                            // alongside rather than replacing it -- they
+                            // answer different questions ("which call is
+                            // this in the source" vs. "how many times did
+                            // this specific call really run").
+                            'label': e => [e.data('callOrder'), e.data('iterLabel')].filter(x => x != null).join(' '),
+                            // 9px (the old iterLabel-only size, back when
+                            // this only ever appeared on a few edges near an
+                            // active replay step) was unreadable now that
+                            // every edge always shows one -- confirmed via
+                            // screenshot: still just an orange fleck even at
+                            // zoom 1. Bumped size and weight so it's legible
+                            // at a normal working zoom; it'll still vanish
+                            // zoomed all the way out to fit a huge graph, same
+                            // as node labels do at that scale.
+                            'font-size': '14px', 'font-weight': 'bold', 'color': '#fab387',
                             'text-rotation': 'autorotate', 'text-background-color': '#1e1e2e',
                             'text-background-opacity': 0.85, 'text-background-padding': '2px'
                         }
@@ -848,14 +892,21 @@
             buildLegend();
             cy.on('tap', 'node', e => {
                 const node = e.target;
-                setFocusedNode(node.id());
-                showNodeInfo(node);
+                // Same behavior as clicking this node's name in the doc list
+                // (focusOnNode already does setFocusedNode + showNodeInfo +
+                // the zoom/center animation + untraced-neighborhood reveal --
+                // this used to skip straight past all of that and just show
+                // info without moving the view at all) plus the graph-click-
+                // specific half: reveal/scroll it into view in the doc list.
+                focusOnNode(node.id());
                 revealInDocList(node.id());
             });
             cy.on('tap', 'edge', e => {
                 const d = e.target.data();
                 document.getElementById('info').innerHTML =
-                    `<b style="color:#89b4fa">${d.source}</b> -> ${d.target}<br>Type: <b>${d.edgeType}</b>${d.iterLabel ? '<br>' + d.iterLabel : ''}`;
+                    `<b style="color:#89b4fa">${d.source}</b> -> ${d.target}<br>Type: <b>${d.edgeType}</b>` +
+                    (d.callOrder != null ? `<br>Call #${d.callOrder} from ${d.source}` : '') +
+                    (d.iterLabel ? '<br>' + d.iterLabel : '');
             });
             const n = elems.filter(e => e.data.nodeType).length, ed = elems.filter(e => e.data.edgeType).length;
             logToServer('initCy', `done (${n} nodes, ${ed} edges)`);

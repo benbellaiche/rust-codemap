@@ -99,7 +99,9 @@ execution replay is only meaningful for a binary target today (see
    concerns of their own — each takes text/paths in and returns a plain
    dict/list out, so they're easy to reason about independent of argparse.
 2. **`viewer/index.html`** — a single self-contained HTML file (Cytoscape.js
-   from a CDN, no build step, no bundler) that fetches `graph.json` /
+   plus the `cytoscape-dagre` layout extension and its `dagre` dependency,
+   all from a CDN via plain `<script>` tags, no build step, no bundler,
+   registered with `cytoscape.use(cytoscapeDagre)`) that fetches `graph.json` /
    `source_index.json` / `trace.json` from its own directory. The Python
    side and the viewer only communicate through those three JSON files —
    there is no other coupling.
@@ -174,6 +176,17 @@ behavior, not on any specific project):
   direct-call path — genuine recursion (`factorial` calling itself) is a
   real, meaningful self-edge, not noise. (The dyn-dispatch over-
   approximation path still excludes self, a separate judgment call.)
+- Each edge carries a `call_order`: an integer that restarts at 1 for every
+  *caller*, counting call sites in the order they're hit walking that
+  caller's MIR body top-to-bottom. Edges are no longer deduplicated by
+  `(caller, callee)` — calling the same callee from two different lines in
+  the same function now produces two separate edges with two different
+  `call_order` values, not one. This is only as accurate as MIR's own
+  basic-block order is to real execution order: exact for straight-line
+  code, not guaranteed once a function has branches/loops (MIR doesn't
+  encode "which branch runs first"). A `&dyn Trait` fan-out (previous bullet)
+  is one call site with an ambiguous target, not several calls — all of its
+  fan-out edges share the same `call_order`.
 - Closures compile to their own top-level MIR item
   (`...::{closure#N}`). Calls made inside a closure body are reattributed to
   the *enclosing* function (`closure_owner_path`), so a call hidden inside

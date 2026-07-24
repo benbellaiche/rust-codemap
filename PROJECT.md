@@ -267,7 +267,103 @@ so each crate's items resolve against that crate's own `src/`.
   neutral ("untraced", not "static-only") since `traced === false` can mean
   either "structurally cannot be traced" or "a real function someone forgot
   to instrument" — the tool can't tell those apart.
-- **Default node color**: was `#a6e3a1` -- the *same* green as
+- **Per-scope static call order**: every edge shows a small number (always
+  on, no toggle) that answers "which call is this, counting only from its
+  own caller" -- restarts at 1 for every function, independent of how many
+  other functions also call the same callee. Worked out by hand-tracing a
+  small real example first (`dummy_api::run_report`) before deciding the
+  shape: initially numbered globally down the whole call tree, revised to
+  restart per caller once actually laid out against a real function's calls
+  (`Report::generate calls: 1 grand_total, 2 free_helper, 3 add`) because a
+  global counter buries the one piece of information that's actually useful
+  at a glance -- "which of *this* function's own calls is this". Backed by
+  a new `call_order` field per edge (`mir_graph.py`, see CLAUDE.md) computed
+  from MIR's own textual/basic-block order -- exact for straight-line code,
+  approximate once a function branches or loops (MIR doesn't encode "which
+  branch runs first"). Requesting this surfaced two follow-up questions,
+  both settled in favor of the more literal reading: calling the same
+  callee from two different lines in the same function is now two separate
+  edges (previously deduplicated into one) each with its own number, and
+  the number stays visible even mid-replay by appending next to (not
+  replacing) the existing iteration-count label (`① ×3`-style, using
+  whichever symbols the label style actually renders) since they answer
+  different questions -- "which call is this in the source" vs. "how many
+  times did this specific call really run". A `&dyn Trait` fan-out is still
+  one call site with an ambiguous target, not several calls, so every edge
+  it produces shares the same number. Verified end-to-end against the
+  dummy-cli fixture: hand-derived numbers for the whole `run_report` call
+  chain matched the generated `graph.json` exactly, Cytoscape's existing
+  bezier curve-style was confirmed (via a synthetic two-edges-same-pair
+  case) to already visually separate parallel edges without any extra
+  styling work, and all prior viewer regression tests re-run clean.
+
+  **Two bugs reported immediately after, both real, neither a caching
+  red herring this time.** (1) The number was invisible in practice: it
+  reused `iterLabel`'s old `font-size: 9px`, sized for appearing on a
+  handful of edges near an active replay step, not for being on literally
+  every edge at once. Confirmed by screenshot at a normal zoom-1 view --
+  still just an orange fleck, not readable text. Bumped to `14px` bold;
+  legible at a normal working zoom (confirmed at `FOCUS_ZOOM` = 2.2), still
+  vanishes at whole-graph-fit zoom for a big graph same as node labels do at
+  that scale (expected, not a regression). (2) Clicking a node *in the
+  graph* never actually moved the view -- its `cy.on('tap', 'node', ...)`
+  handler only called `setFocusedNode`/`showNodeInfo`/`revealInDocList`,
+  never `focusOnNode`, so it silently skipped the zoom/center/untraced-
+  reveal animation that clicking the *same node's name in the doc list*
+  already triggered via `focusOnNode`. Two different code paths for what
+  was supposed to be the same interaction, and they'd quietly drifted apart
+  the moment `focusOnNode` grew the untraced-reveal behavior (round 8,
+  `revealInDocList` section above) without the graph-click handler being
+  updated to match. Fixed by having the tap handler call `focusOnNode(id)`
+  too, then `revealInDocList(id)` for the graph-click-specific half (reveal
+  in the doc list) that `focusOnNode` alone doesn't cover. Verified with a
+  real mouse click (Playwright, canvas coordinates via
+  `node.renderedPosition()`) on two different nodes, confirming the zoom
+  actually reaches 2.2 and the info panel updates, matching doc-list-click
+  behavior exactly.
+
+  **Sibling clustering (dagre)**: reported next, with a concrete example --
+  `add` and `Batch::grand_total` are both called directly from
+  `Report::generate` (siblings, same scope) but `add` rendered *below*
+  `grand_total` as if it were downstream of it, since our own hand-placed
+  per-depth grid (previous entry) only bucketed nodes by BFS depth and
+  filled each bucket in whatever order a flat scan of the component visited
+  them -- no notion of "these came from the same parent, keep them
+  together." Two asks: (1) fix that clustering generally, (2) separately,
+  align mutually-exclusive branches (if/else, match arms) on the exact same
+  row while keeping sequential calls slightly offset -- deferred, since that
+  needs `mir_graph.py` to reconstruct each function's CFG from its
+  `SwitchInt`/basic-block structure to tell "alternative branch" apart from
+  "sequential call," information the current flat per-function call list
+  (§ above, `call_order`) already discards. Only (1) implemented here.
+  Replaced the hand-placed grid as the *first* attempt with `cytoscape-dagre`
+  (`dagre@0.8.5` + `cytoscape-dagre@2.5.0`, both CDN `<script>` tags,
+  registered via `cytoscape.use(cytoscapeDagre)`) -- a real layered-graph
+  (Sugiyama-style) layout that assigns ranks from edge direction like our
+  own BFS depth did, but additionally *orders* nodes within a rank to
+  minimize edge crossings, which is exactly the clustering behavior that was
+  missing. No more manual root/BFS-depth computation needed for the common
+  case -- dagre derives ranks straight from the edges. The old hand-placed
+  per-depth grid is kept, verbatim, as `layoutAsLevelGrid()` -- a fallback
+  for when dagre's result is disproportionate, since dagre has the exact
+  same structural limit plain breadthfirst always had (every node of a rank
+  still lands on one row, unbounded width for a fan-out-heavy rank): the
+  same `widthBudget` check as before, now measuring dagre's result instead
+  of breadthfirst's, triggers the fallback. Confirmed still firing correctly
+  on the dummy-cli fixture's pathological 685-node component (dagre:
+  `w=39877 h=1360`, over budget, correctly fell back to the grid's
+  `1578x3994`) while the well-behaved `run_report` cluster visibly improved
+  -- `Batch::grand_total` and `free_helper` (both direct children of
+  `Report::generate`) now render adjacent on the same rank instead of one
+  stacked under the other; `add` renders further down because it's
+  *genuinely* also reachable through a longer `generate -> free_helper ->
+  double -> add` path, not because of a layout defect -- dagre draws that
+  direct `generate -> add` edge as a long curve spanning ranks, standard
+  Sugiyama-layout behavior for a "skip-level" edge. All prior regression
+  tests (untraced-node focus reveal, doc-list reveal-on-click, per-scope
+  `call_order`, node-click-focus) re-run clean, plus a new check confirming
+  both CDN scripts actually load and expose their expected globals
+  (`window.dagre`, `window.cytoscapeDagre`) with zero JS errors.
   `node.visited` during replay, so a never-visited node and an actually-
   visited one were indistinguishable. Changed the default to blue
   (`#89b4fa`); `visited` keeps the green (unchanged, along with `current`/
