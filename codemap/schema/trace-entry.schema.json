@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/rust-codemap/trace-entry.schema.json",
+  "title": "rust-codemap trace entry event",
+  "description": "One JSON-Lines record for a span's own NEW event, as produced by the exact tracing_subscriber setup mandated in README.md's \"Tracing log format\" -- one such record per span, emitted the moment that span is entered. There is no 'formatVersion' field by design (see PROJECT.md §4, \"Trace-format schema\"): this schema file IS the version -- a real format change edits this file, trace-close.schema.json, both parsers (trace_log.py and the viewer's parseTraceJsonl fallback), and the README snippet together, in one commit.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["timestamp", "level", "fields", "target", "filename", "line_number", "span", "spans"],
+  "properties": {
+    "timestamp": {
+      "type": "string",
+      "description": "tracing_subscriber's own RFC 3339 timestamp. Not read by trace_log.py today (spans are ordered by their position in the file, not by this field) -- documented because it's always present in real output, not because the parser depends on it."
+    },
+    "level": {
+      "type": "string",
+      "description": "e.g. \"INFO\". Not read by trace_log.py -- documented for completeness, same reasoning as timestamp."
+    },
+    "fields": {
+      "type": "object",
+      "description": "On an entry event, this is always exactly {\"message\": \"new\"} -- tracing_subscriber's own fixed marker for a NEW span event. A span's own captured arguments (e.g. #[instrument]'s a/b for add(a, b)) live inside `span` below, NOT here -- do not confuse the two `fields`-shaped objects in this format.",
+      "required": ["message"],
+      "additionalProperties": false,
+      "properties": {
+        "message": { "const": "new" }
+      }
+    },
+    "target": {
+      "type": "string",
+      "description": "The Rust module path tracing_subscriber attributes this event to (e.g. \"dcore::basics\"). Not read by trace_log.py -- span-to-node resolution uses `filename`/`line_number` instead (see README.md's \"How a span is matched to a graph node\"), specifically because a module path alone can't disambiguate two crates sharing a module name the way a real file path can."
+    },
+    "filename": {
+      "type": "string",
+      "description": "Absolute path to the source file containing the #[instrument] attribute that produced this span. Required, not optional: the mandated main() snippet always sets .with_file(true), and file+line resolution (this field, plus line_number below) is the ONLY way trace_log.py can tell two crates' identically-named default-instrumented spans apart -- see PROJECT.md's cross-crate node-id collision entry in §2.3/§4."
+    },
+    "line_number": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The line the #[instrument] attribute itself starts on -- NOT the fn/method line (see README.md: trace_log.py scans forward from here to find the real item line). Required for the same reason as filename."
+    },
+    "span": {
+      "type": "object",
+      "description": "This span's own name plus whatever fields #[instrument] captured as arguments (e.g. {\"a\": 1, \"b\": 2} for add(a, b)) or the custom `values` field #[instrument] emits for a Vec/non-Copy argument -- both siblings of `name`, not nested under it. `name` alone is required; every other key is call-site-specific and therefore unconstrained here.",
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "The span's default (bare fn/method name) or custom (#[instrument(name = \"...\")]) label. NOT trusted as this tool's node-id match key by itself -- see README.md's \"How a span is matched to a graph node\" for why (a method's default name is never qualified with its Type, two crates' functions can share the exact same default name, and a custom name can be anything at all)."
+        }
+      }
+    },
+    "spans": {
+      "type": "array",
+      "description": "The ordered ancestor chain at the moment this span was entered, root first, EXCLUDING this span itself. An empty array means this is itself a root span (nothing else was open around it, e.g. `main` in a binary). Each element only ever carries a bare `name` (and whatever fields that ancestor's own instrumentation captured) -- never its own filename/line_number, since those would be redundant with that same ancestor's own top-level entry event elsewhere in the trace. trace_log.py, notably, does NOT resolve node ids from this array's text at all (see trace_log.py's own module docstring) -- it reconstructs the real ancestor chain from an internally-tracked open-span stack instead, specifically because two different crates' spans can share an identical bare name here with no way to tell them apart from the text alone.",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" }
+        }
+      }
+    }
+  }
+}

@@ -166,7 +166,16 @@ clicking a node **in the graph** does the same pair of things in reverse:
 An entry that isn't a node in the currently loaded graph (e.g. a struct's
 own doc page — the type itself isn't a call-graph node, only its methods
 are) still opens its native doc page, but can't pan the graph to it
-(reported in the info panel, not a silent no-op).
+(reported in the info panel, alongside its signature and source-file link
+— same info any other entry gets, not a silent no-op).
+
+Private (non-`pub`) items only appear here at all if you generated with
+`--include-private` (see "Command reference") — the **"Show private"**
+button next to "Hide untraced" then reveals them (hidden by default, same
+as untraced nodes); the button itself stays hidden if there's nothing for
+it to affect. `main`'s own effective visibility is genuinely `pub(crate)`
+(a binary has no external API), but it's exempted from this toggle — a
+binary's entry point isn't "someone's private helper," it's always shown.
 
 ### Navigating a large graph by hand
 
@@ -227,19 +236,15 @@ stop highlighting without losing your place in the view.
 
 ## Tracing log format
 
-> **Status: partially settled.** This is the format the tool currently
-> parses correctly (both `trace_log.py`, used server-side, and the
-> viewer's own client-side fallback parser implement exactly this). It
-> has not yet been written up as a
-> formal, versioned spec — see [PROJECT.md](PROJECT.md) for what's still
-> open (root-span requirements, uniqueness of span names, field-naming
-> guarantees). Treat this section as "what works today", not a final
-> contract.
+> **Status: mandatory, not descriptive.** This is not "what happens to
+> work today" — it's the one format this tool supports. Don't try to
+> adapt your own logging setup to look similar; instead, add the exact
+> snippet below (unmodified) to your binary's `main()`. A formal, versioned
+> schema for this contract is proposed in PROJECT.md §4, but the shape
+> below is already fixed and won't change out from under you before that
+> lands.
 
-The target binary must write one JSON object per line (JSON Lines), which is
-exactly what
-[`tracing_subscriber`](https://docs.rs/tracing-subscriber)'s JSON formatter
-produces out of the box:
+Add this to your binary's `main()`, before anything else runs, unmodified:
 
 ```rust
 tracing_subscriber::fmt()
@@ -250,6 +255,22 @@ tracing_subscriber::fmt()
     .init();
 ```
 
+Then instrument whichever functions you want to see in the replay with
+`#[tracing::instrument]` (or `#[instrument(name = "...")]` for a custom
+label — the tool resolves by source location, not by this name, see below).
+Run the binary, redirect its output to a file, and load that file with
+**"Load trace…"** in the viewer.
+
+`.with_file(true).with_line_number(true)` is not optional: without it,
+spans can only be matched by name, which silently fails for every method
+(see "How a span is matched to a graph node" below) and can't tell two
+call sites of the same function apart at all. There is no supported
+"basic" mode with a smaller log line — this is the one contract
+`trace_log.py` and the viewer's fallback parser both parse.
+
+The target binary must write one JSON object per line (JSON Lines), which is
+exactly what the snippet above produces via
+[`tracing_subscriber`](https://docs.rs/tracing-subscriber)'s JSON formatter.
 Each line is either a span **entry** event or a span **close** event:
 
 - **Entry**: `{"filename": "...", "line_number": N, "span": {"name": "my_span", ...fields}, "spans": [ {"name": "caller"}, ... ]}`
@@ -301,22 +322,49 @@ Known current limitations:
   the trace with its own `filename`/`line_number` (true for any span
   tracing itself emitted, since every span gets its own top-level entry
   when entered) to resolve from.
-- Spans are still deduplicated by (resolved) node id. If the same function
-  is called from genuinely different call sites, they currently collapse
-  into a single graph node/trace entry rather than being distinguished —
-  acceptable for a first pass, called out here so it isn't a surprise. This
-  is unrelated to (and not fixed by) the file+line resolution above, which
-  only changes *which* node id a span maps to, not how many distinct
-  entries a repeatedly-called function gets.
+- Spans are deduplicated by (resolved node id, call site) — not by node id
+  alone. A single static call site invoked repeatedly (a loop, or simply
+  called again from a separate activation of the same caller) still
+  collapses into one trace entry with an iteration count, as before. A
+  callee reached from **N different** static call sites in the same
+  caller (see `graph.json`'s own `callOrder` on each edge, from
+  `mir_graph.py`) instead produces up to N separate entries, one per site
+  — occurrences are assigned to sites in trace order (1st occurrence ->
+  smallest `callOrder`, 2nd -> next, ...), wrapping around if there are
+  more occurrences than known sites (e.g. one of the sites is itself in a
+  loop) — an approximation in that specific mixed case, but still splits
+  into the right *number* of distinct entries rather than merging them
+  all into one. This needs `graph.json` (passed to `parse_trace()`
+  server-side); with no graph available, every occurrence of a
+  single-site relationship still aggregates exactly as before.
 
 ## Command reference
 
 ```
-python -m codemap run   --project <path> [--port 8787] [--no-browser]
+python -m codemap run   --project <path> [--port 8787] [--no-browser] [--include-private]
 python -m codemap graph --project <path> [--out <path>]
-python -m codemap doc   --project <path> [--graph <path>] [--out <path>]
+python -m codemap doc   --project <path> [--graph <path>] [--out <path>] [--include-private]
 python -m codemap serve [--dir viewer] [--docs <path>] [--graph <path>] [--doc <path>] [--port 8787]
+python -m codemap selfcheck [--project ../dummy-cli]
+python -m codemap validate-trace <trace.jsonl>
 ```
+
+`--include-private` (on `doc`/`run`) also documents non-`pub` items
+(passes `--document-private-items` to `cargo doc`) so the viewer's "Show
+private" toggle (hidden entirely if you didn't pass this) has something to
+show. Off by default: rendering pages for every private item is a real
+cost that scales with how many exist, on top of the type-checking `cargo
+doc` already does either way — see [PROJECT.md](PROJECT.md) §2.9.
+
+`selfcheck` and `validate-trace` are this tool's own internal checks, not
+something you run against your own project: `selfcheck` builds the graph
+for a known fixture (default `../dummy-cli`, this repo's own test fixture)
+and asserts a fixed set of facts about it, specifically to catch a future
+Rust toolchain upgrade silently changing MIR's text format (see
+[PROJECT.md](PROJECT.md) §4, "MIR as the only extraction source");
+`validate-trace` checks any trace.jsonl against the schema in
+`codemap/schema/` — genuinely useful on your own trace too, to confirm it
+actually matches the mandated format above.
 
 `--out`/`--graph` (on `graph`/`doc`) default to `<target crate>/target/rust-codemap/<crate name>/...` — see
 above. Run any subcommand with `--help` for details.
@@ -354,11 +402,16 @@ around); neither belongs in the target's own call-graph, and both are
 correctly excluded by walking `cargo metadata`'s resolved dependency graph
 outward from the target instead of just listing workspace members.
 
-Known limitation: node ids aren't crate-qualified (a function is just
-`name` or `Type::method`, see below), so if two different crates in the
-closure happen to define the same free function name or the same
-`Type::method` pair, they collide into a single graph node. Not yet solved
-— see PROJECT.md.
+Node ids are qualified by the crate that actually defines them
+(`crate::name` for a free function, `crate::Type::method` for a method) —
+if two different crates in the closure define the same free function name
+or the same `Type::method` pair, they still render as two distinct graph
+nodes, not one collapsed together. Resolving a call site's actual target
+crate isn't always as simple as reading an explicit qualifier off the MIR
+text, though — see [PROJECT.md](PROJECT.md) §2.8 for how cross-crate calls
+get resolved (and the one case, a third crate calling a method name shared
+by two *other* crates with no qualifier of its own, that MIR text alone
+genuinely can't disambiguate).
 
 ## How the call-graph is built
 
@@ -368,7 +421,8 @@ type-checker, no external tool beyond `rustc` itself. It handles a few
 cases a naive "grep for calls" would miss:
 
 - **Dynamic dispatch** (`&dyn Trait` calls): over-approximated by linking to
-  *every* local implementation of that trait method, since MIR alone can't
+  *every* known implementation of that trait method across the whole
+  dependency closure (not just the calling crate), since MIR alone can't
   resolve which concrete type is behind the pointer at that call site.
 - **Closures**: MIR turns a closure into its own top-level item. Calls made
   inside a closure body (e.g. inside `.map(...)`) are re-attributed to the
@@ -411,11 +465,21 @@ each. In short, today:
   in practice — kept as a low-cost safeguard regardless.
 - The static call-graph (`run`/`graph`/`doc`) works for both binaries and
   libraries, standalone or with local dependencies merged in. Execution
-  replay does not yet: it assumes a trace's root span is named `main`,
-  which only a binary is guaranteed to have.
-- Cross-crate node-id collisions (see "Multi-crate merging" above) are
-  detected-but-unresolved: two crates' same-named items silently merge into
-  one graph node.
+  replay does not, and this is an accepted limitation rather than a
+  planned fix: a trace only exists because *something* ran and produced
+  log output, and only a binary's `main()` is guaranteed to be that
+  something (the replay animation's unwind-to-root also keys off finding a
+  node whose id ends in `::main`). The same reasoning is why replay isn't
+  meaningful for async or multi-threaded execution either — the tool
+  replays *log order*, and that only maps onto a single, straight call
+  stack for ordinary synchronous binary execution.
+- Cross-crate node-id collisions are resolved by qualifying every node id
+  with its own crate (see "Multi-crate merging" above) — the one thing
+  that's still just an approximation, not fully resolved, is a *third*
+  crate calling a method name two *other* crates both happen to share,
+  with no crate qualifier of its own in the MIR text to disambiguate by;
+  that specific case fans out to every possible match rather than picking
+  one, the same way an actual `&dyn Trait` call already does.
 - All call edges are typed generically as `call` — the distinction between
   a direct call, a dynamic dispatch, and a loop are not yet recovered from
   MIR (the viewer already supports styling `dispatch`/`loop_call`/

@@ -29,6 +29,8 @@ python -m codemap run   --project <path>                # graph + doc + serve, o
 python -m codemap graph --project <path>                 # -> <target_dir>/rust-codemap/<crate>/graph.json
 python -m codemap doc   --project <path>                  # -> <target_dir>/rust-codemap/<crate>/source_index.json
 python -m codemap serve --graph <path> --doc <path> [--docs <path>]  # re-serves already-generated output, re-read on every request
+python -m codemap selfcheck [--project ../dummy-cli]      # MIR-format canary -- see PROJECT.md §4
+python -m codemap validate-trace <trace.jsonl>            # check a trace against codemap/schema/trace-*.schema.json
 ```
 
 No `trace` subcommand anymore -- removed once "Load trace…" in the viewer
@@ -60,8 +62,16 @@ fetches project-specific files automatically as the primary path; use its
 "Load graph…" / "Load doc index…" / "Load trace…" buttons to pick up
 whatever `graph`/`doc`/`trace` (or `run`) just wrote.
 
-There is no test suite yet. To sanity-check a change to `codemap/`, run the
-commands above against:
+There is no general test suite yet, but `python -m codemap selfcheck` (runs
+`graph` against `../dummy-cli` and asserts a fixed set of structural facts
+about the result -- specific nodes, edges, the `traced` flag, `call_order`
+renumbering, the cross-crate collision fix) and `validate-trace` (checks a
+trace.jsonl against `codemap/schema/`) are real, repeatable automated
+checks -- run `selfcheck` after any change to `mir_graph.py`/`__main__.py`'s
+graph-building code, and after any Rust toolchain upgrade (see PROJECT.md
+§4, "MIR as the only extraction source" -- this is the canary that catches
+a future rustc MIR-format change instead of it failing silently). Beyond
+that, to sanity-check a change to `codemap/`, run the commands above against:
 - `../dummy-lib/{dummy-core,dummy-ops,dummy-api}` — a sibling repo
   purpose-built as a multi-crate (library-only) test fixture, see
   PROJECT.md §2.7 and its own README. Confirm `graph`/`doc` merge all 3
@@ -98,6 +108,13 @@ execution replay is only meaningful for a binary target today (see
    `doc_index.py`, `trace_log.py` are pure parsing modules with no CLI/IO
    concerns of their own — each takes text/paths in and returns a plain
    dict/list out, so they're easy to reason about independent of argparse.
+   `codemap/schema/trace-{entry,close}.schema.json` are the written trace-
+   format contract (plain, standard JSON Schema draft-07 -- readable by any
+   real validator, not just this repo); `schema_check.py` is a small,
+   dependency-free validator for exactly the subset of JSON Schema those
+   two files use, so checking a trace against them (`validate-trace`)
+   doesn't need pulling in a third-party `jsonschema` package just for
+   that.
 2. **`viewer/index.html`** — a single self-contained HTML file (Cytoscape.js
    plus the `cytoscape-dagre` layout extension and its `dagre` dependency,
    all from a CDN via plain `<script>` tags, no build step, no bundler,
@@ -129,19 +146,50 @@ not the target crate's (`doc_index.build_index()` takes a list of
 This is the part most likely to need care when changed. It parses MIR
 *text* (produced via `cargo build -p <crate> ...` with
 `RUSTFLAGS=--emit=mir`, one invocation per crate in the dependency closure
-above, texts simply concatenated before parsing) with regexes — there is no
-AST and no dependency on rustc's internals beyond the stability of its MIR
-pretty-printer output. Load-bearing assumptions (all rely on rustc
-behavior, not on any specific project):
+above) with regexes — there is no AST and no dependency on rustc's
+internals beyond the stability of its MIR pretty-printer output (see
+`python -m codemap selfcheck`, above, for the canary that watches this).
+
+**Each crate's MIR is parsed on its own now, not concatenated into one
+blob** (`parse_mir(text, crate_name, known_crates, ...)`, one call per
+crate; `merge_crates(...)` combines the results). This changed specifically
+to fix a real bug: two different crates defining the same free function or
+`Type::method` pair used to silently collide into one graph node once
+merged (PROJECT.md §4, "cross-crate node-id collision"). Every node id is
+now qualified with the crate that actually defines it
+(`dcore::Item::describe`, `dapi::Item::describe` -- two distinct nodes,
+where there used to be one). A call site's *target* can't always be
+resolved within its own crate's parse, though (see the next bullet) --
+`parse_mir` defers that to `merge_crates`, which sees every crate's own
+`local_ids` at once; `edges`/`dyn_edges` carry an unresolved `callee_raw`
+(+ `crate_hint`, `_seq`) until then, not a final `target`/`call_order`.
 
 - Free functions defined in the crate being compiled are always **local**
   (anything from another crate is fully path-qualified with that other
   crate's name) -- but MIR is *inconsistent* about whether it prints a
   local free function's own module path or not (`basics::add` right next
   to bare `compute`, both `pub fn` in their own submodule -- confirmed via
-  the dummy-lib fixture, PROJECT.md §2.7). `RE_FREE_FN` and `normalize_call`
-  both normalize to the bare name either way, so don't assume "bare = safe
-  to match, qualified = something else" anywhere new.
+  the dummy-lib fixture, PROJECT.md §2.7), **and this inconsistency turns
+  out to extend across crate boundaries too, not just within one crate**:
+  confirmed on the same fixture, a call from `dummy-api` into
+  `dummy-ops::combiner::double` prints as bare `double(...)` (no crate
+  qualifier at all), while a call from the same function into
+  `dummy-core::basics::add` prints as the fully qualified
+  `dcore::basics::add(...)`. `RE_FREE_FN`/`normalize_call` both normalize
+  to the bare name either way; `split_crate_hint` additionally strips a
+  *known local crate's* name specifically when MIR does include it (never
+  a hardcoded name -- `known_crates` comes from `cargo metadata`'s own
+  dependency closure, same as everywhere else in this tool). When it
+  doesn't, `merge_crates` falls back to searching every OTHER crate's own
+  `local_ids` for an unqualified match: same-crate is always checked
+  first (so a name existing in both the caller's own crate and some other
+  crate resolves to the caller's own crate, not a coincidental match
+  elsewhere); a single match elsewhere resolves there; two or more matches
+  are genuinely ambiguous from MIR text alone (e.g. a *third* crate
+  calling an ambiguous shared method name it has no way to qualify) and
+  fan out to every match, sharing one `call_order` -- the same
+  over-approximation already used for `&dyn Trait` calls, not a new kind
+  of imprecision.
 - Similarly, an impl block's module prefix before `<impl at ...>` is only
   present when the impl isn't at the crate root, and the `Self` type in a
   method's first parameter can itself be module-qualified (`&report::Item`,
@@ -186,16 +234,32 @@ behavior, not on any specific project):
   code, not guaranteed once a function has branches/loops (MIR doesn't
   encode "which branch runs first"). A `&dyn Trait` fan-out (previous bullet)
   is one call site with an ambiguous target, not several calls — all of its
-  fan-out edges share the same `call_order`.
+  fan-out edges share the same `call_order`. **`call_order` is assigned in
+  `merge_crates`, in a final renumbering pass, not while scanning a
+  crate's own MIR** -- most matched call terms in an instrumented fn's body
+  are `#[instrument]`'s own generated scaffolding (`Span::new`,
+  `Callsite::interest`, `LevelFilter::current`, ...) that never resolves to
+  anything local; assigning the real 1, 2, 3, ... only after resolution
+  drops those is what keeps a caller's first *real* call at `call_order 1`
+  instead of somewhere in the high teens or twenties purely from counting
+  noise (a real regression caught while building the crate-qualification
+  fix above, confirmed on `dummy-cli`'s own `main`). `parse_mir` itself
+  only assigns a raw per-caller `_seq` (every matched call term, resolved
+  or not); edges/dyn-fan-outs sharing the same `(source, _seq)` share one
+  final `call_order` once renumbered.
 - Closures compile to their own top-level MIR item
   (`...::{closure#N}`). Calls made inside a closure body are reattributed to
   the *enclosing* function (`closure_owner_path`), so a call hidden inside
   `.map(...)` still produces an edge from the right node.
 - Calls through `&dyn Trait` are over-approximated: MIR can't tell which
   concrete type is behind the pointer, so the edge fans out to *every*
-  locally-known implementation of that method. This is a deliberate
-  simplification, not a bug — expect it to look noisy on a project with a
-  large trait hierarchy.
+  locally-known implementation of that method, **across the whole
+  dependency closure, not just the calling crate** (confirmed on the
+  dummy-lib fixture's `Summable` trait, implemented once in `dummy-ops` and
+  once in `dummy-core` -- a call through `&dyn Summable` correctly fans out
+  to both crates' implementations). This is a deliberate simplification,
+  not a bug — expect it to look noisy on a project with a large trait
+  hierarchy.
 - The `traced` flag on each node is derived by checking whether the
   function's MIR body contains the tracing crate's `Callsite` scaffolding —
   i.e. whether `#[instrument]`/`span!`/`event!` actually expanded there.
@@ -208,10 +272,34 @@ behavior, not on any specific project):
 
 Discovers doc pages purely by filename pattern
 (`struct.Name.html`/`enum.Name.html`/`trait.Name.html`/`fn.name.html`) under
-`target/doc/<crate>/`, keyed by the item's own name — no manual
+`target/doc/<crate>/`, keyed by `(crate name, item name)` — no manual
 name-to-file table. `SOURCE_LINK_RE` matches `.../src/<any-crate-name>/...`
 generically; don't hardcode a crate name into this regex again (it was
-found and fixed once already — see PROJECT.md §7).
+found and fixed once already — see PROJECT.md §7). The final index is
+keyed by crate-qualified id (`crate::Name`, `crate::Type::method`) to match
+`mir_graph.py`'s own node ids exactly — required for a free function
+(itself a graph node) and for a method (looked up against the *specific*
+crate's own type page, never a same-named type in some other crate); a
+struct/enum/trait entry additionally gets the bare `Name` key too, but only
+from whichever crate is indexed first for that name, so a signature's
+rendered type name (never crate-qualified in the HTML itself) can still be
+linkified for the common, non-colliding case without resurrecting the old
+silent last-crate-wins behavior for the colliding one.
+
+Every entry also carries a `public` bool, used by the viewer's opt-in
+"Show private" toggle (only meaningful when `codemap doc --include-
+private` was used -- otherwise no private item has a page to have been
+indexed from at all). Derived from the scraped signature text
+(`sig.startswith("pub ")`) -- **except for methods**, where that alone is
+wrong: a trait-impl method's own declaration never carries `pub` (Rust
+forbids re-declaring visibility inside `impl Trait for Type { ... }`), so
+the plain heuristic would flag every method of an ordinary *public* trait
+as private. `_is_trait_impl_method()` disambiguates using rustdoc's own
+stable section-header anchors (`id="implementations"` vs `id="trait-
+implementations"` on the type's page) -- whichever appears closest before
+the method's own anchor decides which case applies. Found and fixed by
+testing against the dummy-lib fixture's real `Summable` trait, not assumed
+correct from the heuristic alone.
 
 ### `codemap/trace_log.py` vs. the viewer's inline JS parser
 
@@ -232,6 +320,23 @@ opened straight off disk); "Load trace…" already prefers a round trip to
 `/__codemap_parse_trace` (`_handle_parse_trace` in `__main__.py`, which
 loads `source_index.json` fresh per request) and only falls back to the
 client-side parser if that request fails.
+
+`trace_log.py` resolves the ancestor chain (`stack` on each event, and the
+`parent` used for call-site dedup) from an internally maintained stack of
+currently-open spans — pushed on each NEW event's own resolved id, popped
+on CLOSE (which, by construction, always closes whatever is currently
+innermost) — **not** by re-parsing an entry's own `spans` array text. This
+replaced an earlier design that cached a raw span name -> resolved id
+mapping globally: a real bug, not just a simplification, once crate-
+qualified ids existed -- two different crates' functions can share the
+exact same *default* `#[instrument]` span name (just the bare fn name, no
+crate qualifier possible in that name at all), so a global cache kept by
+name silently let the second crate's occurrence inherit the first's
+resolution. Confirmed on the dummy-lib/dummy-cli fixture's own
+`make_and_describe`/`describe` collision test (PROJECT.md §2.7/§2.3) before
+being fixed. Any future change to this file should keep resolving from the
+live open-span stack, not from `entry["spans"]`'s own text, for the same
+reason.
 
 ### `viewer/index.html` — the pieces that aren't obvious from a skim
 
@@ -264,13 +369,18 @@ client-side parser if that request fails.
   unwind all the way back to the `main` node and only then settles that
   path to the normal "visited" green. `main` here is not a hardcoded
   project assumption for a *binary* — `fn main` is the mandated name of
-  every Rust binary's entry point. It is, however, a real gap for
-  libraries: `finishTraceToRoot()` and the layout's `roots: ['main']` both
-  still key off that exact name. The layout half is already conditional
-  (`initCy`/`btn-relayout` check whether a `main` node exists before using
-  it as the root, falling back to Cytoscape's own auto-detected roots
-  otherwise); `finishTraceToRoot()` is not — replay on a library-derived
-  graph is unexplored territory, see PROJECT.md §4.
+  every Rust binary's entry point; since node ids are now crate-qualified,
+  the actual id is `<bin crate>::main`, found dynamically via the shared
+  `mainNodeId()` helper (`.endsWith('::main')`, not a literal `'main'`
+  string compare anywhere) rather than hardcoded per call site. It is,
+  however, a real gap for libraries: `finishTraceToRoot()` and
+  `layoutAsLevelGrid()`'s root detection both still rely on that helper
+  finding *some* `::main` node at all. The layout half is already
+  conditional (falls back to Cytoscape's own auto-detected zero-indegree
+  roots if `mainNodeId()` finds nothing); `finishTraceToRoot()` is not —
+  replay on a library-derived graph remains unexplored territory, and is
+  an accepted, permanent limitation now, not a gap to eventually close
+  (PROJECT.md §4).
 - Type names inside a rendered signature are linkified (`linkifySignature`)
   only when that exact identifier is a key in `source_index.json` — never
   from a hardcoded list of "known types."
@@ -290,4 +400,7 @@ client-side parser if that request fails.
 - Several things are intentionally *not yet* built (a dedicated
   call-stack/timing frame beyond the sidebar list; real rustdoc-style
   navigation instead of scraped signature/doc snippets) — these are open
-  decisions in PROJECT.md §4, not gaps to silently fill in.
+  decisions in PROJECT.md §4, not gaps to silently fill in. Cross-crate
+  node-id collision and MIR-as-the-extraction-source, previously listed
+  here too, are now settled — see this file's `mir_graph.py`/`selfcheck`
+  sections above and PROJECT.md §4.

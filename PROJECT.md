@@ -116,6 +116,62 @@ A generic, project-agnostic tool that, for **any Rust codebase**:
 - **Still true**: the same parsing logic is *also* implemented in JS in the
   viewer (for the "Load trace…" button, so a raw log can be loaded without
   running the CLI first). Two implementations of the same logic — see §3.
+- **Dedup by call site, not just by node id.** Settled per §4: "called from
+  a loop" and "called from two/three genuinely different lines of the same
+  caller" are different things and should look different in a replay.
+  `parse_trace()` now takes an optional third argument, `graph` (typically
+  `graph.json`'s own contents) — `_build_edge_call_orders(graph)` builds a
+  `(caller id, callee id) -> sorted [callOrder, ...]` map straight from the
+  edges `mir_graph.py` already emits (one `callOrder` per static call site,
+  see CLAUDE.md). A pair with a single site behaves exactly as before
+  (aggregate into one entry with an iteration count, no matter how many
+  times it's actually invoked at runtime — that's the loop case, and also
+  covers "called once each from several *different* callers", since that
+  was never this feature's target and stays intentionally unchanged). A
+  pair with N>1 sites instead gets up to N separate entries: occurrences
+  are assigned to sites in trace order via a per-`(parent, name)` counter
+  (1st occurrence -> smallest `callOrder`, 2nd -> next, ...), tracked
+  separately for "new" and "close" events so a close's aggregated
+  `time.busy` lands back on the matching split-out entry (properly-nested
+  span emission keeps a given invocation's own new/close pair at the same
+  relative rank among same-named siblings either way). Wraps back to the
+  first site if there are more occurrences than known sites (one of the
+  sites is itself in a loop) — an acknowledged approximation in that mixed
+  case (which specific site looped isn't recoverable from the trace alone),
+  but still splits into the right *number* of entries instead of collapsing
+  them all into one. The final dedup key changed from `name` alone to
+  `(name, callOrder-or-None)`. With no `graph` passed at all (e.g. the
+  viewer's client-side `parseTraceJsonl()` fallback, which has no access to
+  `graph.json`'s edges the way `trace_log.py` does), behavior is unchanged
+  from before this feature existed.
+
+  `viewer/index.html`'s `stepTo()` was updated to match: when coloring the
+  hop into a span's own immediate call, if that span carries a `callOrder`
+  and more than one parallel edge exists between the same two nodes, it
+  narrows down to the one edge whose own `callOrder` matches, instead of
+  coloring every parallel edge identically (ancestor hops in the same
+  `fullPath` are never narrowed this way — only the last hop, the span's
+  own call, is one `trace_log.py` actually resolved a specific site for).
+
+  Verified with a real fixture, not synthetic JSON: added
+  `dapi::calls_add_twice()` (calls `dcore::basics::add` from two different
+  lines) to `dummy-api`, wired it into `dummy-cli::main`, rebuilt, captured
+  a real trace. `graph.json` came back with two separate
+  `calls_add_twice -> add` edges (`callOrder` 1 and 2); `parse_trace()`
+  against the real trace produced exactly two `add` entries, one per
+  `callOrder`, each with `iterations: 1`, while the pre-existing
+  single-site `add` calls (under `double`, invoked from two different
+  activations of `double` itself) still correctly aggregated into one
+  entry with `iterations: 3`. Confirmed end-to-end in a real browser too
+  (not just the Python-level call): the live `/__codemap_parse_trace`
+  round trip returns both split entries, and stepping through them one at
+  a time highlights only the specific edge each one belongs to (red/
+  current on the matching `callOrder`, green/visited on the other once
+  past it) — verified by reading each edge's actual resolved
+  `line-color`/`width` style, not just checking a CSS class was applied
+  (the "class present but styling silently didn't take" failure mode
+  already caught once before in this project, §2.5's dimmed-edge-color
+  entry).
 
 ### 2.4 CLI (`codemap/` package, run as `python -m codemap <subcommand>`)
 
@@ -266,7 +322,26 @@ so each crate's items resolve against that crate's own `src/`.
 - **Untraced nodes**: hidden by default, toggle to reveal. Naming kept
   neutral ("untraced", not "static-only") since `traced === false` can mean
   either "structurally cannot be traced" or "a real function someone forgot
-  to instrument" — the tool can't tell those apart.
+  to instrument" — the tool can't tell those apart. **One exception, added
+  later (§2.8's fixture): `main` itself.** Reported directly against the
+  cross-crate collision fixture: `main`'s own calls into
+  `make_and_describe` looked disconnected, because `main` (never
+  `#[instrument]`-able in the first place -- the span would start before
+  `tracing_subscriber::init()`, called from inside `main`'s own body, has
+  even run) is genuinely `traced === false`, and an edge stays hidden if
+  either endpoint is. Unlike an ordinary untraced function, this isn't
+  ambiguous the way the comment above describes -- there's no "maybe
+  someone forgot to instrument it" reading for `main` specifically, it's a
+  structural certainty for every binary. Fixed in the viewer only (not
+  `mir_graph.py` -- the underlying `traced` field keeps its accurate
+  meaning): a node whose id ends in `::main` is simply never given the
+  `.untraced` class in the first place, so it renders (and keeps its
+  outgoing edges rendered) regardless of the "Show/Hide untraced" toggle.
+  `main` isn't a hardcoded project name here, same reasoning as
+  `mainNodeId()` elsewhere in the viewer — it's Rust's own mandated
+  binary entry-point name, so this only ever fires when such a node
+  genuinely exists (never for a library-only graph, or an embedded
+  `#![no_main]` binary — both already have no such node to except).
 - **Per-scope static call order**: every edge shows a small number (always
   on, no toggle) that answers "which call is this, counting only from its
   own caller" -- restarts at 1 for every function, independent of how many
@@ -988,7 +1063,12 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
   multi-crate scenarios: a trait implemented across two different crates
   (dynamic dispatch), a free function called from two different crates
   (static dispatch), a deliberately uninstrumented function, a cross-crate
-  node-id collision (two unrelated `Item::describe`), and every crate's
+  node-id collision (two unrelated `Item::describe`, and -- added
+  alongside §2.8's fix, since the original pair was never actually called
+  by anything -- `make_and_describe` in both `dummy-core` and
+  `dummy-api::report`, each calling its own crate's own `Item::describe`,
+  so the collision fix has a real edge and a real trace to verify against,
+  not just two otherwise-dead node definitions), and every crate's
   `[lib] name` overridden from its package name (bug #6 below). See its own
   `README.md`. Analyzing it one crate at a time (before any cross-crate
   merging existed) is what surfaced MIR-parsing bugs #1-3 in §3.
@@ -1051,6 +1131,298 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
   fixture continuing to exist -- they're exercised by synthetic components
   built ad hoc in test scripts instead (see §2.5's dagre entries), so
   nothing there was lost by removing it.
+
+### 2.8 Cross-crate node-id qualification, the MIR-format canary, and the trace-format schema
+
+Three of §4's open decisions, all picked up together and all now settled/
+implemented.
+
+**Cross-crate node-id collision.** Previously: two different crates
+defining the same free function or `Type::method` pair silently merged
+into one graph node once their MIR was concatenated and parsed as a single
+blob. Fixed by qualifying every node id with the crate that defines it
+(`dcore::Item::describe`, `dapi::Item::describe` -- two distinct nodes now,
+confirmed on the dummy-lib fixture's own deliberate `Item`/`describe`
+collision pair, which had existed since much earlier in this project but
+was never actually *called* by anything, so the bug it was meant to
+demonstrate had never been exercised end-to-end). This needed restructuring
+`mir_graph.py` around a two-phase design -- `parse_mir(text, crate_name,
+known_crates, ...)` now runs once per crate (previously: every crate's MIR
+text concatenated, parsed once); `merge_crates(...)` resolves every call
+site's target against the union of every crate's own `local_ids` afterward.
+See CLAUDE.md's `mir_graph.py` section for the resolution order (crate-hint
+first, then same-crate, then a global no-hint search, fanning out on a
+genuine multi-crate ambiguity the same way `&dyn Trait` calls already did)
+and why it's needed at all: MIR's inconsistency about printing a module
+prefix (already known, §3's bug #3) turns out to extend across crate
+boundaries too -- confirmed empirically that a call from `dummy-api` into
+`dummy-ops::combiner::double` prints as bare `double(...)`, no crate
+qualifier, while a call from the same function into
+`dummy-core::basics::add` prints fully qualified. `doc_index.py`'s index
+now keys the same way (crate-qualified, with a bare-name fallback only for
+struct/enum/trait entries, and only from whichever crate is indexed
+first for that name -- see its own docstring); the viewer's hardcoded
+`'main'` string-equality checks became a shared `mainNodeId()` helper
+matching `*::main` instead.
+
+Two real, unrelated bugs turned up while verifying this against a live
+trace (not just a live graph), both fixed:
+1. **`trace_log.py` was caching span resolution by raw name, globally.**
+   `#[instrument]`'s *default* span name is just the bare fn name -- no
+   crate qualifier is possible in that name at all -- so two different
+   crates' functions sharing a default name (confirmed by adding
+   `make_and_describe` to both `dummy-core` and `dummy-api::report`,
+   each calling its own crate's own `Item::describe`, deliberately
+   exercising the *free-function* half of the same collision, not just
+   the method half) resolved to whichever crate's occurrence happened to
+   populate the cache first -- the second crate's own span silently
+   inherited the first's resolved id, collapsing exactly the distinction
+   the id-qualification fix above exists to preserve. Fixed by replacing
+   the whole name-keyed cache with an explicitly maintained stack of
+   currently-open spans: each "new" event resolves independently from its
+   *own* `filename`/`line_number` and pushes onto the stack; a "close"
+   event, by construction, always corresponds to whatever's currently on
+   *top* of that stack (tracing's span guards are RAII, so spans nest like
+   a real call stack for the ordinary synchronous, single-threaded
+   execution this tool already assumes) -- resolved by popping, never by
+   re-deriving from the close event's own (ambiguous, name-only) text. The
+   `stack` recorded on each event is simply a snapshot of the open-span
+   stack at that moment, for the same reason -- `entry["spans"]`'s own text
+   is no longer read for resolution purposes at all, only for nothing
+   (kept in the raw JSON, just unused).
+2. **`call_order` was inflated by `#[instrument]`'s own generated calls.**
+   Deferring call-target resolution to `merge_crates` (needed for the fix
+   above) meant every matched call term in a caller's MIR body had to be
+   recorded before knowing whether it would resolve to anything local --
+   but most matched call terms in an instrumented fn are exactly
+   `#[instrument]`'s own scaffolding (`Span::new`, `Callsite::interest`,
+   `LevelFilter::current`, ...), which never resolves. Confirmed as a real
+   bug (not hypothetical) on `dummy-cli`'s own `main`: its first real call
+   landed at `call_order 9`, not `1`, purely from counting the
+   `tracing_subscriber::fmt()...init()` builder chain's own method calls
+   first. Fixed by having `parse_mir` record a raw per-caller `_seq`
+   (every matched term, resolved or not) instead of a final `call_order`,
+   and having `merge_crates` renumber 1, 2, 3, ... per caller, in `_seq`
+   order, only across the calls that actually survived resolution -- a
+   fan-out (dyn-dispatch, or a genuinely ambiguous cross-crate match)
+   shares one `_seq` and keeps sharing one final `call_order`, so this
+   renumbering doesn't accidentally split one call site into several
+   numbered ones.
+
+Verified end-to-end on the dummy-cli fixture (not just a synthetic case):
+`dcore::make_and_describe -> dcore::Item::describe` and
+`dapi::make_and_describe -> dapi::Item::describe` render as two separate
+nodes with two separate edges in `graph.json`; a real captured trace
+through both resolves to two separate trace entries (`iterations: 1` each,
+not one merged entry); `source_index.json` carries both `Item::describe`
+signatures under their own crate-qualified keys with the right per-crate
+field types (`i32` vs `usize`); and every `call_order` across the whole
+merged graph restarts at 1 per caller again. The full Playwright regression
+suite (~25 files referencing node ids directly) was updated for the new
+`crate::id` shape and re-run clean; a handful of already-stale files
+(hardcoded ports from long-removed servers, one file testing UI that no
+longer exists -- `#btn-load-graph`/`#status`, both gone per §2.5) failed for
+reasons unrelated to this change and were left alone rather than revived.
+
+**MIR as the only extraction source.** Considered `syn`-based source
+parsing and DWARF debug info as alternatives (see the full write-up this
+replaced, in an earlier version of §4) -- both rejected: `syn` alone would
+lose real type resolution (trait dispatch, generic monomorphization,
+which submodule a function lives in) that MIR already gets for free, and
+every bug fix in §3 exists *because* MIR resolved something `syn` never
+would have known; DWARF solves a "binary-level ground truth" problem this
+tool doesn't have (it's static analysis of source the user already has,
+not reverse-engineering a compiled artifact), needs a new non-trivial
+dependency, and is only available for debug builds. Settled on keeping
+MIR, but hardening against its real risk (an unversioned, rustc-internal
+text format that could change shape on a future toolchain upgrade) with a
+canary instead of an alternative extraction mechanism: `python -m codemap
+selfcheck` builds the dummy-cli fixture's graph for real and asserts a
+fixed set of structural facts already confirmed true today (a bare free
+fn, a module-qualified one, an impl method, both the crate-hinted and the
+no-hint cross-crate call-resolution paths, a cross-crate dyn-dispatch
+fan-out, generic-turbofish stripping, self-recursion, the `Callsite`-based
+`traced` flag, `call_order` renumbering, and the node-id collision fix
+itself) -- sampling every distinct MIR shape the regexes in `mir_graph.py`
+depend on, not just "does *a* graph come out." Verified the canary actually
+catches a real regression, not just always passing: temporarily broke
+`RE_FREE_FN` so it could never match, re-ran `selfcheck`, and 7 of 10
+checks correctly failed (the ones structurally downstream of free-function
+extraction) while the 3 unrelated ones (impl methods, `traced`, the
+id-collision fix) still passed, exactly matching what should and shouldn't
+be affected by that specific break.
+
+**Trace-format schema.** Written as two JSON Schema (draft-07) documents,
+`codemap/schema/trace-entry.schema.json` and `trace-close.schema.json` --
+separate files rather than one schema with "required unless it's a close
+event" conditionals, since the two event shapes really are structurally
+different (`fields` is a fixed `{"message": "new"}` on one, a `{"message":
+"close", "time.busy": "...", "time.idle": "..."}` on the other). Every
+field the mandated `tracing_subscriber` setup actually produces is
+documented, including ones `trace_log.py` doesn't read (`timestamp`,
+`level`, `target`) -- the schema's job is the full real contract, not just
+the subset the parser happens to use. Deliberately has no `formatVersion`
+field (see the schema files' own top-level `description` for the reasoning
+already written there): this isn't a wire protocol with independently-
+evolving producers/consumers, it's one parser pair maintained in this same
+repo, so a real format change edits the schema, both parsers, and the
+README snippet together, in one commit -- the schema file itself, not a
+version number inside it, is what marks a real change. `codemap/
+schema_check.py` is a small, dependency-free validator for exactly the
+subset of JSON Schema these two files use (type/required/properties/
+additionalProperties/const/pattern/minimum/items) -- the schema files
+themselves stay plain, standard JSON Schema so any real validator can also
+use them; this module exists only so checking a trace doesn't need pulling
+in a third-party `jsonschema` package, consistent with `requirements.txt`
+staying empty. `python -m codemap validate-trace <path>` runs it against a
+real file, line by line (an entry or a close schema, picked by
+`fields.message`) -- doubles as this schema's own fixture-validation test
+(run against dummy-cli's own `trace.jsonl`) and as a genuinely useful
+end-user diagnostic now that README.md's format is mandatory, not
+descriptive: "does my own trace file actually match the contract."
+Verified both directions: a clean real trace passes all 36 lines with zero
+errors; a deliberately corrupted line (a required field removed, another
+given the wrong type) reports exactly those two errors, at the right JSON
+Pointer-ish path, and nothing else.
+
+**Two follow-up reports against this same fixture, both real, both fixed.**
+
+1. **`main`'s outgoing calls looked disconnected in the static graph.**
+   `main` is never itself a tracing span (see the trace-side entry right
+   below), but that's unrelated to this one -- this is about the *static*
+   view: `main` genuinely is `traced === false` (it structurally can never
+   emit a span), and the viewer hides untraced nodes by default -- an edge
+   stays hidden if either endpoint is, so every one of `main`'s own calls
+   (`run_report`, `calls_add_twice`, both `make_and_describe`s) rendered as
+   if caller-less. Unlike an ordinary untraced function, there's no
+   "maybe someone forgot to instrument it" reading for `main` specifically
+   -- it's a structural certainty for every binary (`tracing_subscriber::
+   init()` runs from inside main's own body, so a span wrapping main would
+   start before its own subscriber exists). Fixed in the viewer only, not
+   `mir_graph.py` -- `traced` keeps its accurate structural meaning; a node
+   whose id ends in `::main` (`isMainId()`, shared with `mainNodeId()`'s
+   existing logic) is simply never given the `.untraced` class, so it
+   renders regardless of the "Show/Hide untraced" toggle. Also fixed the
+   legend's `hasUntraced` check (was reading the raw `traced` field
+   directly, would still have shown a swatch for a graph where `main` was
+   the *only* untraced node) and the "hide everything looks like an empty
+   canvas" escape hatch (now excludes `main` from both sides of that
+   comparison, or a real binary with zero instrumented functions besides
+   main would show only main with none of its calls, an equally
+   uninformative near-empty canvas). `test_untraced_reveal.js`'s own
+   "unrelated untraced nodes remain hidden" check had to be relaxed: it
+   used to lean on `main` incidentally being *some* second untraced node
+   to test scoping against (unrelated to main specifically) -- with `main`
+   exempted, `dcore::Pair::sum` (deliberately the fixture's *only*
+   uninstrumented real function) is now the sole untraced node, leaving
+   nothing else to test scoping against; the assertion no longer demands a
+   nonzero count, which would otherwise be undemonstrable with today's
+   fixture.
+2. **The same root cause, but for *replay*, not the static view -- and a
+   real risk caught during review before landing the obvious-looking
+   fix.** `main` never emitting a span means it never appears in ANY
+   span's `stack` either, so `stepTo()`'s hop-coloring (which walks
+   `[...span.stack, span.name]`) never has a first hop to color for any
+   span reached directly from `main` -- reported as "edges from main
+   aren't colored." First proposed fix: seed the parser's `open_stack`
+   with `main`'s id, so every ancestor-less span picks it up automatically
+   -- rejected on review, correctly: that's an unconditional *guess*, and
+   a real one it could get wrong. A span reached through some *other*,
+   also-untraced intermediate function (`main -> helper -> this_span`,
+   `helper` itself never instrumented -- tracing would still only ever see
+   `this_span`, never `helper`) would be mislabeled as called directly by
+   `main`, implying an edge (`main -> this_span`) that might not even
+   exist in the static graph. Fixed properly instead, in `trace_log.py`:
+   an ancestor-less span is only ever attributed to `main` when `graph`
+   *confirms* a direct static edge from `main` to it (`_find_main_id` + a
+   lookup in the already-existing `edge_call_orders` map) -- never as a
+   default for "nothing else was recorded." No graph, or no confirming
+   edge, and the span's `stack` stays exactly what it always was: empty,
+   not a guess. This also composes correctly, for free, with the existing
+   call-site-dedup machinery (§2.3) if `main` ever called the same
+   function from two different lines -- `edge_call_orders` is the same
+   ground truth either way. Verified on the real fixture: `run_report`,
+   `calls_add_twice`, and both `make_and_describe`s (all genuinely called
+   directly by `main`, confirmed in `graph.json`) now correctly report
+   `stack: ['dummy_cli::main']`; deeper spans (already had a real recorded
+   ancestor) are untouched. Confirmed end-to-end in a real browser: the
+   edge `main -> run_report` colors red/current while stepping into it and
+   green/visited once past it, same as any other hop -- previously stayed
+   the default color throughout.
+
+### 2.9 Source link for doc-only entries, and an opt-in "private items" toggle
+
+Two related doc-sidebar asks, picked up together.
+
+**A struct/enum/trait entry's info used to drop its signature and source
+link.** `focusOnNode()`'s "not a node in the loaded graph" branch (for a
+type -- never a call-graph node on its own, only its methods are) only
+ever called `docLinkHtml(id)`, which is *just* the bold/linked name --
+silently dropping the signature and 📂 source-file:line link that a real
+graph node's info panel already shows via `buildInfoHtml()`. Both draw
+from the exact same `sourceIndex[id]` data, so there was never a reason
+for the doc-only case to show less. Factored the shared part out into
+`docEntryHtml(id, nodeData)` (doc link + signature + source link, the part
+that's meaningful for ANY `sourceIndex` entry) -- `buildInfoHtml()` is now
+`docEntryHtml()` plus its own span-specific tail, and the "not a node"
+branch calls the same shared function instead of the bare link alone.
+
+**Private items, opt-in.** `cargo doc` (and therefore `doc_index.py`)
+never had anything to show for a non-`pub` item at all, by design --
+rustdoc doesn't render a page for one unless told to. Added `--include-
+private` to `codemap doc`/`run` (passes `--document-private-items` to
+`cargo doc`) and a `"public"` field on every `doc_index.py` entry, so the
+viewer can filter without needing two separate `source_index.json` files
+for the on/off cases. Real cost, not assumed: rustdoc still type-checks
+the whole crate either way, but *rendering* pages for however many
+private items exist is the actual scaling factor, and `doc_index.py`'s own
+`rglob("*.html")` scan is linear in page count too -- kept opt-in
+specifically because of this, rather than defaulting it on. (Not yet
+measured on a real stress fixture -- the dummy-lib fixture is far too
+small to say anything quantitative; flagged as worth doing with the
+`bulk/`-style generator if this ever needs a real number instead of
+"proportional, and probably not free.")
+
+`public` is derived from the scraped signature text (`sig.startswith("pub
+")` -- true unless positively shown otherwise, so an empty/unscrapable
+signature defaults to visible rather than hidden) -- deliberately not a
+second lookup, the same signature `doc_index.py` already extracts. Real
+bug caught immediately by testing against the actual fixture rather than
+trusting the heuristic on paper: a **trait-impl method's own declaration
+never carries `pub`** at all (Rust forbids re-declaring visibility inside
+`impl Trait for Type { ... }` -- it's exactly as visible as the trait and
+type already are), so the naive heuristic flagged `dcore::Pair::total`/
+`dops::Batch::total` (both implementing the ordinary *public* `Summable`
+trait) as private -- which would have hidden a large, common category of
+real methods by default the moment anyone turned this feature on. Fixed
+with `_is_trait_impl_method(html, idx)`: rustdoc's own page structure
+separates "Implementations" (inherent, where `pub`/visibility genuinely
+varies) from "Trait Implementations" (confirmed via the stable
+`id="implementations"` / `id="trait-implementations"` section-header
+anchors on a real generated page) -- whichever section header appears
+closest *before* the method's own anchor decides which case applies; a
+trait method is always treated as public regardless of its own missing
+`pub`, an inherent one still goes through the plain text heuristic.
+
+Added a genuinely private free function to the dummy-lib fixture
+(`dcore::internal_helper`, no `pub`) specifically to test this against
+something real -- the fixture had none until now. Viewer gets a "Show
+private" toggle in the settings bar, same pattern as "Hide untraced":
+hidden by default, and the button itself only appears at all if the
+loaded `source_index.json` actually has a private entry to filter (no
+permanently-inert button when `--include-private` wasn't used, today's
+default). One more interaction caught while testing rather than assumed
+correct: `dummy_cli::main` itself comes back `public: false` too (its real
+rustdoc-rendered visibility is `pub(crate)` -- a binary has no external API
+at all, so that's correct, not a bug) -- but `main` is not "someone's
+private helper," the same reasoning §2.8's untraced-exemption already
+established, so it's exempted from this toggle the same way: always shown
+in the doc list regardless of the "Show/Hide private" state, and excluded
+from the count that decides whether the button even appears (a fixture
+where `main` is the *only* private entry should still show no button, not
+an inert one).
+
+## 3. Points to fix
 
 - ~~Duplicated trace-parsing logic~~ **Fixed.** `trace_log.py` (Python) and
   the in-browser `parseTraceJsonl()` (JS) had already drifted apart in a
@@ -1389,13 +1761,14 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
   the component as an ad-hoc entry point when no zero-indegree node exists;
   verified on a synthetic 12-node pure-cycle component (no crash, real
   non-degenerate footprint). All prior regression tests re-run clean.
-  The "real library unchanged" report is still open — next step if it
-  recurs is reading that session's Log panel output (`layoutComponents`
-  entries show component count/sizes) to tell apart "one dominant
-  component's internal shape" (what every fix in this section has targeted
-  so far) from "many components, individually fine, tiled too loosely by
-  the outer row-wrapping logic" (`targetRowWidth` in the same function,
-  untouched by any of this).
+  **The "real library unchanged" report is now resolved.** Confirmed
+  working by the reporter after this round of fixes (dagre sibling
+  clustering, the hand-rolled per-depth-band grid replacing `concentric`,
+  the cyclic-component indegree fallback) landed — no further layout
+  change needed on their end. `targetRowWidth` (the outer per-component
+  row-wrapping logic, as opposed to any one component's own internal
+  shape) was never actually implicated; kept as the next thing to look at
+  *if* a similar report ever recurs, but not a currently-open issue.
 
 ## 4. Points to decide
 
@@ -1410,84 +1783,162 @@ its `Cargo.toml`/`src/` — with no tool logic of its own.
   iframe, but doesn't sync the graph focus or the doc list's own selection
   to wherever that link went — still one-directional (list -> iframe, not
   iframe -> list/graph).
-- **The tracing log format contract.** README.md now documents *what the
-  parser currently accepts* as a pragmatic baseline, explicitly marked "not
-  yet a final spec." Still open:
-  - Is the documented `tracing_subscriber` JSON setup mandated, or should
-    the tool detect/accept variants?
-  - Is a single root span (like `main`) required, and what happens without
-    one?
-  - Should this become a written spec/schema (JSON Schema), or stay as
-    documentation + a reference `tracing_subscriber` snippet?
-  - ~~Span `name` is used as the *unique* dedup key — breaks if the same
-    function is called from genuinely different call sites and the graph
-    needs to distinguish them.~~ **Partially settled, see §2.5's
-    "click-to-navigate" entries below for the full story**: `name` is no
-    longer trusted as the *match* key at all (resolved by real source
-    location instead, when `.with_file(true).with_line_number(true)` is
-    set) — this fixed the actual reported problem, which turned out to be
-    broader than "only custom names break": a method's bare default
-    instrumented name never matched this tool's own `Type::method` node
-    ids either, with zero customization involved. What's *not* fixed, and
-    remains a real open limitation: spans are still deduplicated by
-    (resolved) node id, so two genuinely different call sites of the same
-    function still collapse into one trace entry -- a different problem
-    from name-matching, unaddressed by this fix.
-- **MIR as the only extraction source, or an alternative/complement?**
-  MIR text dumps can be large/slow on real-world crates, and are an
-  unstable, version-tied rustc implementation detail. Still open whether to
-  keep MIR as the sole mechanism or consider alternatives (`syn`-based
-  source parsing, DWARF) later.
+- ~~The tracing log format contract.~~ **Settled: mandatory, not
+  descriptive.** README.md's "Tracing log format" section no longer reads
+  as "what the parser happens to accept today" — it states the exact
+  `main()` snippet to add, unmodified, and says plainly that there is no
+  other supported shape. The tool does not attempt to detect or accept
+  variants (a smaller log line, a different span-event configuration,
+  etc.) — that would mean maintaining N parsers instead of one, for a
+  target audience (crates adopting this tool) that has no existing
+  logging setup of their own to be compatible with in the first place.
+  What's still genuinely open (not decided by "mandate the format"):
+  - Whether a single root span (like `main`) is required, and what happens
+    without one — unaddressed either way; not exercised on a trace with no
+    such root yet.
+  - Whether to eventually write this contract as an actual versioned
+    schema document rather than prose + a code snippet — see the
+    "trace-format schema" proposal below, not yet acted on.
+  - ~~Span `name` is used as the *unique* dedup key~~ **Settled — see the
+    call-site dedup entry in §2.3**: dedup is now keyed by
+    `(resolved node id, call site)`, not node id alone. A genuinely
+    different call site of the same function now produces its own trace
+    entry; a single site invoked repeatedly (loop or otherwise) still
+    aggregates into one, exactly as before.
+- ~~Trace-format schema — write it as a real, versioned contract.~~
+  **Settled and implemented — see §2.8.** Two JSON Schema (draft-07)
+  documents (`codemap/schema/trace-{entry,close}.schema.json`), no
+  version field (the schema file itself is the version), checked via
+  `python -m codemap validate-trace` and `codemap/schema_check.py` (a
+  small dependency-free validator, not a runtime per-line check inside
+  `trace_log.py` itself). Still doesn't resolve the "is a root span
+  required" question just above — the schema encodes whatever that
+  decision ends up being, not make it, and today's schema doesn't require
+  one (an empty `spans` array is valid, meaning "this is a root").
+- ~~MIR as the only extraction source, or an alternative/complement?~~
+  **Settled and implemented — see §2.8.** `syn`-based source parsing and
+  DWARF debug info were both considered and rejected (would lose real type
+  resolution MIR gets for free, or need a new dependency for a problem this
+  tool doesn't actually have); kept MIR, hardened against its real risk (an
+  unversioned, rustc-internal text format) with a canary instead of an
+  alternative extraction mechanism -- `python -m codemap selfcheck`.
 - **Scope of "any Rust code."** ~~Single binary crate only, or also
   libraries~~ ~~multi-crate workspaces as a single combined graph~~
   **Settled, both**: `graph`/`doc`/`run` no longer even ask (`--bin`/`--lib`
   were dropped entirely, see §2.4) — `mir_graph.py` never assumed a binary,
-  and the viewer's layout hardcoding `roots: ['main']` is now conditional
-  on that node existing. Multi-crate merging is real and working (§2.4,
-  §2.7), scoped to the target's actual dependency closure. Execution
-  replay is explicitly **not** covered by either of these —
-  `finishTraceToRoot()` still assumes the trace's root span is named
-  `main`, which nothing guarantees for a library, and replaying a trace
-  that spans multiple crates hasn't been considered at all. Still fully
-  open: sync-only vs. `async fn`/multi-threaded tracing.
-- **Cross-crate node-id collision — leave as a known limitation, or
-  disambiguate?** Confirmed on `dummy-lib` (§2.7): two different crates'
-  same-named `Type::method` (or free function) silently merge into one
-  graph node once merged, with no signal that it happened. Options: (a)
-  leave it, document it (current state); (b) detect the collision and
-  surface it somehow (viewer warning, CLI warning at generation time); (c)
-  qualify node ids by crate name to prevent it structurally -- but that's
-  a bigger change (ids are currently bare/`Type::method` everywhere: the
-  viewer, `doc_index.py`'s node lookup, `main`-detection for layout, all of
-  it) and would need its own design pass, not a quick fix.
+  and the viewer's layout root-detection (`mainNodeId()`, §2.8) is
+  conditional on that node existing. Multi-crate merging is real and
+  working (§2.4, §2.7), scoped to the target's actual dependency closure.
+  Execution replay is explicitly **not** covered by either of these —
+  `finishTraceToRoot()` still assumes the trace has a root span (some node
+  matching `mainNodeId()`), which nothing guarantees for a library, and
+  replaying a trace that spans multiple crates hasn't been considered at
+  all.
+
+  **Replay-for-library/async/multi-thread: accepted as a permanent
+  limitation, not a gap to close.** A trace only exists because something
+  ran and produced log output — a library has no entry point of its own to
+  run, so "replay a library" was never a coherent ask to begin with (you'd
+  replay whatever *binary* exercised the library, which already works).
+  Async and multi-threaded execution have a similar shape: replay works by
+  assuming log order is a single, straight call stack, which stops being
+  true the moment execution isn't strictly synchronous on one thread. No
+  further design work planned here — this is closed, not deferred.
+- ~~Cross-crate node-id collision — leave as a known limitation, or
+  disambiguate?~~ **Settled and implemented — see §2.8.** Qualified every
+  node id by the crate that defines it (`crate::Type::method`,
+  `crate::free_fn`), rather than detect-and-warn: a warning still leaves
+  the merged graph *wrong*, just louder about it. `mir_graph.py`,
+  `doc_index.py`, `trace_log.py`, and `viewer/index.html` all updated (see
+  §2.8 for exactly what changed in each, including two real bugs the
+  migration surfaced and fixed along the way); the Playwright suite's
+  ~25 affected files were updated for the new id shape and re-run clean.
 - **Call-stack/timing frame — new visualization or evolve the existing
-  one?** The sidebar's "Execution Trace" list already shows per-span
-  duration and iteration counts, but flat. Still open whether the dedicated
-  frame from the vision (§1.4) is this list reworked (e.g. a flame-graph-
-  style view with width-by-duration) or a new component alongside it.
+  one? Open — design proposal below, not yet built.** The sidebar's
+  "Execution Trace" list already shows per-span duration and iteration
+  counts, but flat.
+
+  **Proposal: a flame graph, as a second view mode on the *existing*
+  sidebar list, not a brand-new frame.** Concretely:
+  - **Data**: no new data needed. Each `traceData` entry already has
+    `depth`, `stack`, `duration_ms`, `iterations` — a flame graph is a
+    rendering of exactly that, nothing else to compute. (`start`/`end`
+    offsets for laying out horizontal position/width would be new — see
+    "what's missing" below.)
+  - **Layout**: classic flame-graph shape — one horizontal bar per span,
+    stacked by `depth` (root at the bottom or top, either is fine, match
+    whichever reads more naturally next to the existing top-down trace
+    list), width proportional to `duration_ms`, x-position determined by
+    when that span started relative to its parent's own start. Standard,
+    well-understood visualization — no novel design needed here, the
+    interesting part is wiring it into what already exists.
+  - **What's missing from `traceData` today**: a span's *start offset*
+    within its parent. `trace_log.py`/`parseTraceJsonl()` currently
+    collapse a span's occurrences into one aggregated `duration_ms`
+    total, with no record of *when* (relative to trace start, or to its
+    parent's own start) each occurrence happened — needed to place bars
+    left-to-right in the right order and to size gaps (idle time) between
+    sibling calls accurately. This is a real, if small, extension to both
+    parsers, not free from the existing data.
+  - **Interaction, reusing what already exists rather than inventing a
+    parallel mechanism**: clicking a flame-graph bar calls the exact same
+    `stepTo(idx)` the existing trace-list row click already does — same
+    highlight/center/info-panel behavior, no separate code path to keep in
+    sync (a lesson already learned once this session, §2.5's graph-click-
+    vs-doc-list-click drift). The flame graph and the flat list are two
+    renderings of one `traceData`, switchable via a small toggle
+    (`renderTrace()` already exists as the one function that (re)builds
+    the sidebar from `traceData` — this becomes an `if` inside it, keyed
+    on view mode, not two divergent render paths).
+  - **Where it lives**: same right-sidebar slot the flat list already
+    occupies (toggle between the two, not both at once — screen space is
+    already tight there per §2.5's history of sidebar-width fights). Not
+    a new panel/frame, since the vision's "dedicated frame" reads more
+    like "a serious view of this data" than "a fourth panel" — and a new
+    panel competes for the same limited width the doc sidebar and graph
+    already negotiate.
+  - **Scale consideration**: a trace with hundreds of spans (plausible on
+    the `bulk`-scale fixture, §2.7, if ever traced rather than just
+    statically graphed) needs bars thin enough to still render sanely —
+    likely wants a minimum-pixel-width floor per bar (merge/collapse
+    sub-pixel-width spans into their parent visually, same spirit as the
+    doc list's crate/class collapsing) rather than assuming every trace
+    stays dummy-cli-sized.
+  No implementation started — this is the shape being proposed, pending
+  agreement before picking it up.
 - ~~How is the tool invoked against a new target project?~~ **Settled**:
   a CLI (`codemap.py`) with subcommands, taking `--project <path>` to any
   target crate. See §2.4.
 
 ## 5. Points to implement
 
-- Write down the tracing log format contract as an actual document/schema,
-  once §4's open questions on it are settled.
+- ~~Write down the tracing log format contract as an actual document/
+  schema~~ **Done — see §2.8.** `codemap/schema/trace-{entry,close}.schema.json`,
+  no version field, checked via `python -m codemap validate-trace`
+  (`codemap/schema_check.py`, not a per-line runtime check inside
+  `trace_log.py`).
 - ~~Build the doc frame~~ **Done** — see §2.5 and §4.
-- Build the dedicated call-stack/timing frame (direction depends on §4).
-- Unify the duplicated trace-parsing logic (§3) — likely by having the
-  viewer's client-side parser be the only implementation, with the CLI's
-  `trace` subcommand becoming a thin wrapper that shells out to it via a
-  headless JS runner, or vice versa; needs a decision, not just an
-  implementation.
+- Build the dedicated call-stack/timing frame — see §4's proposal (a flame
+  graph as a second view mode on the existing sidebar list, reusing
+  `traceData`/`stepTo`, plus a small extension to record each span's start
+  offset). Not yet built.
+- ~~Unify the duplicated trace-parsing logic~~ **Done, see §3**: not by
+  eliminating one of the two implementations, but by making the server
+  round trip (`/__codemap_parse_trace` -> `trace_log.py`) the one real
+  implementation `codemap run`/`serve` always use, and demoting the
+  viewer's own JS parser to an explicit, documented fallback for when
+  there's no server to ask — a decision that was made, not left open; this
+  entry used to describe it as still needing one.
 
 ## 6. Points of improvement (non-blocking)
 
-- Edge-type richness: today every MIR-derived edge is generically typed
-  `"call"`. The viewer already supports styling `dispatch` / `loop_call` /
-  `trampoline` differently if the generator is later extended to emit them
-  (dyn-dispatch edges are the obvious first candidate for a `dispatch` type
-  instead of plain `call`).
+- ~~Edge-type richness~~ **Explicitly deprioritized, not forgotten.** Today
+  every MIR-derived edge is generically typed `"call"`. The viewer already
+  supports styling `dispatch` / `loop_call` / `trampoline` differently if
+  the generator is later extended to emit them (dyn-dispatch edges are the
+  obvious first candidate for a `dispatch` type instead of plain `call`) —
+  left alone for now by explicit request, not because the idea was
+  rejected. Revisit only if it comes back up.
 - Multi-run trace coverage: a single trace only exercises the branches its
   input happened to take. A node's `traced` flag is already run-independent
   (§2.1), but for *edges*/branch coverage specifically, an optional "union

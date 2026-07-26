@@ -26,6 +26,26 @@ Subcommands:
           the old "Load graph.../Load doc index..." file-picker fallback
           was removed once auto-load made it redundant for the case it
           existed for.
+  selfcheck
+          A MIR-format "canary": builds the graph for a known fixture
+          (default: ../dummy-cli, a sibling of this repo -- see
+          CLAUDE.md/PROJECT.md §2.7) and asserts a fixed set of structural
+          facts about it (specific nodes, edges, a traced flag, a call
+          order) that are already known true today. mir_graph.py depends
+          entirely on rustc's MIR pretty-printer output staying in the same
+          *shape* release to release -- nothing here guarantees that, and a
+          future rustc that reformats it would otherwise fail silently (a
+          near-empty graph for a real user's real crate, no error at all).
+          This exists to fail loudly and specifically instead, run any time
+          after a toolchain upgrade (see PROJECT.md §4, "MIR as the only
+          extraction source").
+  validate-trace
+          Checks a real trace.jsonl, line by line, against
+          codemap/schema/trace-{entry,close}.schema.json -- the written-
+          down version of README.md's "Tracing log format" contract (see
+          PROJECT.md §4). Useful both as this project's own fixture-
+          validation test and as a real diagnostic for "does my own
+          trace file actually match the mandated format".
 
 `graph`/`doc` write into `<target crate>/target/rust-codemap/<crate_name>/`
 by default -- next to cargo's own build output, never into this repo, and
@@ -49,7 +69,7 @@ import webbrowser
 from pathlib import Path
 from types import SimpleNamespace
 
-from . import mir_graph, doc_index, trace_log
+from . import mir_graph, doc_index, trace_log, schema_check
 
 
 def cargo_metadata(manifest: Path) -> dict:
@@ -246,27 +266,30 @@ def cmd_graph(args) -> Path:
     )
 
     deps_dir = target_dir / "debug" / "deps"
-    mir_texts = []
+    crate_texts = {}
     for pkg_name, cname in members:
         mir_path = find_mir_file(deps_dir, cname)
         if mir_path is None:
             print(f"  WARNING: no .mir found for {pkg_name} ({cname}) -- skipping")
             continue
         print(f"  {pkg_name}: {mir_path.name} ({mir_path.stat().st_size // 1024} KB)")
-        mir_texts.append(mir_path.read_text(encoding="utf-8", errors="ignore"))
-    if not mir_texts:
+        crate_texts[cname] = mir_path.read_text(encoding="utf-8", errors="ignore")
+    if not crate_texts:
         sys.exit(f"ERROR: no .mir file found for any dependency-closure member under {deps_dir}")
 
-    # A single combined text: parse_mir just scans lines, so concatenating
-    # every member's MIR and parsing once naturally merges nodes/edges
-    # across crates (including cross-crate calls, once resolvable) with no
-    # separate "merge N graphs" step needed.
+    # Each crate's MIR is parsed on its own (not concatenated into one
+    # blob) so every node id can be qualified with the crate that actually
+    # defines it (`crate::Type::method`, `crate::free_fn`) -- otherwise two
+    # different crates defining the same free function or Type::method
+    # pair silently merge into a single graph node (see PROJECT.md §4,
+    # "cross-crate node-id collision"). Cross-crate call targets are then
+    # resolved against every crate's own ids at once in `merge_crates`.
     vendor_dirs = find_vendor_dirs(manifest)
-    graph = mir_graph.build_graph("\n".join(mir_texts), vendor_dirs)
+    graph = mir_graph.build_graph(crate_texts, extra_external_markers=vendor_dirs)
     write_json(out_path, graph)
     traced = sum(1 for n in graph["nodes"] if n["data"]["traced"])
     print(f"OK {out_path}  ({len(graph['nodes'])} nodes, {len(graph['edges'])} edges, "
-          f"{traced} traced, {len(mir_texts)} crate(s) merged)")
+          f"{traced} traced, {len(crate_texts)} crate(s) merged)")
     return out_path
 
 
@@ -284,12 +307,13 @@ def cmd_doc(args) -> Path:
     # (which could include unrelated siblings or client binaries), or
     # cross-references for those crates' items would silently come up empty.
     packages = local_dependency_closure(manifest)
-    print("Running cargo doc --no-deps ...")
-    subprocess.run(
-        ["cargo", "doc", "--no-deps", "--manifest-path", str(manifest),
-         *[a for pkg in packages for a in ("-p", pkg["name"])]],
-        check=True,
-    )
+    include_private = getattr(args, "include_private", False)
+    doc_cmd = ["cargo", "doc", "--no-deps", "--manifest-path", str(manifest),
+               *[a for pkg in packages for a in ("-p", pkg["name"])]]
+    if include_private:
+        doc_cmd.append("--document-private-items")
+    print(f"Running cargo doc --no-deps{' --document-private-items' if include_private else ''} ...")
+    subprocess.run(doc_cmd, check=True)
 
     crates = []
     for pkg in packages:
@@ -306,8 +330,119 @@ def cmd_doc(args) -> Path:
 
     index = doc_index.build_index(crates, graph)
     write_json(out_path, index)
-    print(f"OK {out_path}  ({len(index)} entries, {len(crates)} crate(s) cross-referenced)")
+    private_count = sum(1 for e in index.values() if not e["public"])
+    print(f"OK {out_path}  ({len(index)} entries, {private_count} private, "
+          f"{len(crates)} crate(s) cross-referenced)")
     return out_path
+
+
+# ── selfcheck ────────────────────────────────────────────────────────────
+
+def cmd_selfcheck(args) -> bool:
+    """See the module docstring's "selfcheck" entry. Each check name below
+    is a plain description of one structural fact, chosen to sample every
+    distinct MIR shape mir_graph.py's regexes depend on (a bare free fn, a
+    module-qualified one, an impl method, a cross-crate call resolved via
+    an explicit hint, one resolved via the no-hint fallback search, a
+    dyn-dispatch fan-out, generic turbofish stripping, self-recursion, the
+    `Callsite` traced-flag detection, call_order renumbering, and the
+    cross-crate node-id collision fix itself) -- not just "does *a* graph
+    come out", which a badly-broken parser could still trivially satisfy
+    with zero real nodes extracted."""
+    graph_path = cmd_graph(SimpleNamespace(project=args.project, out=None))
+    graph = json.loads(graph_path.read_text(encoding="utf-8"))
+    node_ids = {n["data"]["id"] for n in graph["nodes"]}
+    edges = {(e["data"]["source"], e["data"]["target"]) for e in graph["edges"]}
+    traced_ids = {n["data"]["id"] for n in graph["nodes"] if n["data"]["traced"]}
+    call_orders_by_source = {}
+    for e in graph["edges"]:
+        call_orders_by_source.setdefault(e["data"]["source"], set()).add(e["data"]["callOrder"])
+
+    checks = [
+        ("bare free fn (RE_FREE_FN, no module prefix)", "dcore::add" in node_ids),
+        ("impl method (RE_IMPL_SELF)", "dapi::Report::generate" in node_ids),
+        ("cross-crate call, MIR gave an explicit crate hint",
+         ("dapi::Report::generate", "dcore::add") in edges),
+        ("cross-crate call, MIR omitted the crate qualifier (no-hint fallback)",
+         ("dapi::free_helper", "dops::double") in edges),
+        ("dyn-dispatch fan-out (2 crates implement the same trait method)",
+         ("dops::sum_via_trait", "dops::Batch::total") in edges and
+         ("dops::sum_via_trait", "dcore::Pair::total") in edges),
+        ("generic turbofish stripped back to one node",
+         ("dcore::use_generic_twice", "dcore::generic_max") in edges),
+        ("self-recursion produces a real self-edge",
+         ("dcore::factorial", "dcore::factorial") in edges),
+        ("#[instrument]'s Callsite scaffolding sets traced=true",
+         len(traced_ids) > 0),
+        ("call_order restarts at 1 per caller (not inflated by tracing's own noise calls)",
+         any(1 in orders for orders in call_orders_by_source.values())),
+        ("cross-crate node-id collision: two distinct Item::describe nodes",
+         "dcore::Item::describe" in node_ids and "dapi::Item::describe" in node_ids and
+         "dcore::Item::describe" != "dapi::Item::describe"),
+    ]
+
+    print(f"MIR-format canary against {args.project} ({len(node_ids)} nodes, {len(edges)} edges):")
+    all_ok = True
+    for label, ok in checks:
+        print(f"  {'OK' if ok else 'FAIL'}  {label}")
+        all_ok = all_ok and ok
+    if not all_ok:
+        print("\nOne or more checks failed. If nothing in codemap/ or the dummy-cli/"
+              "dummy-lib fixtures changed recently, this likely means the installed "
+              "rustc's MIR pretty-printer output changed shape -- see PROJECT.md §4, "
+              "\"MIR as the only extraction source\".")
+    return all_ok
+
+
+# ── validate-trace ───────────────────────────────────────────────────────
+
+_SCHEMA_DIR = Path(__file__).parent / "schema"
+
+
+def cmd_validate_trace(args) -> bool:
+    """Checks a real trace.jsonl against the two schemas in codemap/schema/
+    (see PROJECT.md §4, "Trace-format schema") -- one line at a time, since
+    each line is independently either an entry or a close event, not one
+    schema for the whole file. Doubles as this project's fixture-validation
+    test for that schema (deliberately not per-line runtime validation
+    inside trace_log.py itself -- see the schema files' own docstrings for
+    why): run against the dummy-cli fixture's own trace.jsonl any time
+    either the schema or the format itself changes, to catch drift between
+    what the schema says and what a real trace actually looks like."""
+    entry_schema = json.loads((_SCHEMA_DIR / "trace-entry.schema.json").read_text(encoding="utf-8"))
+    close_schema = json.loads((_SCHEMA_DIR / "trace-close.schema.json").read_text(encoding="utf-8"))
+
+    path = Path(args.trace)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    total = 0
+    all_ok = True
+    for i, line in enumerate(lines, start=1):
+        line = line.strip()
+        if not line:
+            continue
+        total += 1
+        try:
+            obj = json.loads(line)
+        except ValueError as exc:
+            print(f"line {i}: not valid JSON ({exc})")
+            all_ok = False
+            continue
+        message = obj.get("fields", {}).get("message")
+        if message == "new":
+            errors = schema_check.validate(obj, entry_schema)
+        elif message == "close":
+            errors = schema_check.validate(obj, close_schema)
+        else:
+            errors = [f"$.fields.message: expected \"new\" or \"close\", got {message!r} -- "
+                      f"not a shape either schema covers"]
+        if errors:
+            all_ok = False
+            print(f"line {i}: {len(errors)} error(s)")
+            for e in errors:
+                print(f"  {e}")
+    verdict = "OK" if all_ok else "FAILED"
+    print(f"{verdict}: {total} line(s) checked against codemap/schema/trace-{{entry,close}}.schema.json")
+    return all_ok
 
 
 # ── serve ────────────────────────────────────────────────────────────────
@@ -392,7 +527,12 @@ class LoggingHandler(http.server.SimpleHTTPRequestHandler):
         # can happen at all: that needs reading the target project's own
         # .rs files directly, which only this server process (running
         # locally alongside the project) can do -- the browser can't reach
-        # an arbitrary path on disk just because it knows one.
+        # an arbitrary path on disk just because it knows one. graph.json is
+        # loaded fresh here too, purely to tell a looping call apart from
+        # several genuinely different call sites of the same callee (see
+        # trace_log.parse_trace's own docstring) -- unrelated to the file
+        # reads above, this one's just "does the caller have more than one
+        # edge to this callee."
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
         source_index = None
@@ -401,8 +541,14 @@ class LoggingHandler(http.server.SimpleHTTPRequestHandler):
                 source_index = json.loads(Path(self.doc_path).read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 pass  # no source_index.json (yet) -- span/node matching just falls back to name-only
+        graph = None
+        if self.graph_path:
+            try:
+                graph = json.loads(Path(self.graph_path).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pass  # no graph.json (yet) -- repeated calls to the same callee just aggregate as one entry
         try:
-            spans = trace_log.parse_trace(body.decode("utf-8", errors="replace"), source_index)
+            spans = trace_log.parse_trace(body.decode("utf-8", errors="replace"), source_index, graph)
             response = json.dumps({"spans": spans}).encode("utf-8")
         except Exception as exc:
             self.send_response(500)
@@ -451,7 +597,8 @@ def cmd_serve(args):
 def cmd_run(args):
     manifest = require_manifest(args.project)
     graph_path = cmd_graph(SimpleNamespace(project=args.project, out=None))
-    doc_path = cmd_doc(SimpleNamespace(project=args.project, graph=None, out=None))
+    doc_path = cmd_doc(SimpleNamespace(project=args.project, graph=None, out=None,
+                                        include_private=args.include_private))
     docs_root = Path(cargo_metadata(manifest)["target_directory"]) / "doc"
 
     print()
@@ -485,6 +632,10 @@ def main():
     r.add_argument("--project", required=True, help="Path to the target crate (dir containing Cargo.toml)")
     r.add_argument("--port", type=int, default=8787)
     r.add_argument("--no-browser", action="store_true", help="Don't automatically open a browser tab")
+    r.add_argument("--include-private", action="store_true",
+                   help="Also document private (non-pub) items -- passes --document-private-items to "
+                        "cargo doc. Off by default: real cost (more HTML pages to render and scan) "
+                        "scaling with how many private items exist -- see PROJECT.md §4.")
     r.set_defaults(func=cmd_run)
 
     g = sub.add_parser("graph", help="Generate the call-graph for a target crate and its whole workspace")
@@ -496,6 +647,10 @@ def main():
     d.add_argument("--project", required=True, help="Path to the target crate (dir containing Cargo.toml)")
     d.add_argument("--graph", default=None, help="graph.json to cross-reference against (default: <target>/rust-codemap/<crate>/graph.json)")
     d.add_argument("--out", default=None, help="Where to write source_index.json (default: <target>/rust-codemap/<crate>/source_index.json)")
+    d.add_argument("--include-private", action="store_true",
+                   help="Also document private (non-pub) items -- passes --document-private-items to "
+                        "cargo doc. Off by default: real cost (more HTML pages to render and scan) "
+                        "scaling with how many private items exist -- see PROJECT.md §4.")
     d.set_defaults(func=cmd_doc)
 
     s = sub.add_parser("serve", help="Serve the viewer directory over HTTP")
@@ -509,8 +664,20 @@ def main():
     s.add_argument("--port", type=int, default=8787)
     s.set_defaults(func=cmd_serve)
 
+    c = sub.add_parser("selfcheck", help="MIR-format canary: build the known fixture's graph, "
+                                          "assert it still looks the way it's supposed to")
+    c.add_argument("--project", default="../dummy-cli",
+                    help="Path to the fixture crate to check (default: ../dummy-cli, a sibling of this repo)")
+    c.set_defaults(func=cmd_selfcheck)
+
+    v = sub.add_parser("validate-trace", help="Check a trace.jsonl against the written trace-format schema")
+    v.add_argument("trace", help="Path to the trace.jsonl file to validate")
+    v.set_defaults(func=cmd_validate_trace)
+
     args = ap.parse_args()
-    args.func(args)
+    result = args.func(args)
+    if result is False:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

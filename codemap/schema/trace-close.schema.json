@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/rust-codemap/trace-close.schema.json",
+  "title": "rust-codemap trace close event",
+  "description": "One JSON-Lines record for a span's own CLOSE event -- structurally identical to trace-entry.schema.json except for `fields` (a fixed \"close\" marker plus the two duration strings tracing_subscriber adds) -- emitted once, when that span exits. See trace-entry.schema.json's own description for why there is no 'formatVersion' field.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["timestamp", "level", "fields", "target", "filename", "line_number", "span", "spans"],
+  "properties": {
+    "timestamp": { "type": "string" },
+    "level": { "type": "string" },
+    "fields": {
+      "type": "object",
+      "description": "Fixed \"close\" marker plus the two duration strings tracing_subscriber's FmtSpan::CLOSE adds on its own -- distinct from an entry event's fields, which are always just {\"message\": \"new\"}.",
+      "required": ["message", "time.busy"],
+      "additionalProperties": false,
+      "properties": {
+        "message": { "const": "close" },
+        "time.busy": {
+          "type": "string",
+          "pattern": "^[0-9]+(\\.[0-9]+)?\\s*(ns|[\\u00b5u]s|ms|s)$",
+          "description": "How long this specific occurrence of the span was actually executing, as a human-readable duration string (\"1.23ms\", \"450\\u00b5s\"/\"450us\", \"2.1s\", \"900ns\"). This is what trace_log.py's iteration count and per-call duration come from -- see parse_duration()."
+        },
+        "time.idle": {
+          "type": "string",
+          "pattern": "^[0-9]+(\\.[0-9]+)?\\s*(ns|[\\u00b5u]s|ms|s)$",
+          "description": "How long the span existed but wasn't the active one (e.g. while a child span was running instead). Always present in real output but not read by trace_log.py today -- documented for completeness."
+        }
+      }
+    },
+    "target": { "type": "string" },
+    "filename": {
+      "type": "string",
+      "description": "Same field, same meaning, as trace-entry.schema.json's filename -- a close event carries the same location its own entry event did."
+    },
+    "line_number": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "span": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" }
+      }
+    },
+    "spans": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" }
+        }
+      }
+    }
+  }
+}

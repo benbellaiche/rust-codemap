@@ -491,6 +491,9 @@
             <button id="btn-untraced">Hide untraced</button>
         </div>
         <div class="cfg-group">
+            <button id="btn-private" style="display:none">Show private</button>
+        </div>
+        <div class="cfg-group">
             <label>Play step</label>
             <input type="range" id="cfg-play" min="200" max="2000" step="50" value="700">
             <span class="cfg-val" id="cfg-play-val">700 ms</span>
@@ -686,9 +689,36 @@
         // size (label-driven, already resolved by this point) is used for
         // spacing rather than a guessed constant, so nodes with long names
         // don't overlap their neighbors.
+        // A binary's entry point is always a free fn literally named
+        // `main` -- since node ids are now crate-qualified
+        // (`crate::name`), that's `<crate>::main`, not the bare `main` a
+        // pre-crate-qualification graph would have had. There is at most
+        // one such node in a real dependency closure (only the target
+        // binary itself would have one; its local dependencies are always
+        // libraries). Falls back to the bare literal for safety, though a
+        // freshly generated graph.json never has one.
+        // `fn main` is Rust's own mandated entry-point name for a binary --
+        // not a project-specific assumption, so treating it specially
+        // (always-visible below, root-of-layout here) doesn't violate
+        // "zero mapping". Only ever matches a genuine `crate::main` (or, as
+        // a defensive fallback, a bare `main` if an older/unqualified graph
+        // is somehow loaded) -- never fires for a library-only graph
+        // (no such node exists there at all) or an embedded/`#![no_main]`
+        // binary (no literal `fn main` either); both already fall back to
+        // Cytoscape's own auto-detected roots exactly as before.
+        function isMainId(id) {
+            return id.endsWith('::main') || id === 'main';
+        }
+
+        function mainNodeId(nodesInComp) {
+            const found = nodesInComp.filter(n => isMainId(n.id()));
+            return found.length ? found[0].id() : 'main';
+        }
+
         function layoutAsLevelGrid(comp, nodesInComp) {
-            let rootNodes = nodesInComp.some(n => n.id() === 'main')
-                ? nodesInComp.filter(n => n.id() === 'main')
+            const mainId = mainNodeId(nodesInComp);
+            let rootNodes = nodesInComp.some(n => n.id() === mainId)
+                ? nodesInComp.filter(n => n.id() === mainId)
                 : nodesInComp.filter(n => n.indegree(true) === 0);
             if (!rootNodes.length) {
                 // A fully cyclic component (mutual recursion, no function in
@@ -990,12 +1020,33 @@
             // A node with traced===false never produces a span, on any input — it
             // may be intentional (e.g. a function that runs before tracing is set
             // up) or simply a real function someone forgot to instrument.
-            cy.nodes().each(n => { if (n.data('traced') === false) n.addClass('untraced'); });
-            // Hidden by default -- UNLESS that would hide every single node
-            // (e.g. a tiny binary whose main() has no #[instrument] at all).
-            // An empty canvas with no indication of why is worse than just
-            // showing the untraced nodes in that case.
-            const noTracedNodesAtAll = cy.nodes().length > 0 && cy.nodes('.untraced').length === cy.nodes().length;
+            // `main` is exempted from this even though it's genuinely
+            // traced===false in the data (mir_graph.py's own "traced" field
+            // keeps its accurate structural meaning either way -- this is a
+            // presentation-layer exception, not a data one): unlike an
+            // ordinary function, main can't usefully be #[instrument]'d at
+            // all (the span would start before tracing_subscriber::init()
+            // -- called from inside main's own body -- has even run), so
+            // its untraced status is a structural certainty, not a sign of
+            // a function someone forgot to instrument. Hiding it by default
+            // made every one of its outgoing calls look disconnected
+            // (an edge stays hidden if either endpoint is) -- confirmed
+            // reported against this exact fixture, where main's own calls
+            // to make_and_describe looked like dangling, caller-less nodes.
+            cy.nodes().each(n => { if (n.data('traced') === false && !isMainId(n.id())) n.addClass('untraced'); });
+            // Hidden by default -- UNLESS that would hide every single
+            // non-main node (e.g. a tiny binary with no #[instrument]
+            // anywhere at all besides main, which is never taggable
+            // .untraced to begin with -- see above). An empty canvas with
+            // no indication of why is worse than just showing the untraced
+            // nodes in that case. Excludes main from both sides of this
+            // comparison, or a real binary with zero instrumented functions
+            // would show only main with none of its calls (each one hidden,
+            // since main itself is the only thing keeping them off
+            // .untraced -- an equally uninformative near-empty canvas this
+            // escape hatch exists specifically to avoid).
+            const nonMainCount = cy.nodes().length - cy.nodes().filter(n => isMainId(n.id())).length;
+            const noTracedNodesAtAll = nonMainCount > 0 && cy.nodes('.untraced').length === nonMainCount;
             applyUntracedVisibility(noTracedNodesAtAll);
             buildLegend();
             cy.on('tap', 'node', e => {
@@ -1076,7 +1127,12 @@
                 div.innerHTML = `<div class="arr" style="${style}"></div> ${meta.label}`;
                 container.appendChild(div);
             });
-            const hasUntraced = cy.nodes().some(n => n.data('traced') === false);
+            // Checks the `.untraced` class, not the raw `traced` data field
+            // directly -- `main` is traced===false too but is exempted from
+            // the class (see initCy), so it must stay exempted from the
+            // legend swatch as well: the legend should reflect what can
+            // actually render dashed-grey/be hidden, not the raw data.
+            const hasUntraced = cy.nodes('.untraced').length > 0;
             document.getElementById('legend-untraced').style.display = hasUntraced ? '' : 'none';
         }
         // Wrap identifiers in a signature with a clickable span, but only when
@@ -1101,9 +1157,15 @@
             return `<a href="${url}" target="_blank" style="color:#89b4fa;font-weight:bold">${id}</a>`;
         }
 
-        function buildInfoHtml(nodeId, nodeData, spanData) {
-            const src = sourceIndex[nodeId] || {};
-            let h = docLinkHtml(nodeId);
+        // Doc link + signature + source-file link -- the part that's
+        // meaningful for ANY sourceIndex entry, whether or not it's also a
+        // call-graph node (a bare struct/enum/trait never is; only its own
+        // methods are -- see focusOnNode's "not a node in the loaded
+        // graph" branch, which reuses this instead of only ever showing
+        // the bare doc-page link it used to).
+        function docEntryHtml(id, nodeData) {
+            const src = sourceIndex[id] || {};
+            let h = docLinkHtml(id);
             if (nodeData && nodeData.traitImpl) h += ` <span style="color:#fab387;font-size:10px">impl ${nodeData.traitImpl}</span>`;
             if (src.signature) h += `<br><code style="color:#cdd6f4;font-size:10px;word-break:break-all">${linkifySignature(src.signature)}</code>`;
             if (src.file && src.line) {
@@ -1114,6 +1176,12 @@
                     h += `<br><span style="color:#6c7086;font-size:10px">&#128194; ${src.file} : ${src.line}</span>`;
                 }
             }
+            return h;
+        }
+
+        function buildInfoHtml(nodeId, nodeData, spanData) {
+            const src = sourceIndex[nodeId] || {};
+            let h = docEntryHtml(nodeId, nodeData);
             if (spanData) {
                 h += `<hr style="border-color:#313244;margin:4px 0">`;
                 h += `<span style="color:#6c7086;font-size:10px">${spanData.duration_ms}ms`;
@@ -1241,12 +1309,14 @@
         // native `cargo doc` page in the frame below the list.
         // Grouped by crate, then by class/type -- both come straight from
         // doc_index.py's output (`crate`/`kind` fields), no new mapping: a
-        // method's class is the `Type` half of its `Type::method` id, a
-        // free fn has no class, and a type's own entry (struct/enum/trait)
-        // acts as its own class heading, which is why its methods land
-        // right under it.
+        // method's class is the `Type` segment of its now crate-qualified
+        // `crate::Type::method` id (index 1, not 0 -- index 0 is the crate,
+        // already its own separate grouping level above this), a free fn
+        // has no class, and a type's own entry (struct/enum/trait) acts as
+        // its own class heading, which is why its methods land right
+        // under it.
         function classKeyFor(id, entry) {
-            if (entry.kind === 'method') return id.split('::')[0];
+            if (entry.kind === 'method') return id.split('::')[1];
             if (entry.kind === 'fn') return '(free functions)';
             return id;
         }
@@ -1290,8 +1360,18 @@
                         `<span class="doc-toggle"></span>${classKey}</div>`;
                     classes[classKey].sort().forEach(id => {
                         const entry = sourceIndex[id];
-                        const label = entry.kind === 'method' ? id.split('::').slice(1).join('::') : id;
-                        html += `<div class="doc-item" data-id="${id}" data-crate="${crateKey}" data-class="${classId}">${label}</div>`;
+                        // Strip both the crate segment and the class heading
+                        // (already shown right above) from the label, leaving
+                        // just the bare method name -- was `slice(1)` back when
+                        // ids were plain `Type::method`; now `crate::Type::method`.
+                        const label = entry.kind === 'method' ? id.split('::').slice(2).join('::') : id;
+                        // entry.public is missing (undefined) on an older
+                        // source_index.json generated before this field
+                        // existed -- treat that the same as public (`!==
+                        // 'false'` below), never hide something we can't
+                        // actually classify as private.
+                        html += `<div class="doc-item" data-id="${id}" data-crate="${crateKey}" data-class="${classId}" ` +
+                            `data-public="${entry.public !== false}">${label}</div>`;
                     });
                 });
             });
@@ -1305,11 +1385,35 @@
             listEl.querySelectorAll('.doc-item').forEach(el => {
                 el.addEventListener('click', () => focusOnNode(el.dataset.id));
             });
+            // Only worth showing the toggle at all if there's actually
+            // something it would affect -- e.g. `codemap doc` was run
+            // without `--include-private`, so no private item has a page
+            // to have been indexed from in the first place; a permanently
+            // inert button is just clutter in that (today's default) case.
+            // Excludes `main` from this count too -- it's always shown
+            // regardless of the toggle (see updateDocListVisibility), so
+            // its own private status alone shouldn't be what makes the
+            // button appear.
+            const hasPrivate = ids.some(id => sourceIndex[id].public === false && !isMainId(id));
+            document.getElementById('btn-private').style.display = hasPrivate ? '' : 'none';
             updateDocListVisibility();
         }
 
         function toggleDocCollapse(set, key) {
             if (set.has(key)) set.delete(key); else set.add(key);
+            updateDocListVisibility();
+        }
+
+        // Hidden by default, same reasoning as "Hide untraced": a private
+        // item is real information, but noisier than most people want by
+        // default, and this only ever has anything to show when `codemap
+        // doc --include-private` was actually used (see renderDocList's
+        // own visibility check on the button itself).
+        let showPrivate = false;
+        function applyPrivateVisibility(show) {
+            showPrivate = show;
+            document.getElementById('btn-private').textContent = show ? 'Hide private' : 'Show private';
+            document.getElementById('btn-private').classList.toggle('active', show);
             updateDocListVisibility();
         }
 
@@ -1325,7 +1429,22 @@
             const items = Array.from(listEl.querySelectorAll('.doc-item'));
             const classHasMatch = {}, crateHasMatch = {};
             items.forEach(el => {
-                const match = el.dataset.id.toLowerCase().includes(q);
+                // A private item additionally needs showPrivate on to ever
+                // count as a match -- folded into `match` itself (not a
+                // separate pass) so it cascades the exact same way the
+                // search filter already does: a class/crate with only
+                // private entries correctly disappears too while
+                // showPrivate is off, not just the items themselves.
+                // `main` is exempted here too, same reasoning as its
+                // .untraced exemption in initCy: it's genuinely only
+                // pub(crate)-visible (a binary has no external API at
+                // all), so `_is_public` in doc_index.py correctly flags
+                // it as not-public -- but that's not "someone marked this
+                // helper private", it's structural for every binary, and
+                // hiding it behind a toggle meant for filtering out real
+                // private helpers isn't the same case.
+                const match = el.dataset.id.toLowerCase().includes(q) &&
+                    (showPrivate || el.dataset.public !== 'false' || isMainId(el.dataset.id));
                 el.dataset.match = match ? '1' : '0';
                 if (match) { classHasMatch[el.dataset.class] = true; crateHasMatch[el.dataset.crate] = true; }
             });
@@ -1534,13 +1653,18 @@
             }
             const node = cy.getElementById(id);
             if (!node.length) {
-                // Still worth a clickable doc link even with no graph node --
-                // a bare struct/enum/trait entry's own doc page exists, it's
-                // just not something the call graph could ever have a node
-                // for (only its *methods* are call-graph nodes).
+                // Still worth showing the doc link, signature, AND the
+                // source-file link even with no graph node -- a bare
+                // struct/enum/trait entry's own doc page (and source
+                // location) exists regardless, it's just not something the
+                // call graph could ever have a node for (only its own
+                // *methods* are call-graph nodes). Previously only
+                // docLinkHtml(id) showed here, silently dropping the
+                // signature/source-link docEntryHtml() also has.
                 document.getElementById('info').innerHTML =
-                    `${docLinkHtml(id)} has documentation but is not a node in the loaded graph ` +
-                    `(never calls anything traceable, or isn't in this graph's dependency closure).`;
+                    `${docEntryHtml(id)}<br><span style="color:#6c7086;font-size:10px">` +
+                    `has documentation but is not a node in the loaded graph ` +
+                    `(never calls anything traceable, or isn't in this graph's dependency closure).</span>`;
                 logToServer('focusOnNode', `${id}: no matching node in loaded graph`);
                 return;
             }
@@ -1687,7 +1811,19 @@
                 const loopCurEdges = [];
                 for (let j = 1; j < fullPath.length; j++) {
                     const src = fullPath[j - 1], tgt = fullPath[j];
-                    const e = cy.edges().filter(ed => ed.data('source') === src && ed.data('target') === tgt);
+                    let e = cy.edges().filter(ed => ed.data('source') === src && ed.data('target') === tgt);
+                    // The last hop (this span's own immediate call, not an
+                    // earlier ancestor's) is the only one trace_log.py
+                    // resolved a specific callOrder for -- when the caller
+                    // has more than one static call site to this callee
+                    // (see parse_trace's docstring), narrow down to the one
+                    // this span was actually attributed to instead of
+                    // coloring every parallel edge between the same two
+                    // nodes identically.
+                    if (j === fullPath.length - 1 && span.callOrder != null && e.length > 1) {
+                        const specific = e.filter(ed => ed.data('callOrder') === span.callOrder);
+                        if (specific.length) e = specific;
+                    }
                     if (!e.length) continue;
                     if (e.data('edgeType') === 'loop_call') {
                         if (isCur) {
@@ -1904,7 +2040,7 @@
         // Triggered by an extra "Step >" click once the trace is fully played.
         function finishTraceToRoot() {
             const last = traceData[traceIdx];
-            const rp = computeReturnPath(last, { name: 'main', stack: [] });
+            const rp = computeReturnPath(last, { name: mainNodeId(cy.nodes()), stack: [] });
             const settle = () => {
                 for (let i = 0; i < rp.length - 1; i++) {
                     const child = rp[i], parent = rp[i + 1];
@@ -1981,6 +2117,7 @@
         });
 
         document.getElementById('btn-untraced').addEventListener('click', () => applyUntracedVisibility(!showUntraced));
+        document.getElementById('btn-private').addEventListener('click', () => applyPrivateVisibility(!showPrivate));
 
         document.getElementById('btn-relayout').addEventListener('click', () => {
             if (!cy) return;
