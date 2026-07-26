@@ -338,6 +338,27 @@ being fixed. Any future change to this file should keep resolving from the
 live open-span stack, not from `entry["spans"]`'s own text, for the same
 reason.
 
+Line classification is a real three-way split, not two: CLOSE
+(`"time.busy" in fields`), NEW (`fields.message == "new"`), and EVENT
+(anything else — a plain `tracing::event!`/`info!`/... call from inside an
+instrumented function's own body, see PROJECT.md §2.10 and
+`codemap/schema/trace-event.schema.json`). An EVENT's own `span` field
+reports its *enclosing* span's identity, not one of its own — before this
+was recognized as a distinct case, an event line fell into the NEW branch
+by mistake and pushed that enclosing name onto `open_stack` a second time,
+permanently corrupting every subsequent span's depth/ancestor chain (only
+the real CLOSE ever pops). `open_stack` holds `(name, callOrder)` pairs,
+not bare names, specifically so an EVENT can look up its enclosing span's
+exact dedup key directly — CLOSE reads its own callOrder the same way now
+too, instead of recomputing it via a second counter. `time.busy` (never
+`time.idle`) is the only duration value read anywhere in this file or the
+viewer — confirmed directly (a scratch crate with a deliberate
+`std::thread::sleep()` and zero real CPU work still reports the whole
+sleep as `time.busy`) that this is wall-clock "was the span entered" time,
+not a CPU-usage/CPU-wait split; don't introduce `time.idle` anywhere on
+the assumption it means "waiting," it doesn't distinguish that from
+ordinary tracing/logging overhead in synchronous code.
+
 ### `viewer/index.html` — the pieces that aren't obvious from a skim
 
 - "Load graph…" / "Load doc index…" / "Load trace…" are plain
@@ -355,7 +376,24 @@ reason.
   `graph.json` data attributes; the legend is built dynamically from
   whatever states/edge-types are actually present in the loaded graph (see
   `buildLegend()`) rather than being a fixed list — keep it that way when
-  adding new visual states.
+  adding new visual states. The legend itself lives in `#legend-panel`, a
+  toolbar-triggered popover (`#btn-legend`, same `position: fixed` +
+  `.open`-class toggle `#log-panel` already uses) — not a permanent
+  sidebar block anymore (PROJECT.md §2.10), freeing that space for
+  Execution Trace + the newer `#exec-context` panel below it.
+- `#info` (left sidebar) is purely static now — doc link, signature,
+  source link, doc comment, via `docEntryHtml()`/`buildInfoHtml()`,
+  regardless of whether a trace is loaded. Anything about the *current
+  replay step specifically* (duration, entry arguments, and the two
+  internal-state-capture mechanisms below) renders in `#exec-context`
+  (right sidebar) instead, via `buildExecContextHtml()` — the left/right
+  sidebar split is deliberately "static info" vs. "execution info," not
+  an arbitrary layout choice (PROJECT.md §2.10). A trace entry's
+  `recordedFields` (one snapshot per invocation, from that invocation's
+  own CLOSE — see trace_log.py above) and `events` (a list of
+  `{message, fields}`, one per `tracing::event!`/`info!`/... call, across
+  every invocation, in firing order) are both optional and only rendered
+  when present.
 - Playback (`stepTo`, `playStep`, `computeReturnPath`/`flashReturnPath`) is
   a replay-from-scratch model: `stepTo(idx)` always clears everything and
   rebuilds state for spans `0..idx`, it never mutates incrementally. Stepping

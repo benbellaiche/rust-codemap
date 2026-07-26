@@ -317,6 +317,21 @@
             font-size: 11px
         }
 
+        /* Mirrors #info exactly -- same bounded, scrollable, non-flex
+           block, sitting below the right sidebar's own flex:1 scroll area
+           (#trace-list) the same way #info sits below #doc-list on the
+           left. This is deliberately the ONLY place per-step execution
+           data (duration, captured arguments, recorded/mid-execution
+           values, events) renders now -- see buildExecContextHtml. */
+        #exec-context {
+            padding: 8px 10px;
+            font-size: 11px;
+            color: #a6adc8;
+            min-height: 120px;
+            max-height: 280px;
+            overflow-y: auto
+        }
+
         .type-link {
             color: #94e2d5;
             cursor: pointer;
@@ -453,6 +468,53 @@
         .log-entry.log-error {
             color: #f38ba8
         }
+
+        /* Mirrors #log-panel's own overlay mechanism exactly (position:
+           fixed, display toggled via .open) -- moved out of the right
+           sidebar entirely to free that space for Execution Trace + the
+           new Execution Context panel below it, per the same reasoning
+           #log-panel already established: reference material you check
+           occasionally doesn't need to permanently occupy layout space. */
+        #legend-panel {
+            display: none;
+            position: fixed;
+            top: 50px;
+            right: 10px;
+            width: 220px;
+            max-height: 70vh;
+            background: #11111b;
+            border: 1px solid #313244;
+            border-radius: 6px;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, .4);
+            z-index: 500;
+            flex-direction: column;
+            overflow: hidden
+        }
+
+        #legend-panel.open {
+            display: flex
+        }
+
+        #legend-panel-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 5px 10px;
+            background: #181825;
+            border-bottom: 1px solid #313244;
+            font-size: 11px;
+            color: #6c7086
+        }
+
+        #legend-panel-header button {
+            font-size: 10px;
+            padding: 2px 8px
+        }
+
+        #legend-panel-body {
+            padding: 8px 10px;
+            overflow-y: auto
+        }
     </style>
 </head>
 
@@ -473,7 +535,39 @@
             <button id="btn-load-trace">Load trace&hellip;</button>
             <input type="file" id="trace-file-input" accept=".json,.jsonl,.log,.txt" style="display:none">
             <button id="btn-config">&#9881; Settings</button>
+            <button id="btn-legend">Legend</button>
             <button id="btn-log">Log<span id="log-badge"></span></button>
+        </div>
+    </div>
+    <div id="legend-panel">
+        <div id="legend-panel-header">
+            <span>Legend</span>
+            <button id="btn-legend-close">&times;</button>
+        </div>
+        <div id="legend-panel-body">
+            <div class="leg">
+                <div class="dot" style="background:#89b4fa"></div> fn / method
+            </div>
+            <div class="leg">
+                <div class="dot" style="background:#a6e3a1"></div> visited
+            </div>
+            <div class="leg">
+                <div class="dot" style="background:#f38ba8"></div> current (active step)
+            </div>
+            <div class="leg" id="legend-untraced" style="display:none">
+                <div class="dot" style="background:#45475a;border:1px dashed #6c7086;opacity:.7"></div> untraced
+            </div>
+            <div style="margin-top:6px"></div>
+            <div id="legend-edges"></div>
+            <div class="leg">
+                <div class="arr" style="background:#a6e3a1"></div> visited
+            </div>
+            <div class="leg">
+                <div class="arr" style="background:#f38ba8"></div> current (active step)
+            </div>
+            <div class="leg">
+                <div class="arr" style="background:#f9e2af;height:2px"></div> return
+            </div>
         </div>
     </div>
     <div id="log-panel">
@@ -526,35 +620,13 @@
         <div id="cy"></div>
         <div class="rh" id="rh-right"></div>
         <div id="sidebar">
-            <div class="pt">Legend</div>
-            <div id="legend">
-                <div class="leg">
-                    <div class="dot" style="background:#89b4fa"></div> fn / method
-                </div>
-                <div class="leg">
-                    <div class="dot" style="background:#a6e3a1"></div> visited
-                </div>
-                <div class="leg">
-                    <div class="dot" style="background:#f38ba8"></div> current (active step)
-                </div>
-                <div class="leg" id="legend-untraced" style="display:none">
-                    <div class="dot" style="background:#45475a;border:1px dashed #6c7086;opacity:.7"></div> untraced
-                </div>
-                <div style="margin-top:6px"></div>
-                <div id="legend-edges"></div>
-                <div class="leg">
-                    <div class="arr" style="background:#a6e3a1"></div> visited
-                </div>
-                <div class="leg">
-                    <div class="arr" style="background:#f38ba8"></div> current (active step)
-                </div>
-                <div class="leg">
-                    <div class="arr" style="background:#f9e2af;height:2px"></div> return
-                </div>
-            </div>
             <div class="pt">Execution Trace</div>
             <div id="trace-list">
                 <p style="padding:8px 10px;color:#6c7086;font-size:11px">Click Play to load & animate.</p>
+            </div>
+            <div class="pt">Execution Context</div>
+            <div id="exec-context">
+                <p style="padding:8px 10px;color:#6c7086;font-size:11px">Step through a trace to see its execution context here.</p>
             </div>
         </div>
     </div>
@@ -666,6 +738,10 @@
             document.getElementById('log-panel').classList.toggle('open'));
         document.getElementById('btn-log-close').addEventListener('click', () =>
             document.getElementById('log-panel').classList.remove('open'));
+        document.getElementById('btn-legend').addEventListener('click', () =>
+            document.getElementById('legend-panel').classList.toggle('open'));
+        document.getElementById('btn-legend-close').addEventListener('click', () =>
+            document.getElementById('legend-panel').classList.remove('open'));
         document.getElementById('btn-log-clear').addEventListener('click', () => {
             logEntries.length = 0;
             logErrorCount = 0;
@@ -1179,19 +1255,72 @@
             return h;
         }
 
-        function buildInfoHtml(nodeId, nodeData, spanData) {
+        // Purely static now -- duration/iterations/fields for the current
+        // replay step used to render here too (via a third `spanData`
+        // argument this function no longer takes); moved to the dedicated
+        // #exec-context panel instead (see buildExecContextHtml/stepTo),
+        // so the left sidebar is static info (this node/type, regardless
+        // of whether a trace is even loaded) and the right sidebar is
+        // execution info (what's happening right now in the replay) --
+        // the two were mixed here before, in the one place that's
+        // supposed to stay static.
+        function buildInfoHtml(nodeId, nodeData) {
             const src = sourceIndex[nodeId] || {};
             let h = docEntryHtml(nodeId, nodeData);
-            if (spanData) {
-                h += `<hr style="border-color:#313244;margin:4px 0">`;
-                h += `<span style="color:#6c7086;font-size:10px">${spanData.duration_ms}ms`;
-                if (spanData.iterations > 1) h += ` &nbsp;&#215;${spanData.iterations}`;
-                h += '</span>';
-                const fields = spanData.fields || {};
-                const keys = Object.keys(fields).filter(k => fields[k] !== '');
-                if (keys.length) h += '<br><span style="color:#a6adc8;font-size:10px">' + keys.map(k => `${k}: <b>${String(fields[k]).substring(0, 30)}</b>`).join(' &nbsp;') + '</span>';
-            }
             if (src.docHtml) h += `<hr style="border-color:#313244;margin:4px 0"><div style="font-size:10px;color:#a6adc8;max-height:120px;overflow-y:auto">${src.docHtml}</div>`;
+            return h;
+        }
+
+        // Renders the current replay step's own execution data into
+        // #exec-context -- duration (see trace_log.py: this is always
+        // time.busy, wall-clock time the span was actually executing, not
+        // a CPU-usage metric -- time.idle is never shown here or read
+        // anywhere in this tool), the entry arguments #[instrument]
+        // already captured, and the two optional richer mechanisms (see
+        // README.md's "Optional: capturing a function's own internal
+        // state"): recordedFields (record()'d values, one snapshot per
+        // invocation) and events (event!/info!/... calls, in order,
+        // across every invocation).
+        function fieldsLine(fields) {
+            const keys = Object.keys(fields || {}).filter(k => fields[k] !== '');
+            if (!keys.length) return '';
+            return keys.map(k => `${k}: <b>${String(fields[k]).substring(0, 40)}</b>`).join(' &nbsp;');
+        }
+
+        function buildExecContextHtml(span) {
+            let h = `<b style="color:#89b4fa">${span.name}</b>`;
+            h += `<br><span style="color:#6c7086">${span.duration_ms}ms`;
+            if (span.iterations > 1) h += ` &nbsp;&#215;${span.iterations}`;
+            h += '</span>';
+
+            const argsLine = fieldsLine(span.fields);
+            if (argsLine) {
+                h += '<div class="pt" style="border:0;padding:6px 0 2px">Arguments</div>' +
+                    `<span style="color:#a6adc8">${argsLine}</span>`;
+            }
+
+            // Only worth its own section when it actually differs from the
+            // entry-time arguments above -- identical unless something was
+            // genuinely record()'d mid-body (see README.md), and showing
+            // the exact same values twice would just be noise.
+            const recorded = (span.recordedFields || [])
+                .filter(r => JSON.stringify(r) !== JSON.stringify(span.fields || {}));
+            if (recorded.length) {
+                h += '<div class="pt" style="border:0;padding:6px 0 2px">Recorded (mid-execution)</div>';
+                recorded.forEach((r, i) => {
+                    const label = recorded.length > 1 ? `<span style="color:#6c7086">#${i + 1}</span> ` : '';
+                    h += `<div style="color:#a6adc8">${label}${fieldsLine(r)}</div>`;
+                });
+            }
+
+            if (span.events && span.events.length) {
+                h += '<div class="pt" style="border:0;padding:6px 0 2px">Events</div>';
+                span.events.forEach(e => {
+                    const rest = fieldsLine(e.fields);
+                    h += `<div style="color:#a6adc8">${e.message}${rest ? ' &mdash; ' + rest : ''}</div>`;
+                });
+            }
+
             return h;
         }
 
@@ -1237,7 +1366,7 @@
 
         function showNodeInfo(node) {
             const d = node.data();
-            document.getElementById('info').innerHTML = buildInfoHtml(d.id, d, null);
+            document.getElementById('info').innerHTML = buildInfoHtml(d.id, d);
         }
 
         // Clicking a linkified type name in a signature shows that type's own
@@ -1246,7 +1375,7 @@
         document.getElementById('info').addEventListener('click', e => {
             const el = e.target.closest('.type-link');
             if (!el) return;
-            document.getElementById('info').innerHTML = buildInfoHtml(el.dataset.type, {}, null);
+            document.getElementById('info').innerHTML = buildInfoHtml(el.dataset.type, {});
         });
 
         // Loading a graph is never tied to a file living next to index.html --
@@ -1261,6 +1390,8 @@
             traceData = []; traceIdx = -1;
             document.getElementById('trace-list').innerHTML =
                 '<p style="padding:8px 10px;color:#6c7086;font-size:11px">Click Play to load & animate.</p>';
+            document.getElementById('exec-context').innerHTML =
+                '<p style="padding:8px 10px;color:#6c7086;font-size:11px">Step through a trace to see its execution context here.</p>';
             document.getElementById('info').innerHTML = 'Click a node for details.';
             const n = g.nodes ? g.nodes.length : 0, ed = g.edges ? g.edges.length : 0;
             const label = `loadGraph (${n} nodes, ${ed} edges)`;
@@ -1850,7 +1981,8 @@
             if (node.length) cy.animate({ center: { eles: node } }, { duration: 250 });
             const span = traceData[idx];
             const nodeData = node.length ? node.data() : {};
-            document.getElementById('info').innerHTML = buildInfoHtml(span.name, nodeData, span);
+            document.getElementById('info').innerHTML = buildInfoHtml(span.name, nodeData);
+            document.getElementById('exec-context').innerHTML = buildExecContextHtml(span);
         }
 
         function clearAll() {
@@ -2164,6 +2296,8 @@
             clearAll();
             document.getElementById('trace-list').innerHTML =
                 '<p style="padding:8px 10px;color:#6c7086;font-size:11px">Click Play to load & animate.</p>';
+            document.getElementById('exec-context').innerHTML =
+                '<p style="padding:8px 10px;color:#6c7086;font-size:11px">Step through a trace to see its execution context here.</p>';
             logToServer('btn-unload-trace', 'unloaded trace, back to static analysis mode');
         });
 

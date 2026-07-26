@@ -215,6 +215,51 @@ def parse_trace(text: str, source_index: dict | None = None, graph: dict | None 
     main to it (`_find_main_id` + a lookup in `edge_call_orders`) -- never
     as a default. No graph, or no confirming edge, and the span's `stack`
     stays exactly what it always was: empty, not a guess.
+
+    Each entry also carries `recordedFields` and `events` when present --
+    the two mechanisms for seeing a function's own internal state, not
+    just its entry arguments (see README.md's "Tracing log format" for the
+    exact code to inject):
+    - `recordedFields`: one dict per invocation (`fields`, above, only ever
+      reflects the FIRST invocation's own entry args), taken from that
+      invocation's own CLOSE event -- which reports the span's *current*
+      known fields at that point, not its entry-time ones. A plain
+      `#[instrument]` never changes after entry, so this is usually
+      identical to `fields` -- it only differs when the function declares
+      an initially-empty field (`#[instrument(fields(x = tracing::field
+      ::Empty))]`) and fills it in later via `tracing::Span::current()
+      .record("x", value)`, which is the whole point: capturing a variable
+      that didn't exist yet when the span was entered.
+    - `events`: any `tracing::event!`/`info!`/... call made from directly
+      inside the function body, in the order they fired, across every
+      invocation -- `{"message", "fields"}` each. Unlike `record()` above
+      (which only ever shows the LATEST value for a given field), a
+      separate event line naturally captures a whole *progression* of
+      values across multiple points in the function, not just one.
+
+    Both need the line-classification fix described next to be usable at
+    all: a bare event line's own `span.name` is just its ENCLOSING span's
+    name (confirmed empirically -- an event doesn't have an identity of
+    its own) -- indistinguishable from a genuine NEW event by name alone.
+    Classification is by `fields.message` instead (a NEW/CLOSE line's own
+    `message` is always exactly "new"/"close", a fixed tracing_subscriber
+    marker -- see the JSON schema in codemap/schema/): CLOSE first
+    (`"time.busy" in fields`, unchanged), then `message == "new"`, then
+    anything else is an EVENT. Getting this wrong is not cosmetic: before
+    this fix, a bare event fell into the same branch as a genuine NEW,
+    pushing its enclosing span's name onto `open_stack` a SECOND time --
+    never popped back off (only the real CLOSE pops, once), permanently
+    corrupting the depth/ancestor chain of every span parsed afterward.
+    Confirmed directly: added a scratch `tracing::info!()` call inside an
+    instrumented function, and every span after it in the trace came back
+    one level deeper than it actually was. `open_stack` itself now holds
+    `(name, callOrder)` pairs, not bare names -- letting an EVENT look up
+    its enclosing span's own dedup key directly (`open_stack[-1]`) rather
+    than needing a second, independently-advancing occurrence counter to
+    stay in sync with the one NEW already used to assign that callOrder --
+    CLOSE reads its own call_order the same way now (by popping it back
+    off the stack), rather than recomputing it via a separate counter that
+    only worked by relying on NEW and CLOSE always advancing in lockstep.
     """
     line_index = _build_line_index(source_index) if source_index else {}
     edge_call_orders = _build_edge_call_orders(graph) if graph else {}
@@ -251,47 +296,59 @@ def parse_trace(text: str, source_index: dict | None = None, graph: dict | None 
         if not raw_name: continue
         entries.append(entry)
 
-    # Which occurrence (0-indexed) of this (parent, name) pair we're up to,
-    # tracked separately for "new" and "close" events -- both advance once
-    # per matching entry, in the same relative order tracing itself emitted
-    # them in (spans nest properly, so a given invocation's own new/close
-    # pair keeps the same rank among same-named siblings either way), which
-    # is what lets a close event's aggregated duration land back on the
-    # same split-out entry its own new event produced.
+    # Which occurrence (0-indexed) of this (parent, name) pair we're up to --
+    # only ever needed for NEW (where a callOrder is actually assigned);
+    # CLOSE and EVENT both read it back off `open_stack` instead of
+    # tracking their own parallel counter (see this function's own
+    # docstring for why a second counter was the wrong fix once EVENT
+    # lines needed the exact same lookup CLOSE already did).
     new_occurrence = {}
-    close_occurrence = {}
 
-    def call_order_for(parent, name, counters):
+    def call_order_for(parent, name):
         sites = edge_call_orders.get((parent, name))
         if not sites or len(sites) <= 1:
             return None
-        idx = counters.get((parent, name), 0)
-        counters[(parent, name)] = idx + 1
+        idx = new_occurrence.get((parent, name), 0)
+        new_occurrence[(parent, name)] = idx + 1
         return sites[idx % len(sites)]
 
-    open_stack = []  # resolved ids of currently-open spans, outermost first
+    open_stack = []  # (resolved name, callOrder) pairs, outermost first
     new_events = []
     close_stats = {}  # (resolved name, callOrder or None) -> {count, total_us}
+    recorded_by_key = {}  # same key -> [close-time span-field dict, ...], one per invocation
+    events_by_key = {}  # same key -> [{"message", "fields"}, ...], across every invocation
     for entry in entries:
         fields = entry.get("fields", {})
         span_info = entry.get("span", {})
         raw_name = span_info.get("name", "")
+        message = fields.get("message")
 
         if "time.busy" in fields:
             # A close always matches whatever's currently innermost -- see
             # this function's own docstring for why that's reliable and a
-            # name-based lookup here would not be.
-            name = open_stack.pop() if open_stack else raw_name
-            parent = open_stack[-1] if open_stack else implicit_root_parent(name)
-            call_order = call_order_for(parent, name, close_occurrence)
+            # name-based lookup here would not be. Its callOrder is
+            # whatever NEW already assigned this exact invocation --
+            # popped back off the stack, not recomputed.
+            if open_stack:
+                name, call_order = open_stack.pop()
+            else:
+                name, call_order = raw_name, None
+            key = (name, call_order)
             us = parse_duration(fields.get("time.busy", "0"))
-            st = close_stats.setdefault((name, call_order), {"count": 0, "total_us": 0.0})
+            st = close_stats.setdefault(key, {"count": 0, "total_us": 0.0})
             st["count"] += 1
             st["total_us"] += us
-        else:
+            # The close event's own `span` reports this invocation's
+            # *current* fields, which is where a value filled in mid-body
+            # via Span::current().record(...) actually shows up -- entry
+            # args (below, in the NEW branch) never change after the fact.
+            recorded_by_key.setdefault(key, []).append(
+                {k: v for k, v in span_info.items() if k != "name"}
+            )
+        elif message == "new":
             resolved = resolve_id(entry.get("filename"), entry.get("line_number"))
             name = resolved or raw_name
-            stack = list(open_stack)
+            stack = [nm for nm, _co in open_stack]
             if not stack:
                 # Confirmed-by-the-static-graph case only -- see
                 # implicit_root_parent's docstring. Doesn't touch
@@ -302,7 +359,7 @@ def parse_trace(text: str, source_index: dict | None = None, graph: dict | None 
                 if confirmed:
                     stack = [confirmed]
             parent = stack[-1] if stack else None
-            call_order = call_order_for(parent, name, new_occurrence)
+            call_order = call_order_for(parent, name)
             ev = {
                 "name": name,
                 "depth": len(stack),
@@ -312,7 +369,18 @@ def parse_trace(text: str, source_index: dict | None = None, graph: dict | None 
             if call_order is not None:
                 ev["callOrder"] = call_order
             new_events.append(ev)
-            open_stack.append(name)
+            open_stack.append((name, call_order))
+        else:
+            # EVENT: a plain tracing::event!/info!/... call from directly
+            # inside the currently-innermost span's own body -- not a span
+            # itself (never pushed onto open_stack, never assigned its own
+            # callOrder), just attached to whatever IS currently innermost.
+            if open_stack:
+                enclosing_key = open_stack[-1]
+                events_by_key.setdefault(enclosing_key, []).append({
+                    "message": message or "",
+                    "fields": {k: v for k, v in fields.items() if k != "message"},
+                })
 
     seen, deduped = set(), []
     for ev in new_events:
@@ -323,5 +391,11 @@ def parse_trace(text: str, source_index: dict | None = None, graph: dict | None 
         ev["iterations"] = st["count"]
         ev["duration_ms"] = round(st["total_us"] / 1000.0, 4)
         ev["total_ms"] = ev["duration_ms"]
+        recorded = recorded_by_key.get(key)
+        if recorded:
+            ev["recordedFields"] = recorded
+        events = events_by_key.get(key)
+        if events:
+            ev["events"] = events
         deduped.append(ev)
     return deduped

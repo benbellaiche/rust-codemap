@@ -1422,6 +1422,101 @@ from the count that decides whether the button even appears (a fixture
 where `main` is the *only* private entry should still show no button, not
 an inert one).
 
+### 2.10 Execution-context frame: internal variable capture, and moving the legend out of the sidebar
+
+Two related asks: a dedicated place to see a function's own internal
+state during replay (not just its entry arguments), and — to make room
+for it without cramming the sidebar — moving the legend somewhere it
+doesn't permanently occupy layout space.
+
+**Split the two right-sidebar-adjacent panels along a static/dynamic
+line.** `#info` (left) is now purely static (doc link, signature, source
+link, doc comment) regardless of whether a trace is loaded or a replay
+step is active; a new `#exec-context` panel (right, below Execution
+Trace, mirroring `#info`'s own position below the doc list on the left)
+took over everything that used to render in `#info` during replay
+(duration, iterations, entry arguments) plus the two new mechanisms
+below. `buildInfoHtml()` lost its third (`spanData`) parameter entirely —
+the doc-link/signature/source-link part it shares with the "not a node in
+the loaded graph" case was already factored out as `docEntryHtml()` in
+§2.9, so this was a matter of no longer calling the removed branch, not a
+new abstraction.
+
+**Two mechanisms for seeing what a function actually did, not just what
+it was called with** (see README.md's "Optional: capturing a function's
+own internal state" for the exact code):
+1. `tracing::field::Empty` + `Span::current().record(...)` — a field that
+   doesn't exist at entry, filled in once actually known. Surfaces as
+   `recordedFields` on the trace entry (one snapshot per invocation, from
+   that invocation's own CLOSE event -- which reports the span's *current*
+   fields, not its entry-time ones).
+2. A plain `tracing::event!`/`info!`/... call from inside the function
+   body — a whole *progression* of values across multiple points, not
+   just the final one (`record()` above only ever keeps the latest).
+   Surfaces as `events`, a list of `{message, fields}` in firing order,
+   across every invocation.
+
+**A real, previously-latent parser bug found and fixed while building
+this, not a design choice for the new feature alone.** `trace_log.py`
+used to classify every line as either CLOSE (`"time.busy" in fields`) or
+NEW (everything else) — a plain event line's own `span.name` is just its
+*enclosing* span's name (confirmed empirically: an event has no identity
+of its own), so it fell into the NEW branch, pushing that name onto
+`open_stack` a *second* time. Only the real CLOSE ever pops -- so that
+extra entry stayed on the stack permanently, corrupting the depth/
+ancestor chain of every span parsed afterward. Confirmed directly with a
+scratch crate (not the shipped fixture): added a bare `tracing::info!()`
+call inside an instrumented function, called something else immediately
+after it, and that *unrelated* next call came back one level deeper than
+it should have been (`depth: 1, stack: ['scratch_record_test']` instead
+of `depth: 0, stack: []`) — reverted the scratch crate once confirmed,
+kept the fix. Classification is now by `fields.message` (CLOSE first,
+unchanged; `message == "new"` for NEW; anything else is an EVENT, attached
+to whichever span is currently innermost, never pushed onto `open_stack`
+itself). `open_stack` entries became `(name, callOrder)` pairs rather
+than bare names, so an EVENT (and CLOSE, which now also reads its own
+callOrder back off the stack instead of recomputing it via a second,
+independently-advancing counter that only worked by coincidentally
+staying in lockstep with the one NEW already used) can look up its
+enclosing span's exact dedup key directly.
+
+**Timing terminology, checked rather than assumed.** Asked directly
+whether `time.busy`/`time.idle` correspond to CPU-usage vs. CPU-wait time
+— they don't. Verified with a disposable scratch crate: a function that
+does a deliberate `std::thread::sleep(80ms)` with *zero* real CPU work
+reports that entire 80ms as `time.busy`, not `time.idle`. What they
+actually measure has nothing to do with the OS's own CPU accounting:
+`busy` is wall-clock time the span was *entered* (however that time was
+spent — real computation, blocked, whatever); `idle` is wall-clock time
+the span existed but wasn't the active context, which is near-zero for
+ordinary synchronous code and only becomes meaningful for `async fn`
+(already out of scope for replay). `time.busy` is, and remains, the only
+duration this tool reads or displays anywhere — confirmed nothing needed
+to change there, just made sure the new panel's own label says "execution
+time," not "CPU time."
+
+**Legend moved from a permanent sidebar block to a toolbar popover**
+(`#btn-legend` next to Settings/Log), reusing the exact overlay mechanism
+`#log-panel` already established (`position: fixed`, toggled via an
+`.open` class) rather than inventing a second one — freeing the vertical
+space it used to occupy in the right sidebar for Execution Trace and the
+new Execution Context panel, which was the whole point of moving it.
+
+Added `dcore::record_demo`/`dcore::event_demo` to the dummy-lib fixture
+specifically to exercise both mechanisms against something real (not
+synthetic JSON) — wired into `dummy-cli::main`, same pattern as every
+other fixture addition this session. Verified end-to-end: the real
+generated trace shows `record_demo`'s `recordedFields` with `doubled: 40`
+alongside the original entry argument `x: 20`; `event_demo`'s `events`
+list shows all 3 loop iterations' `step`/`total` values in order; the
+viewer's Execution Context panel renders both correctly while stepping,
+and `#info` shows neither (checked via the actual rendered HTML, not just
+the underlying data, to catch a "class applied but styling didn't
+change" class of bug this project has hit before). Full regression suite
+(~25 files) re-run clean, including one (`test_replay_mode_fixes.js`)
+that needed its own selector updated after the legend's move, same as
+any other test that directly referenced a since-relocated element id.
+
 ## 3. Points to fix
 
 - ~~Duplicated trace-parsing logic~~ **Fixed.** `trace_log.py` (Python) and

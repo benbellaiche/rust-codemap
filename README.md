@@ -282,7 +282,71 @@ Each line is either a span **entry** event or a span **close** event:
   set (recommended — see below for why).
 - **Close**: same shape, but `fields` additionally contains `"time.busy"`
   (a duration string like `"1.23ms"`, `"450µs"`, `"2.1s"`) — this is where
-  per-call duration and iteration counts come from.
+  per-call duration and iteration counts come from. `time.busy` is the
+  only duration this tool reads or displays anywhere — it's wall-clock
+  time the span was actually entered (i.e. really executing, including
+  any nested calls), not a CPU-usage metric: measured directly with a
+  deliberate `std::thread::sleep()` inside an instrumented function, and
+  confirmed the sleep shows up entirely in `time.busy`, not in the
+  sibling `time.idle` field tracing also reports. `time.idle` (time the
+  span existed but wasn't the active context) is not used anywhere in
+  this tool — it's near-zero for ordinary synchronous code and only
+  becomes meaningful for `async fn` (out of scope for replay already, see
+  "Known limitations").
+
+### Optional: capturing a function's own internal state
+
+The two entry/close events above only ever show a span's *entry*
+arguments — useful, but silent about anything computed *during* the
+call. Two ordinary `tracing` mechanisms, already emitted by the exact
+same setup above with zero changes to it, let you see more, and the
+viewer's "Execution context" panel (bottom-right, next to the replay
+list) shows both automatically once a trace has them:
+
+- **A value that doesn't exist yet at entry** — declare it as an empty
+  field, fill it in once it's actually known:
+
+  ```rust
+  #[tracing::instrument(fields(doubled = tracing::field::Empty))]
+  fn compute(x: i32) -> i32 {
+      let doubled = x * 2;
+      tracing::Span::current().record("doubled", doubled);
+      doubled + 1
+  }
+  ```
+
+  Shows up as `recordedFields` on that call's trace entry — the span's
+  *current* fields as of its own close event, not its entry-time ones
+  (`x` is still there too; `record()` only ever adds/updates fields, it
+  never removes ones `#[instrument]` already captured). Only ever shows
+  the *latest* value for a given field — recording it twice keeps just
+  the second value, no history of the first.
+
+- **A progression of values across multiple points in the call** — a
+  plain event, logged from anywhere inside the function body:
+
+  ```rust
+  #[tracing::instrument]
+  fn run(n: i32) -> i32 {
+      let mut total = 0;
+      for step in 0..n {
+          total += step;
+          tracing::info!(step, total, "running total after this step");
+      }
+      total
+  }
+  ```
+
+  Shows up as `events` — a list of `{message, fields}`, one per
+  `event!`/`info!`/... call, in the order they actually fired, across
+  every invocation. Unlike `record()` above, this keeps every value along
+  the way, not just the final one.
+
+Both are entirely optional and additive: a trace with none of this still
+parses exactly as it always has. See `codemap/schema/trace-event.schema.json`
+for the third line shape a plain event produces (distinct from entry/close
+— told apart by `fields.message`, since an event's own `span` field
+reports its *enclosing* span's identity, never one of its own).
 
 ### How a span is matched to a graph node
 

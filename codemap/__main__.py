@@ -400,17 +400,18 @@ _SCHEMA_DIR = Path(__file__).parent / "schema"
 
 
 def cmd_validate_trace(args) -> bool:
-    """Checks a real trace.jsonl against the two schemas in codemap/schema/
+    """Checks a real trace.jsonl against the three schemas in codemap/schema/
     (see PROJECT.md §4, "Trace-format schema") -- one line at a time, since
-    each line is independently either an entry or a close event, not one
+    each line is independently an entry, a close, or a plain event, not one
     schema for the whole file. Doubles as this project's fixture-validation
-    test for that schema (deliberately not per-line runtime validation
+    test for those schemas (deliberately not per-line runtime validation
     inside trace_log.py itself -- see the schema files' own docstrings for
     why): run against the dummy-cli fixture's own trace.jsonl any time
-    either the schema or the format itself changes, to catch drift between
+    either a schema or the format itself changes, to catch drift between
     what the schema says and what a real trace actually looks like."""
     entry_schema = json.loads((_SCHEMA_DIR / "trace-entry.schema.json").read_text(encoding="utf-8"))
     close_schema = json.loads((_SCHEMA_DIR / "trace-close.schema.json").read_text(encoding="utf-8"))
+    event_schema = json.loads((_SCHEMA_DIR / "trace-event.schema.json").read_text(encoding="utf-8"))
 
     path = Path(args.trace)
     lines = path.read_text(encoding="utf-8").splitlines()
@@ -433,15 +434,20 @@ def cmd_validate_trace(args) -> bool:
         elif message == "close":
             errors = schema_check.validate(obj, close_schema)
         else:
-            errors = [f"$.fields.message: expected \"new\" or \"close\", got {message!r} -- "
-                      f"not a shape either schema covers"]
+            # Anything else is a plain tracing::event!/info!/... call from
+            # inside an instrumented function's own body -- see
+            # trace-event.schema.json and trace_log.py's own module
+            # docstring for why this can't be told apart from an entry by
+            # `span.name` alone (an event's `span` reports its ENCLOSING
+            # span's identity, not one of its own).
+            errors = schema_check.validate(obj, event_schema)
         if errors:
             all_ok = False
             print(f"line {i}: {len(errors)} error(s)")
             for e in errors:
                 print(f"  {e}")
     verdict = "OK" if all_ok else "FAILED"
-    print(f"{verdict}: {total} line(s) checked against codemap/schema/trace-{{entry,close}}.schema.json")
+    print(f"{verdict}: {total} line(s) checked against codemap/schema/trace-{{entry,close,event}}.schema.json")
     return all_ok
 
 
