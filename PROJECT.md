@@ -1952,6 +1952,71 @@ version string: this needs zero discipline to stay accurate (no step to
 remember before restarting), and directly answers the exact question that
 took an entire session to answer manually the hard way.
 
+### 2.13 Flame graph: the §4 proposal, built as written, then reverted
+
+**Removed immediately after being seen: "you can delete the flame graph, I'll
+keep the simple list view."** Everything below describes what was actually
+built and verified before that request -- kept as a historical record, not
+current behavior, in case a flame graph comes back up later (the approach
+worked; it just wasn't wanted this time). Fully reverted, cleanly: the
+`#trace-flame`/`#btn-flame-toggle` HTML and CSS, `renderFlameGraph()`/
+`traceViewMode`/`FLAME_ROW_H`, the `flame-${i}` class-syncing line in
+`stepTo()`, the `.flame-bar` mention in `clearAll()`'s selector, both
+placeholder-reset call sites, and -- since it had no other consumer --
+`startOffsetMs` itself (`trace_log.py`'s `_parse_timestamp()`/`trace_start`
+tracking and `parseTraceJsonl()`'s mirrored `traceStartMs` logic). Full
+regression suite re-run clean after the revert; `test_flame_graph.js`
+deleted (nothing left for it to test).
+
+Requested directly after the proposal below (§4) sat unbuilt for a while:
+"I don't really see what this would look like — build it and we'll see."
+Built exactly as proposed, no design changes:
+
+- **Second view mode, not a new frame.** A "Flame graph" toggle button next
+  to the "Execution Trace" header swaps `#trace-list` (the flat list) for
+  `#trace-flame` inside the *same* sidebar slot -- both are always built by
+  `renderTrace()` (an `if`-branch via a shared `renderFlameGraph()` call,
+  not a second divergent code path), so toggling is instant and can never
+  show stale data.
+- **The one real data gap the proposal identified, filled.** `trace_log
+  .py`/`parseTraceJsonl()` now compute `startOffsetMs` per span -- real
+  wall-clock milliseconds since the trace's very first entry, from each
+  NEW line's own `timestamp` field (`_parse_timestamp()`, `datetime
+  .fromisoformat`, handles the `Z`-suffixed RFC 3339 format tracing_
+  subscriber emits). Deliberately real time, not `openSeq` (log-position
+  ordinal, used for every other ordering decision in this file) --
+  positioning bars by actual elapsed time is the entire point of a flame
+  graph. Absent (key omitted) when a line has no parseable `timestamp` --
+  `renderFlameGraph()` falls back to spacing every span as an equal-width
+  slot in trace order rather than rendering empty.
+- **Interaction reuses `stepTo()` exactly.** Clicking a bar calls the same
+  `stepTo(idx)` a trace-list row click already does -- verified directly:
+  clicking a flame bar updates `traceIdx`, and the flame bar, the flat-list
+  row, AND the graph node all pick up `.current` from that one call, no
+  separate code path to drift out of sync (the exact `.class`-vs-doc-list
+  drift §2.5 already hit once this project).
+- **Layout**: icicle-style (root at top, deeper calls below -- matches the
+  existing top-down trace list's own reading direction, per the proposal's
+  own "either is fine, match whichever reads more naturally" call),
+  `left`/`width` as percentages of the trace's total span so it resizes
+  with the sidebar for free, `top` from `depth * rowHeight`. A
+  minimum-width floor (0.5%) keeps a genuinely tiny call (e.g. `dcore::add`
+  next to `dapi::run_report`'s much longer total) visible and clickable
+  instead of a literal zero-width sliver, same reasoning as the proposal's
+  own "scale consideration" bullet.
+- **Verified, not assumed correct from reading the code**: bar `top`
+  matches `depth` exactly (a depth-2 span sits exactly one row below a
+  depth-1 one); bars move rightward as trace order advances; a genuinely
+  still-open real ancestor (e.g. `run_report` while its own child
+  `Report::generate` is the current step) stays visually active/red in the
+  flame graph too, not "visited" -- the same closeSeq-based correctness
+  from §2.11's follow-ups automatically applies here too, since it's the
+  identical `active`/`stillOpen` computation in `stepTo()`, just also
+  applied to `flame-${i}` alongside `sp-${i}`; Reset and Unload both clear
+  the flame graph's own state (`.current`/`.visited` classes, placeholder
+  text) exactly like the flat list already did. Full existing regression
+  suite re-run clean; a new `test_flame_graph.js` added.
+
 ## 3. Points to fix
 
 - ~~Duplicated trace-parsing logic~~ **Fixed.** `trace_log.py` (Python) and
@@ -2412,9 +2477,11 @@ took an entire session to answer manually the hard way.
   migration surfaced and fixed along the way); the Playwright suite's
   ~25 affected files were updated for the new id shape and re-run clean.
 - **Call-stack/timing frame — new visualization or evolve the existing
-  one? Open — design proposal below, not yet built.** The sidebar's
-  "Execution Trace" list already shows per-span duration and iteration
-  counts, but flat.
+  one? Built once exactly as proposed below, then explicitly reverted —
+  see §2.13.** Kept just the flat list, by request. Revisit only if the
+  idea comes back up; the approach below is verified to work if it does.
+  The sidebar's "Execution Trace" list already shows per-span duration and
+  iteration counts, but flat.
 
   **Proposal: a flame graph, as a second view mode on the *existing*
   sidebar list, not a brand-new frame.** Concretely:
@@ -2462,8 +2529,9 @@ took an entire session to answer manually the hard way.
     sub-pixel-width spans into their parent visually, same spirit as the
     doc list's crate/class collapsing) rather than assuming every trace
     stays dummy-cli-sized.
-  No implementation started — this is the shape being proposed, pending
-  agreement before picking it up.
+  **Built exactly as proposed above, verified working, then reverted at
+  explicit request — see §2.13** for what shipped, how it was verified,
+  and exactly what was torn back out.
 - ~~How is the tool invoked against a new target project?~~ **Settled**:
   a CLI (`codemap.py`) with subcommands, taking `--project <path>` to any
   target crate. See §2.4.
@@ -2476,10 +2544,9 @@ took an entire session to answer manually the hard way.
   (`codemap/schema_check.py`, not a per-line runtime check inside
   `trace_log.py`).
 - ~~Build the doc frame~~ **Done** — see §2.5 and §4.
-- Build the dedicated call-stack/timing frame — see §4's proposal (a flame
-  graph as a second view mode on the existing sidebar list, reusing
-  `traceData`/`stepTo`, plus a small extension to record each span's start
-  offset). Not yet built.
+- Build the dedicated call-stack/timing frame — **built once (a flame
+  graph, second view mode on the existing sidebar list), verified working,
+  then explicitly reverted — see §2.13.** Kept just the flat list.
 - ~~Unify the duplicated trace-parsing logic~~ **Done, see §3**: not by
   eliminating one of the two implementations, but by making the server
   round trip (`/__codemap_parse_trace` -> `trace_log.py`) the one real
@@ -2497,16 +2564,23 @@ took an entire session to answer manually the hard way.
   obvious first candidate for a `dispatch` type instead of plain `call`) —
   left alone for now by explicit request, not because the idea was
   rejected. Revisit only if it comes back up.
-- Multi-run trace coverage: a single trace only exercises the branches its
-  input happened to take. A node's `traced` flag is already run-independent
-  (§2.1), but for *edges*/branch coverage specifically, an optional "union
-  of several runs" mode could clarify what's reachable vs. genuinely dead.
-- Info-panel navigation: clicking a linkified type name overwrites the
-  panel with no way back except reselecting the original node. A small
-  back/breadcrumb affordance would help once doc navigation gets deeper.
-- Performance/scalability of the regex-based MIR parser on larger codebases
-  is untested — worth benchmarking once pointed at something bigger than a
-  tiny demo.
+- ~~Multi-run trace coverage~~ **Declined, won't build.** A single trace
+  only exercises the branches its input happened to take; an optional
+  "union of several runs" mode was considered for *edge*/branch coverage
+  specifically (a node's `traced` flag is already run-independent, §2.1)
+  but explicitly rejected by request.
+- ~~Info-panel navigation~~ **Not needed — verified moot.** Clicking a
+  linkified type name overwrites the panel with no way back except
+  reselecting the original node; a back/breadcrumb affordance was
+  considered but turns out unnecessary, since `docEntryHtml()` (the same
+  renderer used for both graph nodes and type-link clicks) already makes
+  every entry's own name a `target="_blank"` link straight to its real,
+  natively-cross-linked `cargo doc` HTML page (§2.5's "Open in new tab") —
+  real navigation between related types already exists there, just not
+  reimplemented a second time inside this small panel.
+- ~~Performance/scalability of the regex-based MIR parser~~ **Verified
+  fine, no longer a concern.** Tested against a real larger codebase;
+  performs well.
 
 ## 7. Other notes worth keeping in mind
 

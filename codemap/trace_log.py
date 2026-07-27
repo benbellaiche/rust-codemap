@@ -12,7 +12,6 @@ import re
 
 _DURATION_RE = re.compile(r"([\d.]+)\s*([a-zµ]+)", re.IGNORECASE)
 
-
 def parse_duration(s: str) -> float:
     """Parse a tracing `time.busy`-style duration string into microseconds."""
     s = s.strip()

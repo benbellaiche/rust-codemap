@@ -467,6 +467,11 @@ needed this -- it calls `stepTo()` synchronously, no delay to race.
 
 ### `viewer/index.html` — the pieces that aren't obvious from a skim
 
+- A flame-graph second view mode for "Execution Trace" was built once
+  (§2.13), verified working, then explicitly reverted -- only the flat
+  list (`renderTrace()`, `#trace-list`) remains. Don't reintroduce
+  `startOffsetMs`/`renderFlameGraph()` speculatively; re-read §2.13 first
+  if this comes back up.
 - `stepTo()`'s edge lookup can come up empty even for a span with a real,
   confirmed ancestor -- an untraced function in between means the trace
   correctly attributes the callee to its still-open ancestor, but no
