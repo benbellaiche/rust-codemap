@@ -202,6 +202,72 @@ def parse_trace(text: str, source_index: dict | None = None, graph: dict | None 
     reason: it's the actual ancestor chain, not a name lookup that could
     collide the same way.
 
+    Optional `"enter"`/`"exit"` lines (`FmtSpan::ENTER | FmtSpan::EXIT`,
+    opt-in on the target's own subscriber setup, never emitted otherwise)
+    relax the "ordinary synchronous, single-threaded execution" assumption
+    above for one specific, real case: `async fn`. A sync fn's span is
+    entered once (right after its own NEW) and never exited again until
+    CLOSE, so ENTER/EXIT simply don't fire for it at all even when enabled
+    -- nothing changes there. An `async fn` genuinely can be entered and
+    exited multiple times across its own lifetime, once per executor poll,
+    and a real `.await` suspension means the executor is free to run
+    something else *entirely unrelated* on this same thread in the
+    meantime -- without tracking this, that unrelated code would wrongly
+    inherit the suspended span as its own ancestor (`own_stack` has no
+    concept of "open but not actually active right now"). Confirmed as a
+    real, reproducible bug on a scratch single-threaded-runtime crate: two
+    independent `#[instrument]` async fns run via `tokio::join!`, one with
+    a longer `sleep` than the other -- the shorter one came back attributed
+    to the longer one (`stack: ["<the longer one>"]`) even though they're
+    genuinely concurrent, not nested at all.
+
+    Fixed by tracking a *second*, GLOBAL structure, `suspended_stack`
+    (name -> stashed `(name, callOrder)` tuples, shared across ALL threads --
+    unlike `open_stacks`, which stays per-thread): an "exit" pops the span
+    off `open_stacks` (if it's genuinely on top -- it always should be) and
+    stashes it; the next "enter" for that same name restores it from the
+    stash, UNLESS it's already on top (the very first enter, which
+    immediately follows NEW -- confirmed directly -- doesn't need
+    restoring, NEW already pushed it). "close" resolves via the SAME
+    real-source-location lookup as NEW (ENTER/EXIT/CLOSE all carry the same
+    `filename`/`line_number`, confirmed directly), checking the stash first
+    and falling back to the plain `open_stacks` pop otherwise -- covers
+    both "this invocation suspended at least once before finishing" and
+    "ENTER/EXIT wasn't enabled at all, nothing was ever stashed." Verified
+    against a genuinely nested case too, not just siblings: an outer async
+    fn awaiting an inner one (the inner with its own separate sleep) still
+    correctly resolves `stack: ["outer"]` for the inner one, even while two
+    other, unrelated async fns are also interleaving on the same thread at
+    the same time.
+
+    The stash is deliberately GLOBAL rather than per-thread: a
+    multi-threaded runtime (e.g. the default `#[tokio::main]` flavor) can
+    migrate the *same* logical task's own polls across different OS
+    threads over its lifetime -- confirmed directly on a scratch crate
+    (a `tokio::spawn`'d task under real scheduler pressure legitimately
+    showed 3 distinct `threadId`s across its own ENTER/EXIT lines). A
+    per-thread stash would stash a suspended span under the thread it
+    exited on and never find it again once resumed elsewhere. Restoring by
+    name only (not by thread) fixes this: the restored entry is pushed
+    onto whichever thread's `open_stacks` entry the resuming "enter"
+    actually happened on -- correct, since for that poll the invocation
+    really is running there. `open_stacks` itself stays per-thread
+    unchanged, since it tracks what's genuinely active *right now*, which
+    is always thread-local at any given instant (unlike the already-solved
+    concurrent-*threads* problem, §2.11, where each OS thread keeps its own
+    separate identity for its whole life -- that distinction is exactly why
+    `open_stacks` didn't need this same treatment).
+
+    Known, accepted limitation (unchanged in category by this fix, only in
+    scope): if the SAME async fn/call-site is invoked multiple times truly
+    concurrently (not merely interleaved by suspension, but genuinely
+    overlapping in flight at once), the name-keyed stash can't distinguish
+    between them and may restore the wrong specific invocation's stashed
+    tuple. This risk already existed in the per-thread version too (for
+    same-name concurrent invocations sharing one thread); going global only
+    widens its scope from "within one thread" to "across threads," not a
+    new category of risk.
+
     `graph` (typically graph.json's own contents), if given, additionally
     tells genuinely different call sites of the same callee apart from one
     call site simply repeating in a loop -- a real, deliberate distinction,
@@ -391,6 +457,35 @@ def parse_trace(text: str, source_index: dict | None = None, graph: dict | None 
         return entry.get("threadId", _NO_THREAD_ID)
 
     open_stacks = {}  # thread id (or the sentinel above) -> [(resolved name, callOrder), ...]
+    # resolved name -> [(name, callOrder), ...] -- invocations that have EXIT-ed
+    # (suspended mid-`.await`, still genuinely in flight) but haven't CLOSE-d yet.
+    # See the ENTER/EXIT branches below for why this exists at all -- async fn only,
+    # never touched for ordinary sync code (no ENTER/EXIT lines emitted there at all
+    # unless the target opted into `FmtSpan::ENTER | FmtSpan::EXIT`).
+    #
+    # Deliberately GLOBAL, not per-thread like `open_stacks` -- a multi-threaded
+    # async runtime (unlike a genuinely separate OS thread, which keeps one
+    # identity for its whole life) can resume the SAME task's next poll on a
+    # completely different worker thread than the one it suspended on.
+    # Confirmed directly on a scratch crate (`tokio::spawn`'d task, default
+    # multi-threaded runtime, real CPU/scheduling pressure from hundreds of
+    # competing yielding tasks): the same async fn's own ENTER/EXIT lines
+    # legitimately carried 3 different `threadId`s across its own lifetime.
+    # A per-thread stash (this dict's first version) would stash the
+    # suspended entry under the thread it exited on and never find it again
+    # once resumed elsewhere -- not a wrong/misleading result (the code
+    # degrades to the same honest "no known ancestor" as an untraced
+    # function, §2.12), but a real, avoidable gap: a child call made during
+    # a migrated poll would lose its correct real-nesting attribution for no
+    # reason a global lookup can't fix. Keyed by name only, same one
+    # (name, callOrder) shape as everywhere else in this file -- shares a
+    # pre-existing, still-untested edge case with the per-thread version:
+    # if the exact same call site's async fn is invoked multiple times
+    # truly concurrently (not yet exercised by any fixture), the wrong
+    # stashed entry could be restored. Not a new risk this introduces, just
+    # widens an already-latent one from "within one thread" to "across
+    # threads too."
+    suspended_stack = {}
     full_path_by_name = {}  # name -> that span's own full ancestor chain + itself, from its most
     # recent NEW resolution -- see the `implicit_parent` branch below for why.
     new_events = []
@@ -412,7 +507,28 @@ def parse_trace(text: str, source_index: dict | None = None, graph: dict | None 
             # here, and a name-based lookup would be no better. Its
             # callOrder is whatever NEW already assigned this exact
             # invocation -- popped back off the stack, not recomputed.
-            if own_stack:
+            #
+            # EXCEPT for an `async fn` with ENTER/EXIT tracked (see those
+            # branches below): its own EXIT (suspending at the final
+            # `.await` before returning) already popped it off `own_stack`
+            # and stashed it in the GLOBAL `suspended_stack` (not
+            # thread-scoped -- see that dict's own comment for why: the
+            # resuming ENTER, and therefore this CLOSE too, can legitimately
+            # land on a different thread than the one that exited) -- by
+            # the time CLOSE arrives, `own_stack`'s own top is whatever's
+            # genuinely still entered (some ancestor, if any), NOT this
+            # invocation anymore. Resolved by real source location (same as
+            # NEW/ENTER/EXIT) to find the right stash -- falls through to
+            # the plain `own_stack.pop()` below whenever nothing's stashed
+            # (the overwhelmingly common case: ordinary sync code, or
+            # ENTER/EXIT simply not enabled at all), so this changes
+            # nothing for anything that isn't async-with-ENTER/EXIT.
+            resolved_close = resolve_id(entry.get("filename"), entry.get("line_number"))
+            close_name = resolved_close or raw_name
+            stash = suspended_stack.get(close_name)
+            if stash:
+                name, call_order = stash.pop()
+            elif own_stack:
                 name, call_order = own_stack.pop()
             else:
                 name, call_order = raw_name, None
@@ -502,6 +618,60 @@ def parse_trace(text: str, source_index: dict | None = None, graph: dict | None 
             new_events.append(ev)
             own_stack.append((name, call_order))
             full_path_by_name[name] = stack + [name]
+        elif message in ("enter", "exit"):
+            # `async fn` only -- an ordinary sync fn's own span is entered
+            # once (right after NEW) and never exited until CLOSE, so
+            # ENTER/EXIT lines (opt-in via `FmtSpan::ENTER | FmtSpan::EXIT`,
+            # never emitted otherwise) only ever show up at all for async
+            # code, where the *real* poll-by-poll picture matters: a
+            # suspended `.await` genuinely leaves the executor free to run
+            # something else entirely on this same thread in the meantime.
+            # Without tracking this, `own_stack` would keep a suspended
+            # span "open" the whole time it's actually idle, and whatever
+            # the executor happens to run next gets wrongly nested under
+            # it -- confirmed as a real, reproducible bug on a real
+            # single-threaded-runtime scratch crate (two `#[instrument]`
+            # async fns, one with a longer sleep than the other, run via
+            # `tokio::join!`): the shorter one came back with a nonexistent
+            # `stack: ["<the longer one>"]` even though they're genuinely
+            # concurrent, not nested.
+            #
+            # Resolved by real source location, exactly like NEW/CLOSE --
+            # ENTER/EXIT lines carry the same `filename`/`line_number` as
+            # NEW does (confirmed directly against a real trace), so this
+            # is never a name-only guess.
+            resolved = resolve_id(entry.get("filename"), entry.get("line_number"))
+            name = resolved or raw_name
+            if message == "exit":
+                # Only pop if this span is genuinely on top -- it always
+                # should be (a span can't exit out from under something
+                # still entered above it), but never corrupt `own_stack` by
+                # popping the wrong thing if that assumption somehow doesn't
+                # hold.
+                if own_stack and own_stack[-1][0] == name:
+                    suspended_stack.setdefault(name, []).append(own_stack.pop())
+            else:  # "enter"
+                # The very FIRST enter for a given invocation immediately
+                # follows its own NEW (confirmed directly) -- NEW already
+                # pushed it, so this is a deliberate no-op then, not a
+                # double-push. Only a *resuming* enter (this span was
+                # previously exited and is now genuinely active again)
+                # needs to restore it from the stash.
+                already_on_top = own_stack and own_stack[-1][0] == name
+                if not already_on_top:
+                    stash = suspended_stack.get(name)
+                    if stash:
+                        # Pushed onto THIS thread's own_stack -- the one this
+                        # ENTER actually happened on, which can genuinely
+                        # differ from the thread it exited on (multi-threaded
+                        # async runtime, confirmed directly on a scratch
+                        # crate -- see `suspended_stack`'s own comment). For
+                        # this poll, the invocation really IS running here.
+                        own_stack.append(stash.pop())
+                    # else: nothing to restore -- ENTER without a matching
+                    # prior EXIT for this name (shouldn't happen in a
+                    # well-formed trace); leave `own_stack` alone rather
+                    # than fabricating an entry with a guessed callOrder.
         else:
             # EVENT: a plain tracing::event!/info!/... call from directly
             # inside the currently-innermost span's own body, on THIS

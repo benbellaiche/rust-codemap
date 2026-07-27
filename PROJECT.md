@@ -2017,6 +2017,158 @@ Built exactly as proposed, no design changes:
   text) exactly like the flat list already did. Full existing regression
   suite re-run clean; a new `test_flame_graph.js` added.
 
+### 2.14 Async replay, single-threaded runtime: a real correctness fix
+
+Raised directly as "can we handle `async fn` without touching the target's
+own code" -- investigated and answered step by step, single-threaded
+runtime first, deliberately not attempting multi-threaded async in the
+same pass (see below for why that's a separate, harder problem).
+
+**What's already free, no code or config changes needed at all.**
+`time.busy`/`time.idle` (already read by this tool, §2.3) are computed by
+`tracing` itself correctly for `async fn` -- confirmed empirically earlier
+this project (a scratch crate with a deliberate `sleep()` and zero real
+CPU work still reported the whole sleep as `time.busy`, i.e. wall-clock
+"was this span entered," not a CPU-usage split) -- `time.idle` in
+particular is exactly the real suspended time for an async fn, computed
+automatically.
+
+**The real gap, confirmed empirically before writing any fix.** A sync
+fn's span is entered once (right after NEW) and never exited again until
+CLOSE -- `own_stack` (§2.3) tracks this correctly by construction. An
+`async fn` genuinely can be entered and exited many times over its own
+lifetime, once per executor poll, and a real `.await` suspension means the
+executor is free to run something else *entirely unrelated* on the same
+thread in the meantime. `own_stack` has no concept of "open but not
+actually active right now," so that unrelated code would wrongly inherit
+the suspended span as its own ancestor. Confirmed directly on a disposable
+scratch crate (`#[tokio::main(flavor = "current_thread")]`, two
+independent `#[instrument]` async fns run via `tokio::join!`, one with a
+much shorter `sleep` than the other): the shorter one came back with
+`stack: ["<the longer one>"]` even though they're genuinely concurrent,
+not nested -- run through the *unmodified* `parse_trace()` to confirm the
+bug was real, not hypothetical, before touching any code.
+
+**The fix, config-only on the target's side.** `tracing_subscriber`'s
+`FmtSpan::ENTER | FmtSpan::EXIT` (opt-in alongside the already-mandatory
+`NEW | CLOSE`) emit a line every time a span is genuinely entered/exited --
+confirmed these carry the same `filename`/`line_number` as NEW (so they
+resolve to the same real node id, never a name-only guess), and that the
+very first ENTER for a given invocation always immediately follows its own
+NEW. `trace_log.py` now tracks a second per-thread structure,
+`suspended_stacks` (name -> stashed `(name, callOrder)` tuples): "exit"
+pops the span off `open_stacks` (only if it's genuinely on top) and
+stashes it; the next "enter" for that name restores it from the stash,
+*unless* it's already on top (the first enter, which never needs
+restoring -- NEW already pushed it, avoiding a double-push). "close" now
+resolves via the same real-source-location lookup as NEW/ENTER/EXIT, and
+checks the stash first before falling back to the plain `open_stacks` pop
+-- which is *all* that happens for ordinary sync code, or when ENTER/EXIT
+isn't enabled at all: nothing stashed, nothing changes, fully backward
+compatible.
+
+Verified against three real cases in one trace, not just the minimal
+repro: two independent async fns genuinely interleaving (`async_task_a`/
+`async_task_b`, `dummy-api`) resolve to the same real parent
+(`async_demo`), not nested in each other; a genuinely nested pair across a
+real suspension (`async_outer` awaiting `async_inner`, the inner with its
+own separate sleep) still correctly resolves `async_inner`'s `stack` one
+level deeper than `async_outer` -- confirming the fix distinguishes real
+nesting from coincidental same-thread interleaving, not just "nothing is
+ever nested anymore." Added permanently to the dummy-lib fixture
+(`dapi::async_demo`/`async_task_a`/`async_task_b`/`async_outer`/
+`async_inner`, `tokio` added as a dependency to `dummy-api` and
+`dummy-cli`, `dummy-cli`'s `main` converted to `#[tokio::main(flavor =
+"current_thread")]` with `ENTER | EXIT` added to its span-events config),
+with a dedicated isolated `trace_async.jsonl` (same pattern as
+`trace_concurrent.jsonl`/`trace_gap.jsonl`) and `test_async_replay.js`.
+Enabling ENTER/EXIT roughly doubled the full trace's line count (every
+*sync* span now also gets an enter/exit pair) -- exercised the whole
+existing regression suite against that bigger trace too, confirming the
+stash-based CLOSE resolution is correct for ordinary sync spans as well,
+not just async ones; every hardcoded span-count assertion across the test
+suite updated (22 -> 27 spans) accordingly.
+
+**Originally scoped to single-threaded runtimes only -- since extended to
+multi-threaded ones too, see §2.15.** A multi-threaded async runtime can
+migrate the *same* task's own polls across different OS threads over its
+lifetime, and `tracing`'s plain JSON output has no concept of a stable task
+identity to stitch those back together across threads -- `threadId` alone
+doesn't solve this the way it did for the already-solved
+concurrent-*OS-threads* problem (§2.11), where each thread genuinely keeps
+its own identity for its whole life. Deliberately deferred as a separate,
+harder next step at the time this section was written, not attempted in
+the same pass -- picked back up and settled in §2.15.
+
+### 2.15 Async replay, multi-threaded runtime: the suspended-span stash made global
+
+Picked up as the deferred follow-up from §2.14: "can the same ENTER/EXIT
+fix be extended to cover a multi-threaded async runtime too, still without
+touching the target's own code?"
+
+**The gap, confirmed empirically before writing any fix.** §2.14's fix
+(`suspended_stacks`, one stash *per thread id*, mirroring `open_stacks`)
+assumed a suspended span always resumes on the same OS thread it exited
+on. Confirmed false on a disposable scratch crate: a `tokio::spawn`'d task
+(default multi-threaded runtime, `worker_threads = 4`, real scheduling
+pressure from hundreds of competing yielding sibling tasks) had its own
+`#[instrument]` async fn's ENTER/EXIT lines legitimately carry 3 distinct
+`threadId`s across its own lifetime -- a genuinely different thread than
+the one it suspended on, each time it was rescheduled. A per-thread stash
+stashes the suspended entry under the thread it exited on and never finds
+it again once resumed elsewhere -- not a wrong/misleading result (degrades
+to the same honest empty `stack: []` as an untraced-function gap, §2.12),
+but a real, avoidable loss of correct nesting: run through the *unmodified*
+`parse_trace()` against this scratch crate's trace to confirm the bug was
+real first, not hypothetical -- a child call made from inside the migrated
+parent came back with `stack: []` instead of correctly nested under it.
+
+**The fix (Option B of two considered).** Two ways to close the gap were
+weighed: (A) accept the graceful degradation as-is, scoped permanently to
+single-threaded runtimes; (B) make the stash **global** instead of
+per-thread, keyed only by name. Went with B: `open_stacks` (what's
+genuinely entered *right now*) stays exactly as it was, per thread -- that
+part was never wrong, since what's "active this instant" is always
+thread-local by definition. Only the *suspended, not-yet-resumed* stash
+(renamed `suspended_stack`, singular) drops its per-thread partition. On
+the resuming "enter," the restored entry is pushed onto **whichever
+thread's `open_stacks` that enter actually happened on** -- correct, since
+for that one poll the invocation genuinely is running there.
+
+**Known, accepted limitation, unchanged in category by this fix, only in
+scope.** If the exact same async fn/call-site is invoked multiple times
+truly concurrently (not merely interleaved by suspension, but genuinely
+overlapping in flight at once -- not yet exercised by any fixture), the
+name-keyed stash can't tell the invocations apart and could restore the
+wrong one's stashed tuple. This risk already existed in §2.14's per-thread
+version too, for same-name concurrent invocations sharing one thread; going
+global only widens its scope from "within one thread" to "across threads,"
+not a new category of risk.
+
+Verified against the same scratch crate that first confirmed the bug,
+directly through `parse_trace()`: the previously-broken child call now
+correctly resolves nested under its migrating parent despite the observed
+cross-thread migration. Then promoted permanently to the dummy-lib fixture
+(`dapi::migrating_child`/`migrating_parent`/`busy_sibling`/
+`multi_async_demo`): `multi_async_demo` builds and runs its own dedicated
+multi-worker-thread tokio runtime on a plain `std::thread` (deliberately
+*not* nested inside `dummy-cli`'s own runtime, which stays
+`flavor = "current_thread"` for §2.14's fixture, and *not* the crate's own
+`#[tokio::main]`), spawning `migrating_parent` as its own independently
+schedulable task alongside 100 busy sibling tasks -- confirmed to reliably
+migrate `migrating_parent`'s own polls across 2+ distinct worker threads on
+every run. `migrating_parent` itself gets no real ancestor recorded on its
+own (new, never-seen-before) worker thread, but `multi_async_demo` is its
+one and only static caller anywhere in the project, so the pre-existing
+`implicit_parent` fallback (§2.11's own mechanism, not anything new)
+correctly attributes it anyway -- the fixture's own interesting case is
+specifically `migrating_parent` -> `migrating_child`, both genuinely part
+of the same task family, surviving real cross-thread migration. Added with
+its own dedicated isolated `trace_multi_async.jsonl` (same pattern as
+`trace_async.jsonl`/`trace_concurrent.jsonl`/`trace_gap.jsonl`) and
+`test_multi_async_replay.js`. Every hardcoded span-count assertion across
+the test suite updated (27 -> 30 spans) accordingly.
+
 ## 3. Points to fix
 
 - ~~Duplicated trace-parsing logic~~ **Fixed.** `trace_log.py` (Python) and
@@ -2430,15 +2582,28 @@ Built exactly as proposed, no design changes:
   replaying a trace that spans multiple crates hasn't been considered at
   all.
 
-  **Replay-for-library/async: accepted as a permanent limitation, not a
-  gap to close.** A trace only exists because something ran and produced
-  log output — a library has no entry point of its own to run, so "replay
-  a library" was never a coherent ask to begin with (you'd replay whatever
-  *binary* exercised the library, which already works). `async fn` has a
-  similar shape: replay works by assuming log order is a single, straight
-  call stack, which stops being true once a span can suspend and resume
-  across `.await` points. No further design work planned here — this is
-  closed, not deferred.
+  **Replay-for-library: accepted as a permanent limitation, not a gap to
+  close.** A trace only exists because something ran and produced log
+  output — a library has no entry point of its own to run, so "replay a
+  library" was never a coherent ask to begin with (you'd replay whatever
+  *binary* exercised the library, which already works). No further design
+  work planned here — this is closed, not deferred.
+
+  **Async replay, revisited and settled — see §2.14/§2.15.** Original
+  reasoning: replay works by assuming log order is a single, straight call
+  stack, which stops being true once a span can suspend and resume across
+  `.await` points. Same shape as the multi-thread case below, and settled
+  the same way: the CORRECTNESS half turned out separable and solvable
+  without touching the target's own function bodies (`FmtSpan::ENTER |
+  EXIT`, config-only) — confirmed and fixed for single-threaded async
+  runtimes first (§2.14), then extended to multi-threaded ones too (§2.15,
+  a global rather than per-thread suspended-span stash) — a task's own
+  polls can migrate across OS threads over its lifetime, and `tracing`'s
+  plain JSON output has no stable task identity to reassemble that across
+  threads the way per-thread stacks did for genuinely separate OS threads,
+  but the static call graph's own `implicit_parent` fallback (§2.11) turned
+  out to already cover the one remaining gap (an ancestor-less span on a
+  brand-new worker thread) the same way it does for `concurrent_demo`.
 
   **Multi-thread, revisited and partially settled — see §2.11.** Full
   simultaneous multi-thread replay (seeing two threads' activity at once,

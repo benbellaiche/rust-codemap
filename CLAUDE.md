@@ -455,6 +455,44 @@ gained an explicit `main` prefix it was silently missing) -- confirmed via
 a full re-check of `parse_trace()`'s output against the entire trace, not
 assumed from the one fixture that surfaced it.
 
+`"enter"`/`"exit"` lines (§2.14, `FmtSpan::ENTER | FmtSpan::EXIT`,
+opt-in on the target -- never emitted for a plain `NEW | CLOSE` setup)
+fix a real correctness gap for `async fn`: a sync fn's span enters once
+and never exits until CLOSE, so `own_stack` tracking it purely via
+NEW/CLOSE is already correct -- but an async fn can be entered/exited many
+times (once per executor poll), and a real `.await` suspension means the
+executor is free to run something *entirely unrelated* on the same thread
+meanwhile. Without tracking this, that unrelated code wrongly inherits the
+suspended span as its ancestor -- confirmed directly (`tokio::join!` on a
+single-threaded runtime, two independent async fns with different sleep
+durations): the shorter one came back nested under the longer one.
+Tracked via a second, GLOBAL structure (§2.15), `suspended_stack` (name ->
+stashed `(name, callOrder)`, shared across ALL threads, not per-thread like
+`own_stack`): "exit" pops the span off `own_stack` (if genuinely on top)
+and stashes it; "enter" restores it from the stash *unless* it's already
+on top (the first enter, immediately following its own NEW -- confirmed
+directly -- never needs restoring). "close" now resolves via the same
+real-source-location lookup as NEW/ENTER/EXIT (confirmed all four carry
+the same `filename`/`line_number`), checking the stash first, falling back
+to the plain `own_stack.pop()` otherwise -- which is *all* that happens
+when ENTER/EXIT isn't enabled at all (ordinary sync code, the overwhelming
+majority), so this is fully backward compatible. The stash is deliberately
+global, not per-thread: a multi-threaded runtime can migrate the *same*
+task's own polls across different OS threads over its lifetime -- confirmed
+directly on a scratch crate (`tokio::spawn`'d task, real scheduler pressure)
+showing 3 distinct `threadId`s across one task's own ENTER/EXIT lines. A
+per-thread stash (the original, mono-thread-only version) would stash the
+suspended entry under the thread it exited on and never find it again once
+resumed elsewhere; restoring by name only fixes this, pushing the restored
+entry onto whichever thread's `own_stack` the resuming enter actually
+happened on. `own_stack` itself stays per-thread, unchanged -- what's
+genuinely active *right now* is always thread-local, unlike the suspended
+stash. Known, accepted limitation (same category as before, just wider
+scope): the exact same async fn/call-site invoked truly concurrently (not
+just interleaved by suspension) could restore the wrong stashed tuple --
+already possible in the per-thread version for same-thread concurrent
+invocations, not a new risk.
+
 `btn-step`'s click handler reads `traceIdx` synchronously but the actual
 `stepTo()` call is delayed (`animPlay`, or a much longer return-path
 flash) -- a `stepBusy` flag (declared with `traceIdx` up top) guards

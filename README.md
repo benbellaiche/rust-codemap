@@ -299,8 +299,9 @@ Each line is either a span **entry** event or a span **close** event:
   sibling `time.idle` field tracing also reports. `time.idle` (time the
   span existed but wasn't the active context) is not used anywhere in
   this tool — it's near-zero for ordinary synchronous code and only
-  becomes meaningful for `async fn` (out of scope for replay already, see
-  "Known limitations").
+  becomes meaningful for `async fn` (replay for which now works, single- or
+  multi-threaded runtime alike, see "Optional: replaying `async fn`
+  correctly" below).
 
 ### Optional: capturing a function's own internal state
 
@@ -423,6 +424,53 @@ truncated, one-name-only chain shares nothing with its own parent's real
 chain even though one genuinely leads to the other — which showed up as a
 real, visible bug (a "returning to main" flash firing on the very first
 step into a spawned thread, before that thread's own edge had even lit up).
+
+### Optional: replaying `async fn` correctly
+
+Add `.with_span_events(...)` to include `FmtSpan::ENTER | FmtSpan::EXIT`,
+alongside the already-mandatory `NEW | CLOSE`:
+
+```rust
+tracing_subscriber::fmt()
+    .json()
+    .with_span_events(
+        tracing_subscriber::fmt::format::FmtSpan::NEW
+            | tracing_subscriber::fmt::format::FmtSpan::ENTER
+            | tracing_subscriber::fmt::format::FmtSpan::EXIT
+            | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+    )
+    .init();
+```
+
+This fixes a real correctness problem for `async fn`, the same way
+`.with_thread_ids(true)` does for genuinely concurrent OS threads. A sync
+fn's span is entered once and never exited again until it closes — but an
+`async fn` can be entered and exited many times over its own lifetime,
+once per executor poll, and a real `.await` suspension means the executor
+is free to run something else *entirely unrelated* on the same thread in
+the meantime. Without ENTER/EXIT, the parser has no way to tell "this span
+is merely suspended, not actually the active caller" from "this span is
+genuinely still running" — confirmed as a real, reproducible bug: two
+independent async fns run concurrently via `tokio::join!` (one with a much
+shorter sleep than the other) came back with the shorter one wrongly
+attributed as nested under the longer one, even though they're siblings,
+not nested. With ENTER/EXIT present, the parser correctly tracks which
+span is *genuinely* active at any point, not just which one hasn't closed
+yet — real nesting across a suspension (one async fn directly awaiting
+another) still resolves correctly, only genuinely-unrelated interleaved
+code stops being wrongly attributed.
+
+**Multi-threaded async runtimes work too** (the default for most
+`#[tokio::main]` setups, not just `flavor = "current_thread")`). A task's
+own polls can migrate across different OS threads over its lifetime on a
+multi-threaded runtime, and `tracing`'s plain JSON output has no concept of
+a stable task identity to reassemble that across threads — unlike
+genuinely separate OS threads (`.with_thread_ids(true)` above), which keep
+one identity for their whole life. The suspended-span stash above is
+tracked globally (not per thread), so a span that suspends on one worker
+thread and resumes on another still resolves correctly; only the "which
+thread is *this* span active on right now" bookkeeping stays per-thread,
+since that part is always genuinely thread-local at any given instant.
 
 ### How a span is matched to a graph node
 
@@ -635,9 +683,12 @@ each. In short, today:
   log output, and only a binary's `main()` is guaranteed to be that
   something (the replay animation's unwind-to-root also keys off finding a
   node whose id ends in `::main`). The same reasoning is why replay doesn't
-  show more than one thread's activity *at once*, or replay `async fn` —
-  the tool replays *log order* within a thread, which only maps onto a
-  real call stack for ordinary synchronous, single-threaded execution.
+  show more than one thread's activity *at once* — the tool replays *log
+  order* within a thread, which only maps onto a real call stack for
+  ordinary synchronous, single-threaded execution (`async fn` is now
+  handled correctly too, single- or multi-threaded runtime alike, with
+  ENTER/EXIT tracking — see "Optional: replaying `async fn` correctly"
+  above).
   What it *can* do, without any propagation change in the target code: a
   spawned-thread span with no recorded ancestor gets attributed back to
   whichever function the static call graph shows as its one and only
