@@ -715,6 +715,31 @@ so each crate's items resolve against that crate's own `src/`.
   edges now resolve to the identical `rgb(137,180,250)` as dimmed nodes,
   and the elevated 0.35 opacity is in effect (not the default 0.75 or the
   node's 0.12). All other regression tests re-run clean.
+
+  **Fourth follow-up, requested directly: reveal untraced first-degree
+  neighbors specifically within this focused view.** `expandNeighborhood`
+  had always deliberately left an untraced neighbor hidden through an
+  expand/restore cycle (see the first follow-up above) -- correct as far as
+  it went, but meant a node's ONE actual untraced caller/callee simply
+  never appeared in this view at all, even though it's a real, direct
+  first-degree relationship. Fixed by identifying which elements of
+  `node.closedNeighborhood()` are currently hidden
+  (`neighborhood.filter(':hidden')`) and showing them for the duration of
+  this one focused view (`revealedByExpansion`, the same
+  remember-and-restore pattern as `hiddenByExpansion`/`expandedPositions`/
+  `preExpandView`) -- `restoreExpansion()` hides them again, so the global
+  "Hide untraced" toggle's state everywhere else is completely unaffected;
+  this view is the one deliberate, scoped exception, same reasoning as
+  `main`'s own permanent exemption from that same toggle. Verified against
+  the untraced-gap fixture (§2.12): double-clicking `gap_demo` reveals its
+  real first-degree neighbor `untraced_relay` (still carrying its
+  `.untraced` class, so it renders with its usual dashed styling, not
+  disguised as an ordinary node) while a second-degree node reached only
+  *through* it (`gap_leaf`, 2 hops away) correctly stays hidden, and a
+  genuinely unrelated node stays hidden too; restoring returns
+  `untraced_relay` to hidden and the unrelated node back to visible. Full
+  existing expansion/untraced-toggle regression suite re-run clean
+  alongside the new test.
 - **Trace span -> graph node matching, by real source location instead of
   span name.** Raised while planning how to actually test replay: the real
   target project's `#[instrument]` calls use custom `name = "..."` values
@@ -1517,6 +1542,416 @@ change" class of bug this project has hit before). Full regression suite
 that needed its own selector updated after the legend's move, same as
 any other test that directly referenced a since-relocated element id.
 
+### 2.11 Concurrent replay: a correctness fix, deliberately short of full multi-thread support
+
+Raised as "can we see B and C highlighted at the same time when A calls
+them concurrently in two threads" -- investigated, scoped down twice
+before landing on what actually got built.
+
+**What full simultaneous display would need, and why it wasn't built.**
+Real wall-clock `timestamp`s (already in every log line, never read by
+this tool for anything) would let the viewer group spans into "active at
+the same real-world moment" clusters instead of one linear step sequence
+-- but `stepTo()`'s whole model (exactly one "current" span, `Step >`
+meaning "the next one in the list") would need to become "the next moment
+the active set changes," possibly several nodes/edges highlighted at
+once, and the Execution Context panel would need to show more than one
+block at a time. A real UI redesign, not an extension -- explicitly
+declined.
+
+**A second question, asked before committing to anything: does this even
+need code changes on the Rust/tracing side?** Yes, confirmed two separate
+things empirically with disposable scratch crates (not the shipped
+fixture):
+1. `.with_thread_ids(true)` -- one line, tells spans apart by thread.
+   Free, no other cost.
+2. Whether `tracing` automatically links a spawned thread's spans back to
+   whatever function spawned it. It does not: a scratch crate calling
+   `thread::spawn(|| b())` from inside an instrumented `a()`, with no
+   other changes, produced `b`'s own `spans: []` -- completely disconnected
+   from `a`, even though `b` is called textually right inside `a`'s own
+   body. Only capturing `tracing::Span::current()` before the `spawn` and
+   `.enter()`-ing it inside the closure produced the correct
+   `spans: [{"name": "a"}]`. This has to be done at *every* thread-spawn
+   call site in the target's own code -- a real, non-trivial adoption
+   cost this project decided not to require.
+
+**What "just don't do the propagation" actually looks like today, though
+-- checked before deciding it was an acceptable trade-off, not assumed.**
+Built a real demo (`dapi::concurrent_demo` calling `dapi::thread_b`/
+`thread_c` in two real OS threads, no propagation) and stepped through it
+for real in the browser. The result wasn't a neutral "missing info" gap:
+`trace_log.py`'s single shared open-span stack doesn't know the two
+threads' NEW events are unrelated, so it saw `thread_c` open while
+`thread_b`'s own span was still open and concluded `thread_c` must be
+*nested inside* `thread_b` -- wrong, they're both direct children of
+`concurrent_demo`. During replay this produced an actively misleading
+result, not just an absent one: stepping to `thread_c`, the viewer tried
+to color an edge `thread_b -> thread_c` that doesn't exist in the static
+graph (so nothing happened), while `concurrent_demo -> thread_b` stayed
+visually "active" long after execution had moved on -- confirmed with a
+real screenshot, not just the underlying data.
+
+**The fix actually built: per-thread open-span stacks, no propagation
+required.** `trace_log.py`'s `open_stacks` (plural) keys the previously-
+single stack by each entry's own optional `threadId` field -- absent
+entries all share one implicit key, so a trace with no thread ids at all
+(the overwhelming majority, unaffected) behaves byte-for-byte like before
+this existed. With thread ids present, `thread_b` and `thread_c` each get
+their own independent stack, so the false nesting can't happen at all --
+both now correctly report `stack: []`, the same honest "no known caller"
+`main` itself already used (§2.8), rather than a fabricated link to each
+other. This is NOT the same as reconstructing the real
+`concurrent_demo -> thread_b`/`-> thread_c` links -- those stay unknown,
+by design, since that data genuinely isn't in the trace without
+propagation. The win is narrower and specific: concurrent code no longer
+produces an actively wrong result, even though it still doesn't show the
+full picture. `CLOSE` and `EVENT` handling were also switched to read
+their own thread's stack specifically (`own_stack`, resolved once per
+entry via a `thread_key()` helper) instead of a bare module-level list.
+
+Added `dapi::thread_b`/`thread_c`/`concurrent_demo` to the dummy-api
+fixture (kept permanently, `main.rs` wired to call it alongside
+everything else, `.with_thread_ids(true)` added unconditionally to the
+mandated setup -- harmless for ordinary single-threaded code, every span
+just carries the same one thread id) specifically so this fix has a real
+regression test, not just the disposable scratch-crate investigation that
+led to it. Verified end-to-end on the real fixture, both before and after
+the fix: before, `thread_c` came back nested under `thread_b`
+(`stack: ['dapi::thread_b']`) and the viewer visibly got stuck on the
+wrong edge; after, both report `stack: []` and neither
+`concurrent_demo -> thread_b` nor `-> thread_c` gets fabricated, while
+`main -> concurrent_demo` and every other single-threaded hop in the
+trace color exactly as before -- confirmed via a dedicated Playwright
+test (`test_concurrent_replay.js`) checking both the underlying
+`stack`/`depth` data and the actual rendered edge colors, and the full
+existing regression suite re-run clean. Schemas
+(`trace-{entry,close,event}.schema.json`) updated with optional
+`threadId`/`threadName` properties -- previously undeclared fields that
+`additionalProperties: false` would have rejected outright, confirmed
+directly (`validate-trace` against a real threaded trace failed until
+this was added).
+
+**Follow-up: the honest `stack: []` above still left the edges uncolored
+during replay -- caught live, not by re-reading the code.** After landing
+the per-thread-stack fix, stepping through the real fixture in the browser
+showed both `concurrent_demo -> thread_b` and `-> thread_c` staying gray/
+inactive throughout -- confirmed with Playwright reading each edge's actual
+computed style at each step, not assumed from the `stack: []` result above.
+Asked which way to resolve it: leave the honest gap, or extend the
+*already-existing* "confirmed-by-the-static-graph" mechanism (until now
+hardcoded to only ever check `main` specifically, §2.8) to any node --
+attribute an ancestor-less span to a parent whenever the static graph shows
+that parent is the *one and only* function that could possibly call it,
+anywhere in the project. Chosen: the generalization. It's the identical
+kind of confirmation the `main`-only version already relied on, just not
+artificially restricted to one specific candidate parent -- a single static
+caller is not a guess regardless of whether that caller happens to be
+`main` or something else. `concurrent_demo` is the sole static caller of
+both `thread_b` and `thread_c`, so both now resolve to
+`stack: ['dapi::concurrent_demo']` and light up their real incoming edge
+correctly during replay (red while current, green once visited) -- even
+though `tracing` itself never recorded that link; the inference comes
+entirely from `graph.json`, the same ground-truth source `main`'s own case
+already trusted. Genuinely ambiguous cases (2+ static callers, e.g.
+`dcore::add`, called from both `dummy-ops` and `dummy-api`) are unaffected
+and still stay an honest `stack: []` -- that line was never about "is the
+candidate `main`", it was always "is there exactly one candidate", and
+still is.
+
+Implementation: `_find_main_id` (single-purpose, main-only) replaced with
+`_build_callers` (callee id -> set of distinct caller ids, from every edge
+in `graph.json`) and `implicit_root_parent` renamed `implicit_parent`,
+now checking "does this callee have exactly one entry in that set" instead
+of "does `main` specifically have a direct edge to it". `main`'s own
+existing behavior is exactly reproduced as one instance of the general
+rule (it usually is the sole caller of whatever it calls directly), not a
+special case anymore. Verified both ways: a direct `parse_trace()` call
+against the real fixture shows `thread_b`/`thread_c` both resolving to
+`['dapi::concurrent_demo']` and every pre-existing span's `stack` unchanged
+(including `dcore::add`'s two ambiguous occurrences, still `[]`); the full
+existing regression suite re-run clean (`test_main_edge_coloring.js`,
+`test_real_trace_replay.js`, `test_call_site_split.js`,
+`test_toggle_static.js`, `test_replay_mode_fixes.js`, `test_exec_context.js`)
+plus `test_concurrent_replay.js` rewritten to assert the new, correct
+coloring instead of the old "stays uncolored" expectation it was built to
+verify before this follow-up.
+
+**Second follow-up: `main -> concurrent_demo` was turning green ("returned")
+before `thread_b`/`thread_c` had even run -- caught live again, via a
+screenshot, not by re-reading the code.** Stepping through the real fixture
+showed `main -> concurrent_demo` already visited/green the moment replay
+reached `thread_b` -- graphically wrong, since `concurrent_demo` is blocked
+on `.join()` and genuinely hasn't returned to `main` yet at that point.
+Root cause: `stepTo()` decided "already returned" purely from step index
+(has this span's NEW been stepped past), which happens to equal real close
+order for ordinary synchronous code (RAII guarantees a span's own CLOSE
+always precedes its next sibling's NEW) -- but that guarantee doesn't hold
+across threads, and `trace_log.py` was discarding the real position of
+CLOSE lines entirely (only aggregating duration/count per invocation, never
+"when did this actually close relative to everything else").
+
+Fixed by giving the viewer the real data instead of an index-order
+assumption: `trace_log.py` now attaches `openSeq`/`closeSeq` to every span
+-- the 0-indexed position of that invocation's own NEW/CLOSE line in the
+raw log (counting NEW, CLOSE, and EVENT lines alike), not anything derived
+from the resolved span list. `stepTo()`'s per-step loop, for every span
+already stepped past (`i < idx`), now checks `span.closeSeq >=
+traceData[idx].openSeq` -- if the span's own close genuinely hasn't
+happened yet by the time the current step's span opened, it stays visually
+"active" (same red as the literal current step, chosen over inventing a
+third color -- multiple things really can be active at once now) instead
+of flipping to green. Confirmed exactly matches the real trace's own
+ordering, not another guess: `concurrent_demo` (`closeSeq` 48) stays active
+through both `thread_b` (`openSeq` 44) and `thread_c` (`openSeq` 45); more
+subtly, `thread_b` itself (`closeSeq` 46) stays active through `thread_c`'s
+own step too, since `thread_b`'s real CLOSE line comes *after*
+`thread_c`'s NEW line in this exact trace -- not a bug, genuinely what
+happened, and now shown honestly instead of smoothed over by index order.
+
+`finishTraceToRoot()` (the extra "Step >" once the trace is fully played)
+had to change too: it only ever unwound the *last* span's own ancestor
+chain, but with spans now able to stay "active" independently of index
+order, some other still-open span (`concurrent_demo`) needed settling too.
+Rewritten to sweep every node still carrying the `.current` class (besides
+the literal last span) and re-derive its own real incoming edge from its
+`stack` -- the same `fullPath` lookup `stepTo()` itself uses, not a
+style-value string match (tried first, and silently did nothing: Cytoscape's
+`.style('line-color')` getter returns a resolved `rgb(...)` string, never
+back the hex literal it was set with, so `=== '#f38ba8'` never matched
+anything -- caught by an actual step-through-then-inspect test, not
+assumed). Verified via Playwright: after fully stepping through the trace,
+`concurrent_demo`/`thread_b`'s real incoming edges are still visibly active
+(not silently reverted to gray by a failed comparison); one more "Step >"
+past the end settles every node/edge to visited, none left stuck active.
+`test_concurrent_replay.js` and `test_real_trace_replay.js` both updated --
+the latter's "every node visited by the end" assertion had to explicitly
+carve `concurrent_demo`/`thread_b` out into a separate "still active"
+check, since asserting they're visited at that point would now itself be
+asserting the bug.
+
+**Third follow-up: the previous fix wasn't actually enough -- caught by the
+user re-describing exactly what they saw, step by step, not by re-testing
+blind.** Reported again as "still broken" after the second follow-up
+above; walking through it together surfaced a DIFFERENT, more precise
+symptom: a yellow "returning to main" flash animation was firing on the
+very first step INTO `thread_b` -- before `thread_b`'s own edge had even
+lit up red. Root cause, once isolated: `implicit_parent`'s fallback
+(second follow-up, §2.11 above) set `stack = [confirmed]` -- just the one
+confirmed parent, not that parent's own ancestor chain too. So
+`concurrent_demo`'s own `stack` was `['main']` while `thread_b`'s was
+`['concurrent_demo']` alone (no `main` prefix) -- two arrays that share NO
+common element at index 0, even though `concurrent_demo` genuinely *is*
+`thread_b`'s direct parent. The viewer's `computeReturnPath()` (walks two
+spans' `stack`s looking for a shared prefix to decide how far to "unwind")
+found no overlap at all and concluded it must unwind all the way back to
+`main` -- a real, visible false positive, confirmed by calling
+`computeReturnPath(concurrent_demo, thread_b)` directly in the browser and
+getting a non-empty path back (should be `[]`, "going deeper, not
+returning", for a true parent->child step).
+
+Fixed in `trace_log.py`: a new `full_path_by_name` dict records, for every
+span whose `stack` gets resolved (from a real nested `own_stack` OR from
+`implicit_parent`), its OWN full chain-plus-itself. When `implicit_parent`
+fires, `stack` is now `full_path_by_name.get(confirmed, [confirmed])` --
+the confirmed parent's *entire* chain, not just its bare name. Verified:
+`thread_b`/`thread_c` now both resolve to
+`['dummy_cli::main', 'dapi::concurrent_demo']` (depth 2, not the previous,
+truncated depth 1); `computeReturnPath(concurrent_demo, thread_b)` now
+correctly returns `[]`. Bonus, unplanned fix from the same change: the
+sidebar trace list's collapse/indent logic (`hasChildren`, compares
+consecutive spans' `depth`) now correctly shows `thread_b`/`thread_c`
+nested under `concurrent_demo` too -- it silently wasn't before, since
+both sat at the same shallow depth. Full regression suite re-run clean
+again, plus `test_concurrent_replay.js` extended with a direct
+`computeReturnPath()` assertion (not just the resulting colors) so this
+exact class of bug -- a *shape* problem in `stack`, not a color/timing one
+-- has its own explicit check going forward.
+
+**Fourth follow-up: a genuinely separate bug, found by simulating an
+impatient user rather than by re-testing the fixes above.** Still reported
+as broken after the third follow-up, despite that one being independently
+verified correct (fresh server, hard-reloaded page, exact same trace file).
+Rather than keep re-deriving the same result, tried something different: a
+Playwright test that clicks "Step >" 4 times rapidly (50ms apart, well
+under the ~700ms `animPlay` delay), simulating a person clicking faster
+than the animation resolves -- and after 4 clicks plus 3 full seconds of
+waiting, the trace was stuck on the very first step. Root cause: the
+`btn-step` click handler reads the global `traceIdx` synchronously to
+compute `nextIdx`, but `traceIdx` itself doesn't actually update until the
+delayed `stepTo()` call lands (after `animPlay`, or a much longer
+return-path flash) -- so a second click before that happens re-reads the
+SAME stale `traceIdx`, computes the SAME `nextIdx` again, and its own
+click does nothing new. Every extra rapid click was silently a no-op,
+which reads as "broken/stuck" to whoever's clicking, not as "ignored."
+This bug predates this whole session's concurrent-replay work entirely --
+it's not something introduced by any of the three follow-ups above, and
+would affect ANY trace, not just concurrent ones -- but it's a very
+plausible explanation for "still doesn't work" surviving three otherwise-
+verified fixes: an impatient re-test (very understandable after several
+rounds of "try again") would keep re-triggering it.
+
+Fixed with a `stepBusy` flag (module-level, alongside `traceIdx`): set the
+moment a step begins (click handler entry), cleared only once the actual
+delayed `stepTo()` (or `finishTraceToRoot()`'s own async settle) really
+lands; the click handler now ignores any click while `stepBusy` is true
+instead of silently recomputing a stale target. Also cleared defensively
+on Reset/Unload/loading a new trace, in case one of those interrupts a
+step mid-flight. `btn-step-prev` didn't need this -- it calls `stepTo()`
+synchronously with no delay, so it was never exploitable this way.
+Verified via Playwright: a rapid double-click now advances by exactly one
+step (not zero, not two, not corrupted), and normal paced clicking
+afterward still reaches the end and settles correctly, including a rapid
+double-click on the very last "Step >" (`finishTraceToRoot`). Full
+regression suite re-run clean again.
+
+### 2.12 Static-graph/replay gap: an untraced intermediate function
+
+Asked deliberately, before moving on to other work: what does the viewer
+show when the static graph and the trace genuinely can't agree, because a
+function in between two traced ones was never instrumented? Not a bug
+report -- a real fixture requested up front so the answer is observed, not
+assumed.
+
+**The fixture** (`dummy-api`): `gap_demo` (`#[instrument]`) calls
+`untraced_relay` (deliberately bare, no `#[instrument]`) which calls
+`gap_leaf` (`#[instrument]` again).
+
+**Static graph**: all three are real nodes -- MIR sees every function
+regardless of instrumentation, `untraced_relay` included. It gets
+`traced: false`, so it's hidden by default behind "Show untraced" (dashed
+outline when revealed), along with *both* of its edges
+(`gap_demo -> untraced_relay`, `untraced_relay -> gap_leaf`) --
+`connectedEdges()` hides anything touching a hidden node, either
+direction. There is no synthesized `gap_demo -> gap_leaf` edge anywhere --
+the graph only ever has the edges MIR actually found declared in the
+source.
+
+**Replay**: `gap_leaf`'s own NEW event finds `gap_demo`'s span still
+genuinely open on the call stack (tracing's `own_stack` has no concept of
+`untraced_relay` at all -- it's not a span, never pushed, never popped),
+so `gap_leaf` gets `stack: ["gap_demo"]` -- correctly skipping the
+untraced function, and NOT a guess: `gap_demo` really is the innermost
+open span at that moment (this is the ordinary `own_stack` mechanism, not
+`implicit_parent` -- the stack isn't empty, so that mechanism never even
+fires here). Verified directly: `parse_trace()` on the real fixture
+returns exactly `stack: ["dapi::gap_demo"]` for `gap_leaf`.
+
+The gap: stepping to `gap_leaf`, the viewer tries to color an edge
+`gap_demo -> gap_leaf` (from `gap_leaf`'s own attributed `stack`) that
+does not exist in the static graph. `gap_leaf` still correctly lights up
+as the current node -- but **no incoming edge lights up at all**, not the
+real `untraced_relay -> gap_leaf` edge (irrelevant to what the trace
+recorded) and not a fabricated direct one either (never invented). Verified
+visually via Playwright screenshots: `gap_leaf` appears as a highlighted
+node with no colored arrow leading into it, genuinely disconnected-looking
+even though the static graph (with untraced revealed) shows the real path
+right there. Not a bug -- an honest reflection of the fact that the trace
+and the static graph are answering two different questions
+("who's my nearest *traced* ancestor" vs. "what calls were actually
+declared"), and this tool has never fabricated an edge to paper over that,
+consistent with every other gap decision in this document (§2.8, §2.11).
+
+Added to the dummy-lib fixture permanently (`dapi::gap_demo`/
+`untraced_relay`/`gap_leaf`, wired into `dummy-cli`'s `main.rs`), with a
+dedicated isolated `trace_gap.jsonl` (same pattern as `trace_concurrent
+.jsonl`, §2.11) for regression-testing this exact scenario going forward.
+
+**Follow-up: asked directly whether this gap should be fixed, not just
+documented.** Three options weighed:
+1. Traverse the static graph for a real multi-hop path (`gap_demo ->
+   untraced_relay -> gap_leaf`) and color it. Rejected: if more than one
+   real path exists between the two trace-confirmed endpoints (plausible
+   in real code, not this simple fixture), there's no way to know which
+   one was actually taken -- exactly the kind of guess this tool has
+   never made (§2.8, §2.11's `implicit_parent`).
+2. **Chosen**: render a visually distinct *synthetic* edge directly
+   between the two trace-confirmed nodes (`gap_demo -> gap_leaf`) --
+   dashed, its own `gap` edge type (muted grey, never one of the real
+   `call`/`dispatch`/`loop_call`/`trampoline` colors), labeled
+   "(untraced gap)". Always well-defined (the two endpoints come straight
+   from `stack`, which is never ambiguous), and never claims a direct call
+   happened -- just that the trace confirms these two are related and
+   something untraced sat in between.
+3. Leave it exactly as it was (no edge at all). Rejected as too little
+   value for a real debugging session -- a node with literally nothing
+   connecting it reads as "broken", not "gap".
+
+Implemented in `stepTo()`: when a hop's normal edge lookup finds nothing,
+`cy.add()` creates the synthetic edge (id `gap-${src}->${tgt}`, reused
+across hops/spans within the same render pass if the same gap recurs),
+colored active/visited exactly like a real edge would be, dashed via a new
+`gap` entry in the base edge stylesheet's line-style list and `EDGE_LEGEND`
+(so the legend explains it, but only once a replayed trace actually hits
+this case -- it's never part of the static graph). Torn down by
+`clearAll()` alongside everything else it resets, so it never lingers past
+the step that created it. Verified via Playwright: the edge appears
+dashed/red while `gap_leaf` is current, settles to green once the trace
+finishes, and disappears entirely on Reset.
+
+**Second follow-up: `gap_demo`/`gap_leaf` rendered as siblings in the
+sidebar, not nested -- caught by the user proposing their own root cause
+("gap_leaf isn't really nested under gap_demo"), which turned out to be
+backwards but pointed straight at a real bug anyway.** Checked first: is
+that true? No -- the raw trace itself settles it (`gap_leaf`'s own NEW
+line carries `"spans":[{"name":"gap_demo"}]`, `tracing`'s own record, not
+this tool's inference), and `parse_trace()` already resolved
+`gap_leaf.stack == ["dapi::gap_demo"]`, confirming real nesting. But
+`gap_demo.depth` and `gap_leaf.depth` were BOTH `1` -- genuinely wrong,
+just not for the reason proposed.
+
+Root cause: `stack = [nm for nm, _co in own_stack]` read `own_stack`'s raw
+names directly. `own_stack` only ever holds names `tracing` itself pushed
+-- it has no idea the span currently on top (`gap_demo`) was itself
+attributed to a further, *virtual* ancestor via `implicit_parent` (`main`,
+which is never pushed onto any `own_stack` at all, since it's never a real
+span). So `gap_demo`'s own resolved `stack` was `["main"]` (via
+`full_path_by_name`, §2.11's second follow-up), but `gap_leaf` — a REAL,
+genuinely-nested descendant, resolved via ordinary `own_stack` tracking,
+not `implicit_parent` — read `own_stack` directly and got just
+`["gap_demo"]`, silently dropping the `main` prefix its own parent already
+carried. Any real descendant of an `implicit_parent`-resolved span was
+subject to this, not just this one fixture — it just hadn't been noticed
+until the sidebar tree made it visible.
+
+Fixed by reusing `full_path_by_name` for the non-empty-`own_stack` case
+too, not just the `implicit_parent` fallback: `stack =
+full_path_by_name.get(own_stack[-1][0], ...)` — the innermost open span's
+own chain was already fully and correctly resolved (recursively including
+any inherited virtual prefix) the moment it was itself pushed, so reusing
+it composes correctly through any depth of real nesting. Verified against
+the *entire* trace, not just the gap fixture: every previously-nested
+span's `depth` increased by exactly 1 and gained an explicit `main` prefix
+it was silently missing before (e.g. `dapi::Report::generate` went from
+`depth: 1, stack: ["dapi::run_report"]` to `depth: 2, stack:
+["dummy_cli::main", "dapi::run_report"]`) -- a real, previously-undetected
+accuracy gap in ordinary, non-concurrent, non-gap nesting depth, fixed as
+a side effect of chasing this one report. Full regression suite re-run
+clean; `test_gap_replay.js` extended with an explicit
+`leaf.depth === demo.depth + 1` check so this exact class of bug --
+correct `stack` contents but wrong absolute `depth` -- has its own
+regression test going forward.
+
+**Third follow-up: version fingerprinting, to close off an entire class of
+"which code is this actually running" confusion.** Requested directly
+after a genuinely multi-hour detour turned out to be a stale server
+process (a zombie from hours earlier, still bound to the same port,
+silently answering requests with old code while every other signal --
+terminal banners, apparently-fresh restarts -- suggested otherwise; see
+§2.11's fourth follow-up). Added a `GET /__codemap_version` endpoint
+(`LoggingHandler.do_GET`, `codemap/__main__.py`) returning the *actual, on-
+disk* last-modified time of `index.html`, `trace_log.py`, and
+`__main__.py` itself, plus the server process's own PID -- computed fresh
+on every request (`Path(...).stat().st_mtime`), never cached, never a
+hand-maintained version number that could itself drift out of sync. The
+viewer fetches this once on page load and renders it directly in the
+toolbar as `#version-badge` (always visible, no DevTools or terminal
+needed) -- e.g. `js:15:08:47 · trace_log.py:15:01:44 ·
+__main__.py:15:07:25 · pid 744`. Deliberately mtime-based, not a semantic
+version string: this needs zero discipline to stay accurate (no step to
+remember before restarting), and directly answers the exact question that
+took an entire session to answer manually the hard way.
+
 ## 3. Points to fix
 
 - ~~Duplicated trace-parsing logic~~ **Fixed.** `trace_log.py` (Python) and
@@ -1930,15 +2365,43 @@ any other test that directly referenced a since-relocated element id.
   replaying a trace that spans multiple crates hasn't been considered at
   all.
 
-  **Replay-for-library/async/multi-thread: accepted as a permanent
-  limitation, not a gap to close.** A trace only exists because something
-  ran and produced log output — a library has no entry point of its own to
-  run, so "replay a library" was never a coherent ask to begin with (you'd
-  replay whatever *binary* exercised the library, which already works).
-  Async and multi-threaded execution have a similar shape: replay works by
-  assuming log order is a single, straight call stack, which stops being
-  true the moment execution isn't strictly synchronous on one thread. No
-  further design work planned here — this is closed, not deferred.
+  **Replay-for-library/async: accepted as a permanent limitation, not a
+  gap to close.** A trace only exists because something ran and produced
+  log output — a library has no entry point of its own to run, so "replay
+  a library" was never a coherent ask to begin with (you'd replay whatever
+  *binary* exercised the library, which already works). `async fn` has a
+  similar shape: replay works by assuming log order is a single, straight
+  call stack, which stops being true once a span can suspend and resume
+  across `.await` points. No further design work planned here — this is
+  closed, not deferred.
+
+  **Multi-thread, revisited and partially settled — see §2.11.** Full
+  simultaneous multi-thread replay (seeing two threads' activity at once,
+  reconstructing which function spawned which thread) is still out of
+  scope, same reasoning as async — deliberately declined after a concrete
+  proposal, not merely unconsidered. But the CORRECTNESS half of this
+  turned out to be separable and worth fixing on its own: without any
+  thread awareness at all, two genuinely concurrent spans could get
+  parsed as if one were nested inside the other (confirmed as a real,
+  reproducible bug, not a hypothetical) — during replay this produced an
+  actively misleading result (an edge stuck "active" long after execution
+  moved on, the real edge never lighting up), not just an absent one.
+  Fixed with per-thread open-span stacks in `trace_log.py`, keyed by an
+  optional `threadId` field (`.with_thread_ids(true)`, see README.md) —
+  concurrent spans no longer get a fabricated relationship to each other.
+  A follow-up (still §2.11) then generalized the existing "confirmed by
+  the static graph" mechanism beyond just `main` — an ancestor-less span
+  is attributed to a parent whenever the call graph shows exactly one
+  function could possibly have called it, which `concurrent_demo` is for
+  both `thread_b`/`thread_c` — so those edges now correctly light up
+  during replay too, without ever guessing a link the trace itself didn't
+  record. Still doesn't reconstruct a *real*, trace-recorded parent link
+  (needs the target code to propagate `tracing::Span::current()` across
+  every `thread::spawn`, confirmed `tracing` doesn't do this automatically
+  — a real per-call-site cost this project decided not to require) or
+  show concurrent activity simultaneously (needs a different `stepTo()`
+  model driven by real timestamps, not just log order) — both remain
+  closed, same as async.
 - ~~Cross-crate node-id collision — leave as a known limitation, or
   disambiguate?~~ **Settled and implemented — see §2.8.** Qualified every
   node id by the crate that defines it (`crate::Type::method`,

@@ -213,6 +213,14 @@ number-key navigation below stays light. Only one neighborhood is expanded
 at a time — double-clicking elsewhere, clicking empty canvas, or "Show full
 graph" all restore the exact original positions, visibility, and view.
 
+If one of that node's direct neighbors is normally hidden by "Hide
+untraced," it's temporarily revealed for this one focused view (still with
+its usual dashed styling, so it's clear it's untraced) — restoring puts it
+back to hidden, so the global toggle's state everywhere else is
+unaffected. A neighbor reached only *through* an untraced function (two
+hops away, not a direct connection) still stays hidden — this only reveals
+genuine first-degree relationships.
+
 Three ways to move from a focused node to one of its neighbors without
 touching the doc list:
 
@@ -348,6 +356,74 @@ for the third line shape a plain event produces (distinct from entry/close
 — told apart by `fields.message`, since an event's own `span` field
 reports its *enclosing* span's identity, never one of its own).
 
+### Optional: telling concurrent calls apart
+
+Add `.with_thread_ids(true)` (and, for readable names instead of raw
+numbers, `.with_thread_names(true)`) to the same setup:
+
+```rust
+tracing_subscriber::fmt()
+    .json()
+    .with_span_events(...)
+    .with_thread_ids(true)
+    .init();
+```
+
+This fixes a real, confirmed correctness problem, not just a nice-to-have:
+without it, if two threads' spans genuinely overlap (thread A opens a span,
+thread B opens its own before A's closes), the parser has no way to tell
+they're on different threads — it ends up treating B's span as *nested
+inside* A's, which is wrong, and during replay produces a real, misleading
+result (an edge stays visually "active" long after execution has actually
+moved on, while the edge to what's really running never lights up at all).
+With thread ids present, each thread gets its own independent stack, so
+this corruption can't happen — a concurrent span with no real ancestor on
+its own thread falls back to the same static-graph inference `main`'s own
+direct children already use (see "How a span is matched to a graph node"
+below): if the call graph shows exactly one function that could possibly
+have called it, that's not a guess, so the edge from it lights up
+correctly during replay. Only genuinely ambiguous cases (2+ static callers
+of the same function) stay an honest "no known caller" (`stack: []`).
+
+**What this does not do**: reconstruct *which specific thread* is running
+concurrently with which, or show more than one thread's activity live at
+once. `tracing` doesn't carry a span across a `thread::spawn` boundary on
+its own (confirmed directly — a child function called from inside an
+instrumented parent's own thread shows an empty ancestor list unless the
+parent explicitly captures `tracing::Span::current()` before spawning and
+re-enters it inside the new thread), so replay still steps through
+concurrent spans one at a time, in trace order, same as everything else —
+it just now correctly *attributes* each one to its real caller when the
+static graph makes that unambiguous, instead of leaving it disconnected.
+A genuinely simultaneous, multi-thread-aware replay view would need
+changing every thread-spawning call site in the target code and a
+different replay model entirely — deliberately out of scope for this tool
+(see PROJECT.md §4).
+
+One more correctness detail, separate from the attribution above: a span
+that spawned other threads and is blocked on joining them (like
+`concurrent_demo` above) stays visually *active* in the replay view for as
+long as those threads are still running, rather than showing as "returned"
+the moment replay steps past it. This isn't inferred or guessed — every
+span carries `openSeq`/`closeSeq`, the real position of its own NEW/CLOSE
+line in the raw log, and the viewer only marks a span "visited" once its
+own `closeSeq` shows it actually closed by that point. For ordinary
+synchronous code this is exactly the same as before (a span's own close
+always precedes its next sibling's open there), so nothing changes; it
+only ever produces a different, more accurate result for concurrent code,
+where that guarantee doesn't hold.
+
+The attribution above also carries the confirmed parent's *entire* own
+ancestor chain, not just its bare name — `concurrent_demo`'s attributed
+children resolve to `['main', 'concurrent_demo']`, not `['concurrent_demo']`
+alone. This matters for more than depth accuracy: the replay view's
+"unwinding" animation between steps decides how far back to animate by
+comparing two spans' ancestor chains for a shared prefix, and a
+truncated, one-name-only chain shares nothing with its own parent's real
+chain even though one genuinely leads to the other — which showed up as a
+real, visible bug (a "returning to main" flash firing on the very first
+step into a spawned thread, before that thread's own edge had even lit up).
+
 ### How a span is matched to a graph node
 
 `span.name` is **not** trusted as the match key by itself, for two reasons
@@ -401,6 +477,31 @@ Known current limitations:
   all into one. This needs `graph.json` (passed to `parse_trace()`
   server-side); with no graph available, every occurrence of a
   single-site relationship still aggregates exactly as before.
+- If a traced function calls another traced function through an
+  un-instrumented one in between (no `#[instrument]` on the middle
+  function), the trace still correctly attributes the callee to its real,
+  still-open ancestor — but the static graph has no direct edge between
+  them (only the real, declared calls through the untraced function).
+  Replay renders a distinct synthetic edge for this instead of showing
+  nothing: dashed, its own muted-grey color, labeled "(untraced gap)" — it
+  never claims a direct call happened, just that the trace confirms these
+  two are related with something untraced in between. See `dummy-api::gap
+  _demo`/`untraced_relay`/`gap_leaf` in the dummy-lib fixture, and
+  PROJECT.md §2.12 for the full reasoning (including why a guessed
+  multi-hop path through the graph was rejected in favor of this).
+
+The small monospace text next to the "Rust Codemap" title (e.g.
+`js:15:08:47 · trace_log.py:15:01:44 · __main__.py:15:07:25 · pid 744`) is
+not decorative — it's the actual, on-disk last-modified time of the files
+this specific server process is serving right now, fetched fresh on every
+page load from `GET /__codemap_version` (never cached, never a hand-
+maintained version number). If you've edited `trace_log.py` or
+`__main__.py`, this won't reflect it until the Python process itself is
+restarted (imports happen once at startup) — `index.html`'s own timestamp,
+by contrast, updates on a plain page reload, since it's served fresh from
+disk on every request. Added after a stale server process answered
+requests with old code for hours despite looking freshly restarted — see
+PROJECT.md §2.12's third follow-up.
 
 ## Command reference
 
@@ -533,10 +634,28 @@ each. In short, today:
   planned fix: a trace only exists because *something* ran and produced
   log output, and only a binary's `main()` is guaranteed to be that
   something (the replay animation's unwind-to-root also keys off finding a
-  node whose id ends in `::main`). The same reasoning is why replay isn't
-  meaningful for async or multi-threaded execution either — the tool
-  replays *log order*, and that only maps onto a single, straight call
-  stack for ordinary synchronous binary execution.
+  node whose id ends in `::main`). The same reasoning is why replay doesn't
+  show more than one thread's activity *at once*, or replay `async fn` —
+  the tool replays *log order* within a thread, which only maps onto a
+  real call stack for ordinary synchronous, single-threaded execution.
+  What it *can* do, without any propagation change in the target code: a
+  spawned-thread span with no recorded ancestor gets attributed back to
+  whichever function the static call graph shows as its one and only
+  possible caller — not a guess, since with a single candidate that's the
+  only answer that fits. `dapi::concurrent_demo` calling `thread_b`/
+  `thread_c` in two real OS threads (see the dummy-lib fixture) is
+  attributed and colored correctly this way, even though `tracing` itself
+  never recorded that link. It's still just an inference from the graph,
+  not a real trace-recorded fact: a function reachable from 2+ different
+  static call sites stays an honest "no known caller" on the same
+  ancestor-less hit, since which one actually called it that time genuinely
+  isn't recoverable. See "Optional: telling concurrent calls apart" above
+  for the correctness fix (per-thread stacks) this inference builds on:
+  without thread ids, two genuinely concurrent spans can get parsed as if
+  one were nested inside the other (they aren't) — confirmed as a real bug,
+  not hypothetical; a concurrent span with no thread ids at all still parses
+  safely too, it's just indistinguishable from ordinary single-threaded
+  code, which is the original, still-present limitation.
 - Cross-crate node-id collisions are resolved by qualifying every node id
   with its own crate (see "Multi-crate merging" above) — the one thing
   that's still just an approximation, not fully resolved, is a *third*

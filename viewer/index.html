@@ -45,6 +45,13 @@
             color: #89b4fa;
         }
 
+        #version-badge {
+            font-size: 10px;
+            font-family: monospace;
+            color: #6c7086;
+            white-space: nowrap;
+        }
+
         #toolbar-center {
             flex: 1;
             display: flex;
@@ -521,6 +528,7 @@
 <body>
     <div id="toolbar">
         <h1>Rust Codemap</h1>
+        <span id="version-badge" title="Which files this server is actually serving right now, and when each was last modified -- fetched fresh from /__codemap_version on every page load, never cached. Added after a stale server process served old code for hours despite looking freshly restarted."></span>
         <div id="toolbar-center">
             <button id="btn-play">&#9654; Play</button>
             <button id="btn-pause" disabled>&#9646;&#9646; Pause</button>
@@ -639,9 +647,21 @@
             // the same color for both would make a plain unvisited node
             // and an actually-visited one indistinguishable.
             fn: '#89b4fa', method: '#89b4fa',
-            edge: { call: '#cdd6f4', dispatch: '#89b4fa', loop_call: '#cdd6f4', trampoline: '#f38ba8' }
+            // `gap` is synthetic, never a real graph.json edge -- added at
+            // replay time only, when the trace confirms an ancestor with no
+            // matching declared call in between (an untraced function sat
+            // there instead -- see PROJECT.md §2.12). Muted grey on purpose,
+            // distinct from every real `edgeType` color, so it never reads
+            // as "this is a real call".
+            edge: { call: '#cdd6f4', dispatch: '#89b4fa', loop_call: '#cdd6f4', trampoline: '#f38ba8', gap: '#6c7086' }
         };
         let cy = null, traceData = [], traceIdx = -1, playActive = false, playTimeout = null, sourceIndex = {};
+        // True while a "Step >" click's own async chain (the animPlay delay,
+        // or a much longer return-path flash) hasn't landed yet -- see the
+        // btn-step listener below for why an extra click before that happens
+        // would otherwise silently do nothing (a real, confirmed bug: 4
+        // rapid clicks left the trace stuck on the very first step).
+        let stepBusy = false;
         // True while a trace is loaded but its replay overlay (visited/
         // current colors, edge styling) is deliberately hidden so the
         // static-navigation highlight/dim can be used instead -- distinct
@@ -1012,7 +1032,7 @@
                             'target-arrow-color': e => COLORS.edge[e.data('edgeType')] || '#6c7086',
                             'target-arrow-shape': 'triangle',
                             'curve-style': 'bezier',
-                            'line-style': e => ['dispatch', 'trampoline'].includes(e.data('edgeType')) ? 'dashed' : 'solid',
+                            'line-style': e => ['dispatch', 'trampoline', 'gap'].includes(e.data('edgeType')) ? 'dashed' : 'solid',
                             'width': 2,
                             'opacity': 0.75,
                             'arrow-scale': 1.2,
@@ -1032,7 +1052,8 @@
                             // this, from this specific node") that only
                             // matters right around whichever node you're
                             // actually looking at.
-                            'label': e => [e.data('callOrder'), e.data('iterLabel')].filter(x => x != null).join(' '),
+                            'label': e => [e.data('callOrder'), e.data('iterLabel'),
+                                e.data('edgeType') === 'gap' ? '(untraced gap)' : null].filter(x => x != null).join(' '),
                             // 9px (the old iterLabel-only size, back when
                             // this only ever appeared on a few edges near an
                             // active replay step) was unreadable now that
@@ -1188,6 +1209,10 @@
             dispatch:   { color: '#89b4fa', dashed: true,  label: 'dispatch' },
             loop_call:  { color: '#cdd6f4', dashed: false, label: 'loop_call (✓ visited)' },
             trampoline: { color: '#f38ba8', dashed: true,  label: 'trampoline' },
+            // Only ever appears once a replayed trace actually hits this case
+            // -- synthetic, added at replay time, never part of graph.json
+            // (see PROJECT.md §2.12).
+            gap:        { color: '#6c7086', dashed: true,  label: 'gap (untraced ancestor, replay only)' },
         };
         function buildLegend() {
             const present = new Set(cy.edges().map(e => e.data('edgeType')));
@@ -1387,7 +1412,7 @@
             stopPlay();
             stopLoopFlow(false);
             if (cy) cy.destroy();
-            traceData = []; traceIdx = -1;
+            traceData = []; traceIdx = -1; stepBusy = false;
             document.getElementById('trace-list').innerHTML =
                 '<p style="padding:8px 10px;color:#6c7086;font-size:11px">Click Play to load & animate.</p>';
             document.getElementById('exec-context').innerHTML =
@@ -1433,6 +1458,25 @@
                     renderDocList();
                 }
             } catch { /* no server-side source_index.json (plain `serve` with no --doc) */ }
+        })();
+
+        // Always-visible "which code is this, actually" indicator -- see
+        // /__codemap_version's own docstring in __main__.py for why this
+        // exists (a stale server process served old code for hours despite
+        // every other signal suggesting a fresh restart). Not cached, not
+        // client-computed: the server reads these files' real mtimes fresh
+        // on every request, so this can never itself go stale independent
+        // of what's actually being served.
+        (async () => {
+            const badge = document.getElementById('version-badge');
+            try {
+                const res = await fetch('/__codemap_version', { cache: 'no-store' });
+                if (!res.ok) { badge.textContent = '(no /__codemap_version -- plain `serve`?)'; return; }
+                const v = await res.json();
+                badge.textContent = `js:${v.indexHtmlMtime ?? '?'} · trace_log.py:${v.traceLogMtime ?? '?'} · __main__.py:${v.mainPyMtime ?? '?'} · pid ${v.pid}`;
+            } catch {
+                badge.textContent = ''; // opened straight off disk (file://), no server to ask at all
+            }
         })();
 
         // ── Doc-driven focus: click a public function in the doc index to
@@ -1664,10 +1708,11 @@
         // click-through-edges/keyboard-digit navigation built earlier
         // benefits from staying light; doing all this on every single hop
         // would make that feel sluggish. `expandedPositions`/
-        // `hiddenByExpansion`/`preExpandView` (all null when nothing is
-        // expanded) remember exactly what was moved, hidden, and where the
-        // camera was, so restoring is exact, not a re-layout guess.
-        let expandedPositions = null, hiddenByExpansion = null, preExpandView = null;
+        // `hiddenByExpansion`/`revealedByExpansion`/`preExpandView` (all
+        // null when nothing is expanded) remember exactly what was moved,
+        // hidden, temporarily revealed, and where the camera was, so
+        // restoring is exact, not a re-layout guess.
+        let expandedPositions = null, hiddenByExpansion = null, revealedByExpansion = null, preExpandView = null;
         function restoreExpansion() {
             if (!expandedPositions) return;
             const toRestore = expandedPositions;
@@ -1688,6 +1733,11 @@
                 if (n.length) n.animate({ position: pos }, { duration: 300 });
             });
             if (hiddenByExpansion) { hiddenByExpansion.show(); hiddenByExpansion = null; }
+            // Put back exactly what expandNeighborhood temporarily revealed
+            // (untraced first-degree neighbors, normally hidden behind
+            // "Hide untraced") -- respects that global toggle everywhere
+            // else, this view is the one deliberate exception.
+            if (revealedByExpansion) { revealedByExpansion.hide(); revealedByExpansion = null; }
             if (preExpandView) {
                 cy.animate({ zoom: preExpandView.zoom, pan: preExpandView.pan }, { duration: 300 });
                 preExpandView = null;
@@ -1716,6 +1766,14 @@
             const neighborhood = node.closedNeighborhood();
             hiddenByExpansion = cy.elements().not(neighborhood).filter(':visible');
             hiddenByExpansion.hide();
+            // The opposite case: a first-degree neighbor that's currently
+            // hidden (untraced, behind "Hide untraced") is still part of
+            // `neighborhood` -- reveal it specifically for this focused
+            // view, same reasoning as `main`'s own exemption from that
+            // toggle elsewhere. `restoreExpansion` hides it again, so the
+            // global toggle's state everywhere else is unaffected.
+            revealedByExpansion = neighborhood.filter(':hidden');
+            revealedByExpansion.show();
             // Radius sized off real node dimensions, not the viewport --
             // sizing off the viewport (the previous approach) could pack
             // neighbors tightly enough to overlap and hide the very edges
@@ -1934,10 +1992,27 @@
             // the exact problem keeping the two separate was meant to avoid.
             clearNavHighlight();
             clearAll();
+            const curOpenSeq = traceData[idx].openSeq;
             for (let i = 0; i <= idx; i++) {
                 const span = traceData[i], isCur = i === idx;
-                cy.getElementById(span.name).addClass(isCur ? 'current' : 'visited');
-                document.getElementById(`sp-${i}`)?.classList.add(isCur ? 'current' : 'visited');
+                // A span already stepped past (i < idx) still counts as
+                // genuinely active, not visited/"returned", if its own real
+                // CLOSE line (closeSeq) hasn't actually happened yet by the
+                // time the CURRENT step's span opened (openSeq) -- see
+                // trace_log.py's own docstring on these two fields. For
+                // ordinary synchronous code this is always false (RAII
+                // guarantees a span's close comes before its next sibling's
+                // open), so nothing changes there; it only ever fires for
+                // concurrent code -- e.g. `concurrent_demo` staying active
+                // through both `thread_b` and `thread_c` instead of wrongly
+                // showing "returned" the moment replay reaches the first of
+                // them, since its own close line comes after both (it's
+                // blocked on `.join()`).
+                const stillOpen = !isCur && span.closeSeq != null && curOpenSeq != null && span.closeSeq >= curOpenSeq;
+                const active = isCur || stillOpen;
+                logToServer('stepTo/color', `idx=${idx} curOpenSeq=${curOpenSeq} | span[${i}]=${span.name} isCur=${isCur} closeSeq=${span.closeSeq} stillOpen=${stillOpen} -> ${active ? 'ACTIVE(red)' : 'visited(green)'}`);
+                cy.getElementById(span.name).addClass(active ? 'current' : 'visited');
+                document.getElementById(`sp-${i}`)?.classList.add(active ? 'current' : 'visited');
                 const fullPath = [...(span.stack || []), span.name];
                 const loopCurEdges = [];
                 for (let j = 1; j < fullPath.length; j++) {
@@ -1955,7 +2030,30 @@
                         const specific = e.filter(ed => ed.data('callOrder') === span.callOrder);
                         if (specific.length) e = specific;
                     }
-                    if (!e.length) continue;
+                    if (!e.length) {
+                        // No real declared edge between these two -- the
+                        // trace still honestly confirms `src` really is
+                        // `tgt`'s nearest ancestor (own_stack or
+                        // implicit_parent found it, never a guess), but at
+                        // least one untraced function sits in between with
+                        // no direct edge in the static graph to match (see
+                        // PROJECT.md §2.12 -- gap_demo -> untraced_relay ->
+                        // gap_leaf is the regression fixture for exactly
+                        // this). Render a visually distinct synthetic edge
+                        // instead of silently showing nothing: its own
+                        // `gap` edgeType (dashed, muted grey, never any of
+                        // the real call-edge colors) so it can never be
+                        // mistaken for a declared call. Reused across hops/
+                        // spans within the same render pass if the same gap
+                        // recurs; torn down by clearAll() before the next.
+                        if (!src || !tgt) continue; // no ancestor at all here (e.g. the root) -- nothing to draw
+                        const gapId = `gap-${src}->${tgt}`;
+                        e = cy.getElementById(gapId);
+                        if (!e.length) {
+                            e = cy.add({ group: 'edges', data: { id: gapId, source: src, target: tgt, edgeType: 'gap' } });
+                            buildLegend(); // picks up the new edgeType so the legend explains it
+                        }
+                    }
                     if (e.data('edgeType') === 'loop_call') {
                         if (isCur) {
                             loopCurEdges.push(e); // will animate below
@@ -1964,8 +2062,8 @@
                             e.style({ 'line-color': '#a6e3a1', 'target-arrow-color': '#a6e3a1', 'line-style': 'solid', 'opacity': 1, 'width': 3 });
                         }
                     } else {
-                        const col = isCur ? '#f38ba8' : '#a6e3a1';
-                        e.style({ 'line-color': col, 'target-arrow-color': col, 'opacity': 1, 'width': isCur ? 5 : 3 });
+                        const col = active ? '#f38ba8' : '#a6e3a1';
+                        e.style({ 'line-color': col, 'target-arrow-color': col, 'opacity': 1, 'width': active ? 5 : 3 });
                     }
                 }
                 // Start flowing animation on loop_call edges entering current span
@@ -1989,6 +2087,11 @@
             stopLoopFlow(false);
             cy?.nodes().removeClass('visited current');
             cy?.edges().removeStyle();
+            // Synthetic "gap" edges (see stepTo()) only ever mean something
+            // for the one specific step that created them -- torn down here,
+            // same as everything else this function resets, so they never
+            // linger once replay moves elsewhere or the trace is unloaded.
+            cy?.edges('[edgeType = "gap"]').remove();
             document.querySelectorAll('.sp').forEach(el => el.classList.remove('visited', 'current'));
         }
 
@@ -2170,7 +2273,7 @@
 
         // ── Final unwind: from the last traced span all the way back to main ────
         // Triggered by an extra "Step >" click once the trace is fully played.
-        function finishTraceToRoot() {
+        function finishTraceToRoot(onDone) {
             const last = traceData[traceIdx];
             const rp = computeReturnPath(last, { name: mainNodeId(cy.nodes()), stack: [] });
             const settle = () => {
@@ -2179,9 +2282,37 @@
                     const e = cy.edges().filter(ed => ed.data('source') === parent && ed.data('target') === child);
                     if (e.length) e.style({ 'line-color': '#a6e3a1', 'target-arrow-color': '#a6e3a1', 'opacity': 1, 'width': 3 });
                 }
+                // Anything else still marked active (a concurrent ancestor
+                // whose own real close came after every step replayed so
+                // far, e.g. concurrent_demo waiting on thread_b/thread_c --
+                // see stepTo()'s own `stillOpen` comment) settles to
+                // visited too, including its own real incoming edge: the
+                // trace is over, so nothing is genuinely still running
+                // anymore, regardless of the specific return-path chain
+                // computed above (which only ever covers `last`'s own
+                // ancestor chain, not any other still-open span). Re-derived
+                // from each such span's own `stack`, the same fullPath
+                // lookup stepTo() itself uses -- not a style-value string
+                // match, which can't reliably compare against Cytoscape's
+                // own resolved rgb(...) getter output.
+                traceData.forEach(span => {
+                    const node = cy.getElementById(span.name);
+                    if (span.name === last.name || !node.hasClass('current')) return;
+                    node.removeClass('current').addClass('visited');
+                    const fullPath = [...(span.stack || []), span.name];
+                    for (let j = 1; j < fullPath.length; j++) {
+                        let e = cy.edges().filter(ed => ed.data('source') === fullPath[j - 1] && ed.data('target') === fullPath[j]);
+                        if (j === fullPath.length - 1 && span.callOrder != null && e.length > 1) {
+                            const specific = e.filter(ed => ed.data('callOrder') === span.callOrder);
+                            if (specific.length) e = specific;
+                        }
+                        if (e.length) e.style({ 'line-color': '#a6e3a1', 'target-arrow-color': '#a6e3a1', 'opacity': 1, 'width': 3 });
+                    }
+                });
                 cy.getElementById(last.name).removeClass('current').addClass('visited');
                 document.getElementById(`sp-${traceIdx}`)?.classList.add('visited');
                 traceIdx = traceData.length; // sentinel: fully unwound, nothing more to step through
+                if (onDone) onDone();
             };
             if (rp.length > 1) flashReturnPath(rp, settle); else settle();
         }
@@ -2225,14 +2356,30 @@
 
         document.getElementById('btn-pause').addEventListener('click', stopPlay);
 
+        // `traceIdx` only actually advances once the delayed `stepTo()` call
+        // below runs (after `animPlay`, or a much longer return-path flash
+        // for an "unwind" transition) -- an impatient extra click before
+        // that happens re-reads the SAME still-stale `traceIdx`, computes
+        // the SAME `nextIdx` again, and silently does nothing new (confirmed
+        // as a real, reproducible bug via a rapid-click test: 4 quick clicks
+        // left the trace stuck on step 0). `stepBusy` (declared up top,
+        // alongside `traceIdx`) makes every click after the first a no-op
+        // until the in-flight one actually lands.
         document.getElementById('btn-step').addEventListener('click', () => {
+            if (stepBusy) return;
             if (!traceData.length) { loadTrace().then(() => { if (traceData.length) { traceIdx = 0; stepTo(0); } }); return; }
-            if (traceIdx === traceData.length - 1) { finishTraceToRoot(); return; }
+            if (traceIdx === traceData.length - 1) {
+                stepBusy = true;
+                finishTraceToRoot(() => { stepBusy = false; });
+                return;
+            }
             if (traceIdx + 1 >= traceData.length) return;
             const nextIdx = traceIdx + 1;
-            const doStep = () => setTimeout(() => stepTo(nextIdx), animPlay);
+            stepBusy = true;
+            const doStep = () => setTimeout(() => { stepTo(nextIdx); stepBusy = false; }, animPlay);
             if (traceIdx >= 0) {
                 const rp = computeReturnPath(traceData[traceIdx], traceData[nextIdx]);
+                logToServer('stepTo/returnPath', `from=${traceData[traceIdx].name} (stack=${JSON.stringify(traceData[traceIdx].stack)}) to=${traceData[nextIdx].name} (stack=${JSON.stringify(traceData[nextIdx].stack)}) -> computeReturnPath=${JSON.stringify(rp)}`);
                 if (rp.length > 1) { flashReturnPath(rp, doStep); return; }
             }
             doStep();
@@ -2245,7 +2392,7 @@
         });
 
         document.getElementById('btn-reset').addEventListener('click', () => {
-            stopPlay(); traceIdx = -1; clearAll();
+            stopPlay(); traceIdx = -1; stepBusy = false; clearAll();
         });
 
         document.getElementById('btn-untraced').addEventListener('click', () => applyUntracedVisibility(!showUntraced));
@@ -2291,6 +2438,7 @@
             stopPlay();
             traceData = [];
             traceIdx = -1;
+            stepBusy = false;
             staticModeActive = false;
             updateStaticToggleButton();
             clearAll();

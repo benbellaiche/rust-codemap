@@ -141,6 +141,20 @@ closure, that crate's *own* `src/` directory for resolving source links,
 not the target crate's (`doc_index.build_index()` takes a list of
 `(doc_root, src_root)` pairs for exactly this reason).
 
+`LoggingHandler.do_GET` intercepts `/__codemap_version` before falling
+through to the base class's static-file serving -- returns each of
+`index.html`/`trace_log.py`/`__main__.py`'s real on-disk mtime (`Path(...)
+.stat().st_mtime`, computed fresh per request, never cached) plus the
+server's own PID. Exists purely to answer "which code is this process
+actually running" at a glance (`viewer/index.html`'s `#version-badge`
+fetches it once on load) -- added after a stale server process (a zombie
+from hours earlier, still bound to the same port) answered requests with
+old `trace_log.py` for a long debugging session despite every other signal
+suggesting a fresh restart (see PROJECT.md §2.12's third follow-up).
+Deliberately mtime-based, not a hand-maintained version string -- there's
+no step to remember, so it can't itself drift out of sync with what's
+actually on disk.
+
 ### `codemap/mir_graph.py` — how the call-graph is actually extracted
 
 This is the part most likely to need care when changed. It parses MIR
@@ -347,20 +361,137 @@ reports its *enclosing* span's identity, not one of its own — before this
 was recognized as a distinct case, an event line fell into the NEW branch
 by mistake and pushed that enclosing name onto `open_stack` a second time,
 permanently corrupting every subsequent span's depth/ancestor chain (only
-the real CLOSE ever pops). `open_stack` holds `(name, callOrder)` pairs,
-not bare names, specifically so an EVENT can look up its enclosing span's
-exact dedup key directly — CLOSE reads its own callOrder the same way now
-too, instead of recomputing it via a second counter. `time.busy` (never
-`time.idle`) is the only duration value read anywhere in this file or the
-viewer — confirmed directly (a scratch crate with a deliberate
-`std::thread::sleep()` and zero real CPU work still reports the whole
-sleep as `time.busy`) that this is wall-clock "was the span entered" time,
-not a CPU-usage/CPU-wait split; don't introduce `time.idle` anywhere on
-the assumption it means "waiting," it doesn't distinguish that from
-ordinary tracing/logging overhead in synchronous code.
+the real CLOSE ever pops). Each open-span stack entry holds `(name,
+callOrder)` pairs, not bare names, specifically so an EVENT can look up
+its enclosing span's exact dedup key directly — CLOSE reads its own
+callOrder the same way now too, instead of recomputing it via a second
+counter. `time.busy` (never `time.idle`) is the only duration value read
+anywhere in this file or the viewer — confirmed directly (a scratch crate
+with a deliberate `std::thread::sleep()` and zero real CPU work still
+reports the whole sleep as `time.busy`) that this is wall-clock "was the
+span entered" time, not a CPU-usage/CPU-wait split; don't introduce
+`time.idle` anywhere on the assumption it means "waiting," it doesn't
+distinguish that from ordinary tracing/logging overhead in synchronous
+code.
+
+There isn't just one open-span stack, either — `open_stacks` (plural) is
+keyed by each entry's own optional `threadId` field (`.with_thread_ids
+(true)`, see README.md and PROJECT.md §2.11), one independent stack per
+thread; entries with no `threadId` at all share one implicit key, so an
+ordinary single-threaded trace behaves exactly as if there were only one
+stack, same as before this existed. This is a real correctness fix, not
+just tidiness: two threads' NEW events can genuinely interleave in the
+log (thread A opens a span, thread B opens its own before A's closes) --
+with a single shared stack, thread B's span would wrongly appear *nested
+inside* thread A's still-open one (confirmed as a reproducible bug on
+`dapi::concurrent_demo`, which exists specifically to catch a regression
+here: without per-thread stacks, `thread_c` came back nested under
+`thread_b` instead of as its sibling under `concurrent_demo`, and replay
+visibly got stuck showing the wrong edge as "active"). This does NOT
+reconstruct a real, trace-recorded parent link -- `tracing` does not
+propagate span context across `thread::spawn` on its own (confirmed
+empirically). What it does get, via `implicit_parent` (formerly
+`implicit_root_parent`, main-only -- see §2.8/§2.11): a concurrent span
+with no ancestor on its own thread is attributed to whichever function the
+*static* call graph shows as its one and only possible caller, same
+inference `main`'s own direct children already used, just no longer
+hardcoded to check only `main` as the candidate. `concurrent_demo` is the
+sole static caller of both `thread_b`/`thread_c`, so both resolve to
+`stack: ['dapi::concurrent_demo']` and light up correctly during replay.
+A function with 2+ static callers (`dcore::add`) still correctly reports
+`stack: []` on an ancestor-less hit -- an honest "no known caller," not a
+guess, since a single candidate is the only case that's actually certain.
+
+Separately, every span also carries `openSeq`/`closeSeq` -- the 0-indexed
+position of its own NEW/CLOSE line in the raw log (all lines counted, NEW/
+CLOSE/EVENT alike), not derived from the resolved span list. `viewer/
+index.html`'s `stepTo()` uses these instead of trusting step-index order
+for "has this span returned yet": a span already stepped past (`i < idx`)
+stays visually active if `span.closeSeq >= traceData[idx].openSeq` -- its
+own real close hasn't happened yet by the time the current step opened.
+For ordinary synchronous code index order and close order are always the
+same (RAII), so this changes nothing there; for `concurrent_demo` (blocked
+on `.join()`), it's the fix for a real, confirmed bug -- `main ->
+concurrent_demo` was showing "returned" (green) the moment replay reached
+`thread_b`, which is graphically false. `finishTraceToRoot()` (the extra
+"Step >" past the end) sweeps every node still `.current`-classed at that
+point and re-derives its own incoming edge from `span.stack` to settle it
+green -- NOT by comparing `.style('line-color')` against a hex literal,
+which silently never matches (Cytoscape's style getter always returns a
+resolved `rgb(...)` string).
+
+`implicit_parent`'s fallback (above) has to set `stack` to the confirmed
+parent's ENTIRE chain, not just that one name -- `full_path_by_name` (name
+-> that span's own resolved `stack + [name]`, updated on every NEW) is what
+supplies it: `stack = full_path_by_name.get(confirmed, [confirmed])`.
+Setting `stack = [confirmed]` alone (the first version of this fix) was a
+real, confirmed bug, not a style nitpick: the viewer's `computeReturnPath()`
+walks two spans' `stack`s looking for a shared prefix to decide how far to
+animate an "unwinding" flash, and `concurrent_demo`'s `stack` (`['main']`)
+shares nothing with `thread_b`'s truncated one (`['concurrent_demo']`
+alone, no `main`) even though `concurrent_demo` genuinely IS its parent --
+so it wrongly concluded "unwind all the way to main" and fired that flash
+on the very first step into `thread_b`, before `thread_b`'s own edge had
+even lit up. Confirmed directly by calling `computeReturnPath(concurrent
+_demo, thread_b)` in-browser and seeing a non-empty result (should be `[]`,
+"going deeper" -- not a return at all).
+
+The NEW branch's `stack` computation has the SAME class of bug for the
+non-empty-`own_stack` case too, not just `implicit_parent`'s fallback:
+reading `own_stack`'s raw names directly loses any virtual prefix the
+innermost open span itself inherited (e.g. `gap_demo`'s own `["main"]`,
+from `implicit_parent` -- `main` is never pushed onto any real
+`own_stack`). A REAL descendant of an `implicit_parent`-resolved span
+(`gap_leaf`, genuinely nested under `gap_demo` -- tracing's own `spans`
+field agrees) came back with `stack: ["gap_demo"]`, `depth: 1` -- same
+depth as `gap_demo` itself, rendering as siblings in the sidebar instead of
+nested, even though they aren't. Fixed the same way: `stack =
+full_path_by_name.get(own_stack[-1][0], ...)` instead of `[nm for nm, _co
+in own_stack]` -- the innermost open span's own chain was already fully
+resolved (recursively, through any depth) the moment it was pushed, so
+reusing it composes correctly. This changed `depth`/`stack` for EVERY
+previously-nested span in the whole fixture, not just the gap one (each
+gained an explicit `main` prefix it was silently missing) -- confirmed via
+a full re-check of `parse_trace()`'s output against the entire trace, not
+assumed from the one fixture that surfaced it.
+
+`btn-step`'s click handler reads `traceIdx` synchronously but the actual
+`stepTo()` call is delayed (`animPlay`, or a much longer return-path
+flash) -- a `stepBusy` flag (declared with `traceIdx` up top) guards
+against a rapid second click re-reading that still-stale `traceIdx` and
+silently computing the same `nextIdx` again (confirmed as a real,
+pre-existing bug via a rapid-click Playwright test: 4 quick clicks left
+the trace stuck on the first step, unrelated to any of the fixes above --
+would affect any trace, not just concurrent ones). `btn-step-prev` never
+needed this -- it calls `stepTo()` synchronously, no delay to race.
 
 ### `viewer/index.html` — the pieces that aren't obvious from a skim
 
+- `stepTo()`'s edge lookup can come up empty even for a span with a real,
+  confirmed ancestor -- an untraced function in between means the trace
+  correctly attributes the callee to its still-open ancestor, but no
+  direct edge exists in `graph.json` for that pair (see PROJECT.md §2.12,
+  `dapi::gap_demo -> untraced_relay -> gap_leaf` in dummy-lib). Handled by
+  `cy.add()`-ing a synthetic edge (`gap-${src}->${tgt}`, `edgeType: 'gap'`)
+  right there in the loop -- dashed, its own muted-grey color (never one of
+  the real `call`/`dispatch`/`loop_call`/`trampoline` colors, so it can't
+  be mistaken for a declared call), colored active/visited same as a real
+  edge otherwise. Reused if the same gap recurs within one render pass;
+  torn down by `clearAll()`'s `cy?.edges('[edgeType = "gap"]').remove()`
+  so it never survives past the step that created it. A rejected
+  alternative: traversing the static graph for a real multi-hop path
+  instead -- correct here, but ambiguous in general (multiple real paths
+  between the same two nodes would mean guessing which one was actually
+  taken, which this tool has never done, see `implicit_parent`).
+- `expandNeighborhood()` (static-view double-click) reveals any first-
+  degree neighbor that "Hide untraced" had hidden, specifically for this
+  one focused view (`revealedByExpansion`, same remember/restore pattern
+  as `hiddenByExpansion`) -- `neighborhood.filter(':hidden')` finds them,
+  `.show()`s them, `restoreExpansion()` `.hide()`s them again on the way
+  out. Deliberately scoped to `node.closedNeighborhood()` (real, direct
+  edges only) -- a node reached only *through* an untraced one (2 hops
+  away) stays hidden; this reveals genuine first-degree relationships, not
+  a wider "show everything nearby."
 - "Load graph…" / "Load doc index…" / "Load trace…" are plain
   `<input type="file">` + `FileReader` pickers — they read straight off
   disk client-side, no fetch involved. This is deliberate: it's what lets

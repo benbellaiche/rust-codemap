@@ -58,6 +58,14 @@
           "name": { "type": "string" }
         }
       }
+    },
+    "threadId": {
+      "type": "string",
+      "description": "Optional -- only present with `.with_thread_ids(true)` (see README.md's \"Optional: telling concurrent calls apart\"). trace_log.py uses this to keep a SEPARATE open-span stack per thread, so two threads' interleaved NEW events never get wrongly nested inside each other. Does not, on its own, reconstruct which thread spawned which -- that needs the target code to explicitly propagate `tracing::Span::current()` across `thread::spawn`, which this project does not require."
+    },
+    "threadName": {
+      "type": "string",
+      "description": "Optional -- only present with `.with_thread_names(true)`, alongside threadId above. Not read by trace_log.py for any resolution logic (threadId alone is the grouping key) -- purely informational, e.g. for display."
     }
   }
 }

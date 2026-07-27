@@ -53,6 +53,13 @@
           "name": { "type": "string" }
         }
       }
+    },
+    "threadId": {
+      "type": "string",
+      "description": "Same field, same meaning, as trace-entry.schema.json's threadId -- a close event carries the same thread id its own entry event did."
+    },
+    "threadName": {
+      "type": "string"
     }
   }
 }

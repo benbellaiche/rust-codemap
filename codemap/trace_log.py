@@ -104,19 +104,20 @@ def _scan_forward_to_code_line(filepath: str, attr_line: int) -> int | None:
     return None
 
 
-def _find_main_id(graph: dict) -> str | None:
-    """The one node, if any, whose id is this project's binary entry point
-    (`crate::main`, or bare `main` as a defensive fallback for an older/
-    unqualified graph) -- same reasoning as the viewer's own `isMainId()`:
-    `fn main` is Rust's own mandated name for a binary's entry point, not a
-    hardcoded project assumption, so this only ever matches something real.
-    Returns None for a library-only graph (no such node exists there) --
-    the caller already treats that as "nothing to do here"."""
-    for n in graph.get("nodes", []):
-        nid = n.get("data", n).get("id", "")
-        if nid == "main" or nid.endswith("::main"):
-            return nid
-    return None
+def _build_callers(graph: dict) -> dict:
+    """callee id -> set of distinct caller ids, from graph.json's own edges
+    (mir_graph.py, ground truth from MIR -- not this trace). Deliberately
+    keyed on distinct *source*, not (source, callOrder): two call sites in
+    the same caller still collapse to one entry here, since what matters
+    for `implicit_parent` below is only "how many different functions could
+    possibly have called this one at all", not how many times."""
+    callers = {}
+    for e in graph.get("edges", []):
+        d = e.get("data", e)
+        src, tgt = d.get("source"), d.get("target")
+        if src and tgt:
+            callers.setdefault(tgt, set()).add(src)
+    return callers
 
 
 def _build_edge_call_orders(graph: dict) -> dict:
@@ -142,7 +143,28 @@ def _build_edge_call_orders(graph: dict) -> dict:
 def parse_trace(text: str, source_index: dict | None = None, graph: dict | None = None) -> list:
     """Returns a list of deduped span dicts: name/depth/stack/fields/iterations/
     duration_ms/callOrder (the last one only when the caller has more than
-    one static call site to this callee -- see below).
+    one static call site to this callee -- see below)/openSeq/closeSeq.
+
+    `openSeq`/`closeSeq` are this invocation's own NEW/CLOSE line's position
+    in the raw log (0-indexed, counting every line -- NEW, CLOSE, and EVENT
+    alike), not anything derived from the resolved `new_events` list. They
+    exist for one reason: the viewer's replay steps through spans in NEW
+    order, and for ordinary synchronous, single-threaded code that order
+    already IS real close order too (RAII guarantees a span's own CLOSE
+    always comes before the next sibling's NEW) -- but that guarantee breaks
+    for concurrent code. `concurrent_demo` calling `thread_b`/`thread_c` (see
+    the `open_stacks` paragraph below) doesn't itself CLOSE until after BOTH
+    threads have closed, since it's blocked on `.join()` -- its own CLOSE
+    line comes last in the log, well after `thread_b`'s and `thread_c`'s NEW
+    lines. Confirmed as a real, visible replay bug, not a theoretical one:
+    without this, the viewer decided "already returned" purely from step
+    index (has this span's NEW been stepped past), which colored
+    `main -> concurrent_demo` green -- implying it had already returned --
+    the moment replay reached `thread_b`, even though `concurrent_demo` was
+    still genuinely running at that point. Comparing `closeSeq` (this
+    span's) against another span's `openSeq` (whatever's currently being
+    stepped to) tells the viewer whether that's actually true instead of
+    assuming it from index order alone.
 
     `source_index` (typically source_index.json's own contents), if given,
     resolves each span to its true graph node id via source location
@@ -198,23 +220,40 @@ def parse_trace(text: str, source_index: dict | None = None, graph: dict | None 
     splits into the right *number* of distinct sites rather than collapsing
     them all back into one, which is the point.
 
-    `graph` also fixes a *specific*, narrow case of a broader gap: `main`
-    itself is never a tracing span (it can't usefully be #[instrument]'d --
-    the span would start before `tracing_subscriber::init()`, called from
-    inside main's own body, has even run), so a function main calls
-    directly gets NO recorded ancestor at all -- its own `stack` comes out
-    empty, indistinguishable from a genuine second root. This was first
-    "fixed" by unconditionally treating every ancestor-less span as a
-    child of `main` -- rejected on review: that's a guess, not a fact, and
-    a real one it could get wrong -- a span reached through some *other*,
-    also-untraced intermediate function (main -> helper -> this_span, with
-    `helper` itself never instrumented) would be mislabeled as called
-    directly by main, an edge that might not even exist in the static
-    graph. Fixed properly instead: an ancestor-less span is only ever
-    attributed to `main` when `graph` *confirms* a direct static edge from
-    main to it (`_find_main_id` + a lookup in `edge_call_orders`) -- never
-    as a default. No graph, or no confirming edge, and the span's `stack`
-    stays exactly what it always was: empty, not a guess.
+    `graph` also fills in an ancestor for spans that come back with no
+    recorded parent at all on their own thread -- `main` itself is the
+    original, most common case (it's never a tracing span -- it can't
+    usefully be #[instrument]'d, since the span would start before
+    `tracing_subscriber::init()`, called from inside main's own body, has
+    even run -- so a function main calls directly gets no recorded ancestor
+    at all), and a thread spawned with no explicit `tracing::Span::current()`
+    propagation (see the `open_stacks` paragraph below) is the other --
+    both leave the span's own `stack` empty, indistinguishable from a
+    genuine second root. This was first "fixed" by unconditionally treating
+    every ancestor-less span as a child of `main` specifically -- rejected
+    on review: that's a guess, not a fact, and a real one it could get
+    wrong -- a span reached through some *other*, also-untraced
+    intermediate function (main -> helper -> this_span, with `helper`
+    itself never instrumented) would be mislabeled as called directly by
+    main, an edge that might not even exist in the static graph. Fixed
+    properly instead, and generalized beyond just `main`: an ancestor-less
+    span is only ever attributed to a parent when `graph` shows that parent
+    is the *one and only* static caller of this span's function, anywhere
+    in the whole project (`_build_callers` below) -- not a guess, since
+    with exactly one possible caller and no real ancestor recorded, that
+    caller is the only answer that fits the facts. A function reached from
+    2+ different static call sites (e.g. `dcore::add`, called from both
+    `dummy-ops` and `dummy-api`) stays unattributed on an empty-stack hit --
+    which one actually called it this time genuinely isn't recoverable, so
+    it's left an honest "unknown" rather than picked arbitrarily. This is
+    also what correctly colors `concurrent_demo -> thread_b`/`-> thread_c`
+    during replay (see the `open_stacks` paragraph below for why those two
+    come back with an empty stack in the first place): `concurrent_demo` is
+    each one's sole static caller, so both get attributed to it even though
+    neither was actually nested under it in the trace -- still not a guess,
+    the static graph has no other candidate either way. No graph, or 2+
+    candidate callers, and the span's `stack` stays exactly what it always
+    was: empty, not a guess.
 
     Each entry also carries `recordedFields` and `events` when present --
     the two mechanisms for seeing a function's own internal state, not
@@ -247,30 +286,65 @@ def parse_trace(text: str, source_index: dict | None = None, graph: dict | None 
     (`"time.busy" in fields`, unchanged), then `message == "new"`, then
     anything else is an EVENT. Getting this wrong is not cosmetic: before
     this fix, a bare event fell into the same branch as a genuine NEW,
-    pushing its enclosing span's name onto `open_stack` a SECOND time --
-    never popped back off (only the real CLOSE pops, once), permanently
-    corrupting the depth/ancestor chain of every span parsed afterward.
-    Confirmed directly: added a scratch `tracing::info!()` call inside an
-    instrumented function, and every span after it in the trace came back
-    one level deeper than it actually was. `open_stack` itself now holds
-    `(name, callOrder)` pairs, not bare names -- letting an EVENT look up
-    its enclosing span's own dedup key directly (`open_stack[-1]`) rather
-    than needing a second, independently-advancing occurrence counter to
-    stay in sync with the one NEW already used to assign that callOrder --
-    CLOSE reads its own call_order the same way now (by popping it back
-    off the stack), rather than recomputing it via a separate counter that
-    only worked by relying on NEW and CLOSE always advancing in lockstep.
+    pushing its enclosing span's name onto the open-span stack a SECOND
+    time -- never popped back off (only the real CLOSE pops, once),
+    permanently corrupting the depth/ancestor chain of every span parsed
+    afterward. Confirmed directly: added a scratch `tracing::info!()` call
+    inside an instrumented function, and every span after it in the trace
+    came back one level deeper than it actually was. Each open-span stack
+    entry (see below) holds `(name, callOrder)` pairs, not bare names --
+    letting an EVENT look up its enclosing span's own dedup key directly
+    (the top of its own thread's stack) rather than needing a second,
+    independently-advancing occurrence counter to stay in sync with the one
+    NEW already used to assign that callOrder -- CLOSE reads its own
+    call_order the same way now (by popping it back off the stack), rather
+    than recomputing it via a separate counter that only worked by relying
+    on NEW and CLOSE always advancing in lockstep.
+
+    `open_stacks` (plural) is one stack *per thread id*, not a single
+    global one -- keyed by each entry's own optional `threadId` field
+    (present only if the target added `.with_thread_ids(true)`, see
+    README.md's "Optional: telling concurrent calls apart"; absent
+    entries all share one implicit key, so a trace with no thread ids at
+    all behaves exactly as if there were only ever one stack, unchanged
+    from before this existed). This matters for a real reason, not just
+    tidiness: two threads' NEW events can genuinely interleave in the log
+    (thread A opens a span, thread B opens its own before A's closes) --
+    with a single shared stack, thread B's span would wrongly appear
+    *nested inside* thread A's still-open one, an actual corruption
+    (confirmed directly: `concurrent_demo` calling `thread_b`/`thread_c`
+    concurrently with NO thread ids at all made `thread_c` come back
+    nested under `thread_b`, not as its sibling under `concurrent_demo` --
+    and during replay this produced a genuinely misleading result, not
+    just a gap: the edge into `thread_b` stayed visually "active" long
+    after execution moved to `thread_c`, whose own real edge never lit up
+    at all). Per-thread stacks fix the corruption -- each thread's own
+    spans nest correctly among themselves -- but do NOT reconstruct a
+    cross-thread parent link that was never in the data to begin with: a
+    span whose own thread has an empty stack when it starts gets no real
+    ancestor from `tracing` itself, same as `main`'s own direct children --
+    the `implicit_parent` mechanism above (the graph confirming a single
+    static caller) is what fills this in when it can, not anything specific
+    to threads; genuinely ambiguous cases (2+ static callers) still come
+    back an honest `stack: []` rather than a guessed link to whatever
+    thread happened to spawn it. Getting a *real*, trace-recorded link
+    (as opposed to this static-graph inference) needs the target code to
+    explicitly carry `tracing::Span::current()` across the `thread::spawn`
+    boundary (confirmed empirically: `tracing` does not do this on its
+    own) -- deliberately out of scope, see PROJECT.md §4.
     """
     line_index = _build_line_index(source_index) if source_index else {}
     edge_call_orders = _build_edge_call_orders(graph) if graph else {}
-    main_id = _find_main_id(graph) if graph else None
+    callers_of = _build_callers(graph) if graph else {}
     scan_cache = {}  # (norm path, attr line) -> resolved line or None, this parse only
 
-    def implicit_root_parent(name):
-        """Only `main` when the static graph proves main really does call
-        `name` directly -- see this function's own docstring above."""
-        if main_id and (main_id, name) in edge_call_orders:
-            return main_id
+    def implicit_parent(name):
+        """The one static caller of `name`, if -- and only if -- the graph
+        shows exactly one anywhere in the whole project. See this
+        function's own docstring above."""
+        callers = callers_of.get(name)
+        if callers and len(callers) == 1:
+            return next(iter(callers))
         return None
 
     def resolve_id(filename, attr_line):
@@ -312,25 +386,35 @@ def parse_trace(text: str, source_index: dict | None = None, graph: dict | None 
         new_occurrence[(parent, name)] = idx + 1
         return sites[idx % len(sites)]
 
-    open_stack = []  # (resolved name, callOrder) pairs, outermost first
+    _NO_THREAD_ID = object()  # sentinel: groups every thread-id-less entry into one implicit stack
+
+    def thread_key(entry):
+        return entry.get("threadId", _NO_THREAD_ID)
+
+    open_stacks = {}  # thread id (or the sentinel above) -> [(resolved name, callOrder), ...]
+    full_path_by_name = {}  # name -> that span's own full ancestor chain + itself, from its most
+    # recent NEW resolution -- see the `implicit_parent` branch below for why.
     new_events = []
     close_stats = {}  # (resolved name, callOrder or None) -> {count, total_us}
     recorded_by_key = {}  # same key -> [close-time span-field dict, ...], one per invocation
     events_by_key = {}  # same key -> [{"message", "fields"}, ...], across every invocation
-    for entry in entries:
+    close_seq_by_key = {}  # same key -> entry_seq of THIS invocation's own close line
+    for entry_seq, entry in enumerate(entries):
         fields = entry.get("fields", {})
         span_info = entry.get("span", {})
         raw_name = span_info.get("name", "")
         message = fields.get("message")
+        own_stack = open_stacks.setdefault(thread_key(entry), [])
 
         if "time.busy" in fields:
-            # A close always matches whatever's currently innermost -- see
-            # this function's own docstring for why that's reliable and a
-            # name-based lookup here would not be. Its callOrder is
-            # whatever NEW already assigned this exact invocation --
-            # popped back off the stack, not recomputed.
-            if open_stack:
-                name, call_order = open_stack.pop()
+            # A close always matches whatever's currently innermost ON
+            # THIS SAME THREAD -- see this function's own docstring for
+            # why a single shared stack across threads would be wrong
+            # here, and a name-based lookup would be no better. Its
+            # callOrder is whatever NEW already assigned this exact
+            # invocation -- popped back off the stack, not recomputed.
+            if own_stack:
+                name, call_order = own_stack.pop()
             else:
                 name, call_order = raw_name, None
             key = (name, call_order)
@@ -338,6 +422,13 @@ def parse_trace(text: str, source_index: dict | None = None, graph: dict | None 
             st = close_stats.setdefault(key, {"count": 0, "total_us": 0.0})
             st["count"] += 1
             st["total_us"] += us
+            # This invocation's own real position in the raw log -- see
+            # `openSeq`/`closeSeq` in the docstring below for what this is
+            # for. Overwritten on each repeat invocation of the same key
+            # (a loop), same as `close_stats` above -- only the latest
+            # invocation's close position matters for that case, exactly
+            # like `recorded_by_key` only ever needing the current state.
+            close_seq_by_key[key] = entry_seq
             # The close event's own `span` reports this invocation's
             # *current* fields, which is where a value filled in mid-body
             # via Span::current().record(...) actually shows up -- entry
@@ -348,16 +439,56 @@ def parse_trace(text: str, source_index: dict | None = None, graph: dict | None 
         elif message == "new":
             resolved = resolve_id(entry.get("filename"), entry.get("line_number"))
             name = resolved or raw_name
-            stack = [nm for nm, _co in open_stack]
+            if own_stack:
+                # `own_stack` itself only ever holds the raw names tracing
+                # actually pushed -- it has no idea the span currently on
+                # top of it (say, `gap_demo`) was itself attributed to a
+                # further, "virtual" ancestor via `implicit_parent` below
+                # (e.g. `main`, which is never pushed onto any own_stack at
+                # all, since it's never a real span). Reading raw own_stack
+                # names here would silently drop that ancestor for every
+                # REAL descendant of an implicit_parent-resolved span --
+                # confirmed as a real bug: `gap_leaf` (really nested under
+                # `gap_demo`, tracing's own `spans` field agrees) came back
+                # with `stack: ["gap_demo"]` / `depth: 1`, the exact same
+                # depth as `gap_demo` itself (`stack: ["main"]`) -- so the
+                # sidebar rendered them as siblings, not nested, even though
+                # they genuinely are. Fixed by reusing `full_path_by_name`
+                # for the innermost currently-open span instead of reading
+                # own_stack's raw name directly: that entry's own chain was
+                # already fully resolved (recursively including any
+                # implicit_parent prefix) the moment IT was pushed, so this
+                # composes correctly through any depth of real nesting.
+                top_name, _co = own_stack[-1]
+                stack = full_path_by_name.get(top_name, [nm for nm, _co in own_stack])
+            else:
+                stack = []
             if not stack:
                 # Confirmed-by-the-static-graph case only -- see
-                # implicit_root_parent's docstring. Doesn't touch
-                # `open_stack` itself (that stays a pure record of what
-                # tracing actually recorded); this only affects what THIS
-                # one span reports as its own ancestor.
-                confirmed = implicit_root_parent(name)
+                # implicit_parent's docstring. Doesn't touch `own_stack`
+                # itself (that stays a pure record of what tracing actually
+                # recorded on this one thread); this only affects what THIS
+                # one span reports as its own ancestor. Inherits the
+                # confirmed parent's OWN full chain (`full_path_by_name`),
+                # not just that one name alone -- `stack` has to be a real
+                # root-to-parent chain, the same shape a normally-nested
+                # `own_stack`-derived one already is, or the viewer's own
+                # `computeReturnPath` (which walks two spans' `stack`s
+                # looking for a shared prefix) can't find any common
+                # ancestor between e.g. `concurrent_demo` (`['main']`) and
+                # `thread_b` (`['concurrent_demo']` alone, no `main`) and
+                # wrongly concludes it must unwind all the way back to
+                # `main` -- confirmed as a real, visible bug: the "return"
+                # flash animation fired on the very first step into
+                # `thread_b`, before `thread_b`'s own edge had even lit up.
+                # Falls back to just `[confirmed]` if the parent's own NEW
+                # hasn't been resolved yet (shouldn't happen in practice --
+                # a function has to run before it can spawn a thread that
+                # calls something else -- but no worse than before this
+                # existed if it somehow does).
+                confirmed = implicit_parent(name)
                 if confirmed:
-                    stack = [confirmed]
+                    stack = full_path_by_name.get(confirmed, [confirmed])
             parent = stack[-1] if stack else None
             call_order = call_order_for(parent, name)
             ev = {
@@ -365,18 +496,21 @@ def parse_trace(text: str, source_index: dict | None = None, graph: dict | None 
                 "depth": len(stack),
                 "stack": stack,
                 "fields": {k: v for k, v in span_info.items() if k != "name"},
+                "openSeq": entry_seq,
             }
             if call_order is not None:
                 ev["callOrder"] = call_order
             new_events.append(ev)
-            open_stack.append((name, call_order))
+            own_stack.append((name, call_order))
+            full_path_by_name[name] = stack + [name]
         else:
             # EVENT: a plain tracing::event!/info!/... call from directly
-            # inside the currently-innermost span's own body -- not a span
-            # itself (never pushed onto open_stack, never assigned its own
-            # callOrder), just attached to whatever IS currently innermost.
-            if open_stack:
-                enclosing_key = open_stack[-1]
+            # inside the currently-innermost span's own body, on THIS
+            # thread -- not a span itself (never pushed onto own_stack,
+            # never assigned its own callOrder), just attached to
+            # whatever IS currently innermost there.
+            if own_stack:
+                enclosing_key = own_stack[-1]
                 events_by_key.setdefault(enclosing_key, []).append({
                     "message": message or "",
                     "fields": {k: v for k, v in fields.items() if k != "message"},
@@ -391,6 +525,9 @@ def parse_trace(text: str, source_index: dict | None = None, graph: dict | None 
         ev["iterations"] = st["count"]
         ev["duration_ms"] = round(st["total_us"] / 1000.0, 4)
         ev["total_ms"] = ev["duration_ms"]
+        close_seq = close_seq_by_key.get(key)
+        if close_seq is not None:
+            ev["closeSeq"] = close_seq
         recorded = recorded_by_key.get(key)
         if recorded:
             ev["recordedFields"] = recorded

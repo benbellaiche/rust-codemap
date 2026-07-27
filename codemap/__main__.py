@@ -66,6 +66,7 @@ import re
 import subprocess
 import sys
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -500,6 +501,43 @@ class LoggingHandler(http.server.SimpleHTTPRequestHandler):
                 self.directory = original_directory
         return super().translate_path(path)
 
+    def do_GET(self):
+        if self.path == "/__codemap_version":
+            self._handle_version()
+            return
+        super().do_GET()
+
+    def _handle_version(self):
+        # Answers "which code is this server actually running right now" --
+        # added after a real, multi-hour debugging session where a stale
+        # server process (a zombie left over from hours earlier, still bound
+        # to the same port -- see PROJECT.md §2.11/§2.13) kept answering
+        # requests with old code while every other signal (the terminal's
+        # own startup banner, a freshly-restarted-looking process) suggested
+        # otherwise. File mtimes, not a hand-maintained version number: they
+        # update automatically and can never drift out of sync the way a
+        # forgotten version bump could. The client fetches this on load and
+        # renders it directly in the toolbar -- always visible, no DevTools
+        # or terminal access needed to answer "is this the code I think it
+        # is."
+        def mtime_str(path):
+            try:
+                return datetime.fromtimestamp(Path(path).stat().st_mtime).strftime("%H:%M:%S")
+            except OSError:
+                return None
+        payload = {
+            "pid": os.getpid(),
+            "indexHtmlMtime": mtime_str(Path(self.directory) / "index.html"),
+            "traceLogMtime": mtime_str(trace_log.__file__),
+            "mainPyMtime": mtime_str(__file__),
+        }
+        response = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response)))
+        self.end_headers()
+        self.wfile.write(response)
+
     def do_POST(self):
         if self.path == "/__codemap_parse_trace":
             self._handle_parse_trace()
@@ -555,6 +593,18 @@ class LoggingHandler(http.server.SimpleHTTPRequestHandler):
                 pass  # no graph.json (yet) -- repeated calls to the same callee just aggregate as one entry
         try:
             spans = trace_log.parse_trace(body.decode("utf-8", errors="replace"), source_index, graph)
+            # Printed straight to this process's own terminal (not the
+            # browser console) every time a trace is parsed -- lets whoever
+            # is running `serve`/`run` see EXACTLY what this running process
+            # computed (name/depth/stack/openSeq/closeSeq per span) without
+            # needing devtools or a separate diagnostic command. Added
+            # specifically because "is the server actually running the code
+            # on disk" became impossible to settle any other way over chat.
+            print(f"[parse_trace] trace_log module: {trace_log.__file__}", flush=True)
+            for s in spans:
+                print(f"  {s['name']}: depth={s.get('depth')} stack={s.get('stack')} "
+                      f"openSeq={s.get('openSeq')} closeSeq={s.get('closeSeq')} "
+                      f"duration_ms={s.get('duration_ms')}", flush=True)
             response = json.dumps({"spans": spans}).encode("utf-8")
         except Exception as exc:
             self.send_response(500)
@@ -591,6 +641,12 @@ def cmd_serve(args):
             print(f"Serving {graph_path} at http://localhost:{args.port}/graph.json (auto-loaded)", flush=True)
         if doc_path:
             print(f"Serving {doc_path} at http://localhost:{args.port}/source_index.json (auto-loaded)", flush=True)
+        # Which trace_log.py this specific process actually loaded, and
+        # when that file was last modified -- printed once at startup so
+        # "is this the code I think it is" is answerable by looking at this
+        # terminal, no separate diagnostic command needed.
+        tl_path = Path(trace_log.__file__)
+        print(f"trace_log module: {tl_path} (last modified {datetime.fromtimestamp(tl_path.stat().st_mtime)})", flush=True)
         print("Press Ctrl+C to stop.", flush=True)
         try:
             httpd.serve_forever()
