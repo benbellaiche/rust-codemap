@@ -176,12 +176,24 @@
             cursor: pointer;
             white-space: nowrap;
             overflow: hidden;
-            text-overflow: ellipsis
+            text-overflow: ellipsis;
+            border-left: 2px solid transparent;
+            box-sizing: border-box
         }
 
         .doc-item:hover {
             background: #313244;
             color: #89b4fa
+        }
+
+        /* Same accent color as the graph node's own .doc-focused halo
+           (overlay-color #f9e2af) -- one consistent "this is the current
+           focus" language across the graph and the doc list, not two. */
+        .doc-item.selected {
+            background: #313244;
+            color: #f9e2af;
+            font-weight: bold;
+            border-left-color: #f9e2af
         }
 
         #btn-clear-focus {
@@ -555,6 +567,9 @@
         <div id="legend-panel-body">
             <div class="leg">
                 <div class="dot" style="background:#89b4fa"></div> fn / method
+            </div>
+            <div class="leg" id="legend-main" style="display:none">
+                <div class="dot" style="background:#fab387"></div> main
             </div>
             <div class="leg">
                 <div class="dot" style="background:#a6e3a1"></div> visited
@@ -1002,6 +1017,14 @@
                         }
                     },
                     { selector: 'node.untraced', style: { 'background-color': '#45475a', 'border-style': 'dashed', 'border-color': '#6c7086', 'border-width': 3, 'opacity': 0.6 } },
+                    // `main`'s own resting color -- distinct from every
+                    // COLORS[nodeType] value (fn/method blue, the grey
+                    // default) so the entry point always stands out at a
+                    // glance. Placed before .visited/.current so replay's
+                    // own colors still take over while main is actively
+                    // being stepped through -- this only ever shows when
+                    // neither of those is active.
+                    { selector: 'node.main-fn', style: { 'background-color': '#fab387', 'border-color': '#e8a879' } },
                     { selector: 'node.visited', style: { 'background-color': '#a6e3a1', 'border-color': '#1e1e2e' } },
                     { selector: 'node.current', style: { 'background-color': '#f38ba8', 'border-color': '#fab387', 'border-width': 3 } },
                     // An overlay halo, not a border/background override --
@@ -1091,6 +1114,7 @@
             logToServer('initCy', `cytoscape construction done after ${Math.round(performance.now() - tCy)}ms -- laying out per component...`);
             const tLayout = performance.now();
             layoutComponents(cy);
+            captureHomePositions();
             cy.fit(undefined, 60);
             logToServer('initCy', `per-component layout + fit done after ${Math.round(performance.now() - tLayout)}ms -- post-processing (untraced/legend)...`);
             // Diagnostic: are the positions the layout produced actually
@@ -1131,6 +1155,16 @@
             // reported against this exact fixture, where main's own calls
             // to make_and_describe looked like dangling, caller-less nodes.
             cy.nodes().each(n => { if (n.data('traced') === false && !isMainId(n.id())) n.addClass('untraced'); });
+            // `main` gets its own distinct color everywhere, systematically
+            // by id shape (`isMainId`), not a per-project name list -- Rust
+            // can't compile a binary with two `fn main`s, so at most one
+            // node in the whole merged graph can ever match this. Purely a
+            // style class, layered in the array BEFORE .visited/.current
+            // below, so a real replay state still wins over it when main is
+            // actively being stepped through -- this is just its resting
+            // color, same role COLORS[nodeType] already plays for everything
+            // else.
+            cy.nodes().each(n => { if (isMainId(n.id())) n.addClass('main-fn'); });
             // Hidden by default -- UNLESS that would hide every single
             // non-main node (e.g. a tiny binary with no #[instrument]
             // anywhere at all besides main, which is never taggable
@@ -1155,6 +1189,14 @@
                 focusOnNode(e.target.id());
             });
             cy.on('dbltap', 'node', e => expandNeighborhood(e.target.id()));
+            // Keeps `homePositions` (expandNeighborhood's own "where does
+            // this node really belong" source of truth) in sync with a
+            // manual drag -- skipped while an expansion is active, since a
+            // node dragged mid-expansion is at its temporary circle-layout
+            // spot, not a real repositioning of its home.
+            cy.on('dragfree', 'node', e => {
+                if (!expandedPositions) homePositions.set(e.target.id(), { ...e.target.position() });
+            });
             cy.on('tap', 'edge', e => {
                 const edge = e.target;
                 const d = edge.data();
@@ -1235,6 +1277,11 @@
             // actually render dashed-grey/be hidden, not the raw data.
             const hasUntraced = cy.nodes('.untraced').length > 0;
             document.getElementById('legend-untraced').style.display = hasUntraced ? '' : 'none';
+            // Same reasoning as untraced above -- a library-only graph (no
+            // `fn main` anywhere) has no `.main-fn` node at all, so showing
+            // this swatch unconditionally would be misleading there.
+            const hasMain = cy.nodes('.main-fn').length > 0;
+            document.getElementById('legend-main').style.display = hasMain ? '' : 'none';
         }
         // Wrap identifiers in a signature with a clickable span, but only when
         // sourceIndex actually has a doc entry for that exact name — never a
@@ -1673,7 +1720,19 @@
         // hidden either way (that was the previous, now-removed focusOnCallees()
         // behavior) -- the graph stays exactly as it was, just re-centered.
         let focusedNodeId = null;
+        // Split out from setFocusedNode() below: a doc-only entry with no
+        // graph node (a bare struct/enum/trait, focusOnNode's own "no
+        // matching node in loaded graph" branch) still needs its doc-list
+        // row to show as selected, even though there's no cy node to ever
+        // add .doc-focused to.
+        let selectedDocItemId = null;
+        function setSelectedDocItem(id) {
+            if (selectedDocItemId) document.querySelector(`.doc-item[data-id="${selectedDocItemId}"]`)?.classList.remove('selected');
+            selectedDocItemId = id;
+            if (id) document.querySelector(`.doc-item[data-id="${id}"]`)?.classList.add('selected');
+        }
         function setFocusedNode(id) {
+            setSelectedDocItem(id);
             if (!cy) return;
             if (focusedNodeId) cy.getElementById(focusedNodeId).removeClass('doc-focused');
             focusedNodeId = id;
@@ -1713,6 +1772,38 @@
         // hidden, temporarily revealed, and where the camera was, so
         // restoring is exact, not a re-layout guess.
         let expandedPositions = null, hiddenByExpansion = null, revealedByExpansion = null, preExpandView = null;
+        // The graph's own "resting" layout position for every node --
+        // captured once after layoutComponents() places everything, and
+        // kept up to date afterward (a manual drag, "Relayout") -- but
+        // NEVER read back from a live, possibly-still-animating
+        // `n.position()` the way expandNeighborhood used to. That distinction
+        // is the fix for a real, reproducible bug: Cytoscape synthesizes
+        // 'dbltap' from two ordinary 'tap' events, not instead of them, and
+        // each 'tap' already runs focusOnNode() -> its own restoreExpansion()
+        // call -- so simply double-clicking an ALREADY-expanded node a
+        // second time (an entirely ordinary interaction, not a rapid edge
+        // case) starts a 300ms restore-to-original animation via that first
+        // 'tap', which is still mid-flight (often barely even started, since
+        // Cytoscape's animation scheduler only picks up a freshly-`.animate()`d
+        // element on its next render tick) by the time the eventual 'dbltap'
+        // handler ran and read `.position()` for its OWN new capture. That
+        // read a transient, not-yet-moved position and stored it as this new
+        // expansion's "original" -- which the next background-click restore
+        // then treated as ground truth, permanently drifting the affected
+        // nodes from their real layout position. Confirmed directly: it
+        // reproduced on every run, not just occasionally, and stopping/
+        // jump-to-ending the in-flight animation first (tried as a first fix)
+        // did NOT help -- the position read right after `stop(true, true)`
+        // was still the pre-restore value, not the true original, meaning
+        // the jump-to-end apparently doesn't apply to an animation that
+        // hasn't rendered even one frame yet. Reading from this separately-
+        // tracked, never-mid-animation map sidesteps the whole race instead
+        // of trying to win it.
+        let homePositions = new Map();
+        function captureHomePositions() {
+            homePositions = new Map();
+            cy.nodes().forEach(n => homePositions.set(n.id(), { ...n.position() }));
+        }
         function restoreExpansion() {
             if (!expandedPositions) return;
             const toRestore = expandedPositions;
@@ -1759,7 +1850,7 @@
             cy.elements().stop(true, true);
             preExpandView = { zoom: cy.zoom(), pan: { ...cy.pan() } };
             expandedPositions = new Map();
-            neighbors.forEach(n => expandedPositions.set(n.id(), { ...n.position() }));
+            neighbors.forEach(n => expandedPositions.set(n.id(), { ...(homePositions.get(n.id()) || n.position()) }));
             // Only hide what was actually visible already -- an untraced
             // node the "Hide untraced" toggle had hidden stays hidden on
             // restore too, rather than this feature un-hiding it by mistake.
@@ -1838,6 +1929,7 @@
         function focusOnNode(id, opts = {}) {
             if (!cy) {
                 document.getElementById('info').innerHTML = `Load a graph first — "${id}" has no graph to focus on yet.`;
+                setSelectedDocItem(id);
                 return;
             }
             const node = cy.getElementById(id);
@@ -1854,6 +1946,7 @@
                     `${docEntryHtml(id)}<br><span style="color:#6c7086;font-size:10px">` +
                     `has documentation but is not a node in the loaded graph ` +
                     `(never calls anything traceable, or isn't in this graph's dependency closure).</span>`;
+                setSelectedDocItem(id);
                 logToServer('focusOnNode', `${id}: no matching node in loaded graph`);
                 return;
             }
@@ -2401,6 +2494,7 @@
         document.getElementById('btn-relayout').addEventListener('click', () => {
             if (!cy) return;
             layoutComponents(cy);
+            captureHomePositions();
             cy.animate({ fit: { padding: 60 }, duration: 300 });
         });
 

@@ -455,7 +455,7 @@ gained an explicit `main` prefix it was silently missing) -- confirmed via
 a full re-check of `parse_trace()`'s output against the entire trace, not
 assumed from the one fixture that surfaced it.
 
-`"enter"`/`"exit"` lines (§2.14, `FmtSpan::ENTER | FmtSpan::EXIT`,
+`"enter"`/`"exit"` lines (§2.13, `FmtSpan::ENTER | FmtSpan::EXIT`,
 opt-in on the target -- never emitted for a plain `NEW | CLOSE` setup)
 fix a real correctness gap for `async fn`: a sync fn's span enters once
 and never exits until CLOSE, so `own_stack` tracking it purely via
@@ -466,7 +466,7 @@ meanwhile. Without tracking this, that unrelated code wrongly inherits the
 suspended span as its ancestor -- confirmed directly (`tokio::join!` on a
 single-threaded runtime, two independent async fns with different sleep
 durations): the shorter one came back nested under the longer one.
-Tracked via a second, GLOBAL structure (§2.15), `suspended_stack` (name ->
+Tracked via a second, GLOBAL structure (§2.14), `suspended_stack` (name ->
 stashed `(name, callOrder)`, shared across ALL threads, not per-thread like
 `own_stack`): "exit" pops the span off `own_stack` (if genuinely on top)
 and stashes it; "enter" restores it from the stash *unless* it's already
@@ -505,11 +505,6 @@ needed this -- it calls `stepTo()` synchronously, no delay to race.
 
 ### `viewer/index.html` — the pieces that aren't obvious from a skim
 
-- A flame-graph second view mode for "Execution Trace" was built once
-  (§2.13), verified working, then explicitly reverted -- only the flat
-  list (`renderTrace()`, `#trace-list`) remains. Don't reintroduce
-  `startOffsetMs`/`renderFlameGraph()` speculatively; re-read §2.13 first
-  if this comes back up.
 - `stepTo()`'s edge lookup can come up empty even for a span with a real,
   confirmed ancestor -- an untraced function in between means the trace
   correctly attributes the callee to its still-open ancestor, but no
@@ -535,6 +530,20 @@ needed this -- it calls `stepTo()` synchronously, no delay to race.
   edges only) -- a node reached only *through* an untraced one (2 hops
   away) stays hidden; this reveals genuine first-degree relationships, not
   a wider "show everything nearby."
+- `expandNeighborhood()` never reads a neighbor's "original" position via
+  live `.position()` -- always via `homePositions` (§2.15), a separately-
+  tracked map updated only after `layoutComponents()`/a manual drag.
+  Confirmed as a real, 100%-reproducible bug otherwise: Cytoscape fires
+  `tap`, `tap`, THEN `dbltap` for a real double-click (not `dbltap` alone),
+  and each `tap` already runs `focusOnNode()` -> `restoreExpansion()` --
+  so double-clicking an already-expanded node again reads a neighbor's
+  position while its own restore-to-original animation (started moments
+  earlier by the first `tap`) is still mid-flight, silently adopting a
+  transient position as the new "home." `cy.elements().stop(true, true)`
+  right before the read does NOT fix this (verified directly) -- jump-to-
+  end doesn't reliably apply to an animation that hasn't rendered a frame
+  yet. Don't reintroduce a live-position read here even for a seemingly
+  unrelated tweak.
 - "Load graph…" / "Load doc index…" / "Load trace…" are plain
   `<input type="file">` + `FileReader` pickers — they read straight off
   disk client-side, no fetch involved. This is deliberate: it's what lets

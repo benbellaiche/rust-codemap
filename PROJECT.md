@@ -1952,72 +1952,7 @@ version string: this needs zero discipline to stay accurate (no step to
 remember before restarting), and directly answers the exact question that
 took an entire session to answer manually the hard way.
 
-### 2.13 Flame graph: the §4 proposal, built as written, then reverted
-
-**Removed immediately after being seen: "you can delete the flame graph, I'll
-keep the simple list view."** Everything below describes what was actually
-built and verified before that request -- kept as a historical record, not
-current behavior, in case a flame graph comes back up later (the approach
-worked; it just wasn't wanted this time). Fully reverted, cleanly: the
-`#trace-flame`/`#btn-flame-toggle` HTML and CSS, `renderFlameGraph()`/
-`traceViewMode`/`FLAME_ROW_H`, the `flame-${i}` class-syncing line in
-`stepTo()`, the `.flame-bar` mention in `clearAll()`'s selector, both
-placeholder-reset call sites, and -- since it had no other consumer --
-`startOffsetMs` itself (`trace_log.py`'s `_parse_timestamp()`/`trace_start`
-tracking and `parseTraceJsonl()`'s mirrored `traceStartMs` logic). Full
-regression suite re-run clean after the revert; `test_flame_graph.js`
-deleted (nothing left for it to test).
-
-Requested directly after the proposal below (§4) sat unbuilt for a while:
-"I don't really see what this would look like — build it and we'll see."
-Built exactly as proposed, no design changes:
-
-- **Second view mode, not a new frame.** A "Flame graph" toggle button next
-  to the "Execution Trace" header swaps `#trace-list` (the flat list) for
-  `#trace-flame` inside the *same* sidebar slot -- both are always built by
-  `renderTrace()` (an `if`-branch via a shared `renderFlameGraph()` call,
-  not a second divergent code path), so toggling is instant and can never
-  show stale data.
-- **The one real data gap the proposal identified, filled.** `trace_log
-  .py`/`parseTraceJsonl()` now compute `startOffsetMs` per span -- real
-  wall-clock milliseconds since the trace's very first entry, from each
-  NEW line's own `timestamp` field (`_parse_timestamp()`, `datetime
-  .fromisoformat`, handles the `Z`-suffixed RFC 3339 format tracing_
-  subscriber emits). Deliberately real time, not `openSeq` (log-position
-  ordinal, used for every other ordering decision in this file) --
-  positioning bars by actual elapsed time is the entire point of a flame
-  graph. Absent (key omitted) when a line has no parseable `timestamp` --
-  `renderFlameGraph()` falls back to spacing every span as an equal-width
-  slot in trace order rather than rendering empty.
-- **Interaction reuses `stepTo()` exactly.** Clicking a bar calls the same
-  `stepTo(idx)` a trace-list row click already does -- verified directly:
-  clicking a flame bar updates `traceIdx`, and the flame bar, the flat-list
-  row, AND the graph node all pick up `.current` from that one call, no
-  separate code path to drift out of sync (the exact `.class`-vs-doc-list
-  drift §2.5 already hit once this project).
-- **Layout**: icicle-style (root at top, deeper calls below -- matches the
-  existing top-down trace list's own reading direction, per the proposal's
-  own "either is fine, match whichever reads more naturally" call),
-  `left`/`width` as percentages of the trace's total span so it resizes
-  with the sidebar for free, `top` from `depth * rowHeight`. A
-  minimum-width floor (0.5%) keeps a genuinely tiny call (e.g. `dcore::add`
-  next to `dapi::run_report`'s much longer total) visible and clickable
-  instead of a literal zero-width sliver, same reasoning as the proposal's
-  own "scale consideration" bullet.
-- **Verified, not assumed correct from reading the code**: bar `top`
-  matches `depth` exactly (a depth-2 span sits exactly one row below a
-  depth-1 one); bars move rightward as trace order advances; a genuinely
-  still-open real ancestor (e.g. `run_report` while its own child
-  `Report::generate` is the current step) stays visually active/red in the
-  flame graph too, not "visited" -- the same closeSeq-based correctness
-  from §2.11's follow-ups automatically applies here too, since it's the
-  identical `active`/`stillOpen` computation in `stepTo()`, just also
-  applied to `flame-${i}` alongside `sp-${i}`; Reset and Unload both clear
-  the flame graph's own state (`.current`/`.visited` classes, placeholder
-  text) exactly like the flat list already did. Full existing regression
-  suite re-run clean; a new `test_flame_graph.js` added.
-
-### 2.14 Async replay, single-threaded runtime: a real correctness fix
+### 2.13 Async replay, single-threaded runtime: a real correctness fix
 
 Raised directly as "can we handle `async fn` without touching the target's
 own code" -- investigated and answered step by step, single-threaded
@@ -2090,7 +2025,7 @@ not just async ones; every hardcoded span-count assertion across the test
 suite updated (22 -> 27 spans) accordingly.
 
 **Originally scoped to single-threaded runtimes only -- since extended to
-multi-threaded ones too, see §2.15.** A multi-threaded async runtime can
+multi-threaded ones too, see §2.14.** A multi-threaded async runtime can
 migrate the *same* task's own polls across different OS threads over its
 lifetime, and `tracing`'s plain JSON output has no concept of a stable task
 identity to stitch those back together across threads -- `threadId` alone
@@ -2098,15 +2033,15 @@ doesn't solve this the way it did for the already-solved
 concurrent-*OS-threads* problem (§2.11), where each thread genuinely keeps
 its own identity for its whole life. Deliberately deferred as a separate,
 harder next step at the time this section was written, not attempted in
-the same pass -- picked back up and settled in §2.15.
+the same pass -- picked back up and settled in §2.14.
 
-### 2.15 Async replay, multi-threaded runtime: the suspended-span stash made global
+### 2.14 Async replay, multi-threaded runtime: the suspended-span stash made global
 
-Picked up as the deferred follow-up from §2.14: "can the same ENTER/EXIT
+Picked up as the deferred follow-up from §2.13: "can the same ENTER/EXIT
 fix be extended to cover a multi-threaded async runtime too, still without
 touching the target's own code?"
 
-**The gap, confirmed empirically before writing any fix.** §2.14's fix
+**The gap, confirmed empirically before writing any fix.** §2.13's fix
 (`suspended_stacks`, one stash *per thread id*, mirroring `open_stacks`)
 assumed a suspended span always resumes on the same OS thread it exited
 on. Confirmed false on a disposable scratch crate: a `tokio::spawn`'d task
@@ -2140,7 +2075,7 @@ scope.** If the exact same async fn/call-site is invoked multiple times
 truly concurrently (not merely interleaved by suspension, but genuinely
 overlapping in flight at once -- not yet exercised by any fixture), the
 name-keyed stash can't tell the invocations apart and could restore the
-wrong one's stashed tuple. This risk already existed in §2.14's per-thread
+wrong one's stashed tuple. This risk already existed in §2.13's per-thread
 version too, for same-name concurrent invocations sharing one thread; going
 global only widens its scope from "within one thread" to "across threads,"
 not a new category of risk.
@@ -2153,7 +2088,7 @@ cross-thread migration. Then promoted permanently to the dummy-lib fixture
 `multi_async_demo`): `multi_async_demo` builds and runs its own dedicated
 multi-worker-thread tokio runtime on a plain `std::thread` (deliberately
 *not* nested inside `dummy-cli`'s own runtime, which stays
-`flavor = "current_thread"` for §2.14's fixture, and *not* the crate's own
+`flavor = "current_thread"` for §2.13's fixture, and *not* the crate's own
 `#[tokio::main]`), spawning `migrating_parent` as its own independently
 schedulable task alongside 100 busy sibling tasks -- confirmed to reliably
 migrate `migrating_parent`'s own polls across 2+ distinct worker threads on
@@ -2168,6 +2103,87 @@ its own dedicated isolated `trace_multi_async.jsonl` (same pattern as
 `trace_async.jsonl`/`trace_concurrent.jsonl`/`trace_gap.jsonl`) and
 `test_multi_async_replay.js`. Every hardcoded span-count assertion across
 the test suite updated (27 -> 30 spans) accordingly.
+
+### 2.15 Two small viewer requests, and a real double-click/restore bug found along the way
+
+Two simple, directly-requested style changes, plus a genuine correctness
+bug found and fixed while verifying them.
+
+**Doc-list selected row now has its own persistent style.** Previously a
+`.doc-item` row had a `:hover` style but nothing marking which one was
+*currently* selected -- clicking an entry (or a graph node, via
+`revealInDocList`) scrolled it into view with no lasting visual trace once
+the mouse moved away. Added `.doc-item.selected` (dark background, bold,
+a 2px left border) using the same accent color (`#f9e2af`) as the graph
+node's own `.doc-focused` overlay halo -- one consistent "this is the
+current focus" language across both panels, not two. Tracked via a new
+`selectedDocItemId` + `setSelectedDocItem(id)`, called from
+`setFocusedNode()` (the existing single place both click directions
+already converge on) and, separately, from `focusOnNode()`'s two early-
+return branches (no graph loaded yet; a doc-only entry with no matching
+graph node) -- both real, reachable cases that don't go through
+`setFocusedNode()` at all, so a selected row would otherwise never show
+for a bare struct/enum/trait's own doc-only page.
+
+**The `main` node gets its own color everywhere, systematically.** Reuses
+the existing `isMainId()` check (`id.endsWith('::main')`, already used
+elsewhere for `main`'s untraced/private exemptions) -- not a name list,
+and safe by construction: a Rust binary can only ever have one `fn main`,
+so at most one node in the whole merged graph can ever match. A new
+`main-fn` class, added right alongside the existing `untraced` classing
+pass in `initCy()`, and a new style rule (`#fab387`, peach) placed in the
+Cytoscape style array *before* `.visited`/`.current` -- deliberately, so a
+real replay state still wins over it while `main` is actively being
+stepped through; this is only its resting color, the same role
+`COLORS[nodeType]` already plays for everything else. Also added to the
+legend popover -- conditionally shown (`#legend-main`, toggled in
+`buildLegend()`), same reasoning and same pattern as the existing
+`#legend-untraced` entry: a library-only graph has no `fn main` anywhere,
+so unconditionally showing this swatch there would be misleading.
+
+**Bug found while manually verifying the above: double-clicking an
+already-expanded node a second time permanently drifts its neighbors off
+their real layout position.** Not a rare edge case -- confirmed to
+reproduce on every attempt, from an entirely ordinary interaction (expand
+a node, look at it, double-click it again). Root-caused by tracing actual
+event timestamps (not assumed): Cytoscape synthesizes `dbltap` from two
+ordinary `tap` events, it does not replace them -- a real double-click
+fires `tap`, `tap`, `dbltap` in that order, tens of milliseconds apart, not
+`dbltap` alone. Each `tap` on a node already runs `focusOnNode()`, which
+calls `restoreExpansion()` to collapse whatever's currently expanded (`this
+is a new focus`) -- so the *first* `tap` of a second double-click on an
+already-expanded node kicks off a 300ms animate-back-to-original for its
+neighbors, which is still mid-flight (often barely started -- Cytoscape's
+scheduler only picks up a freshly-`.animate()`'d element on its next render
+tick) by the time the eventual `dbltap` handler (`expandNeighborhood`) reads
+`.position()` to remember these same neighbors' "original" spot for the
+*new* expansion. That read a transient, not-yet-restored position and
+stored it as ground truth -- which the next background-click restore then
+treated as the real original, permanently drifting the affected nodes.
+Confirmed directly with real synthesized mouse events (not
+`cy.emit('dbltap')`, which skips the two `tap` events and never reproduced
+it): 10 of `main`'s neighbors ended up hundreds of units off after exactly
+this sequence.
+
+First fix attempt -- forcing `cy.elements().stop(true, true)` (jump any
+in-flight animation to its end) right before the read -- did **not** work:
+verified directly (added temporary logging) that the position read
+immediately after `stop(true, true)` was still the pre-restore value, not
+the true original, meaning "jump to end" doesn't reliably apply to an
+animation that hasn't rendered even a single frame yet. Fixed properly
+instead by not depending on animation timing at all: a new `homePositions`
+map (node id -> its real resting position) is captured once right after
+`layoutComponents()` finishes (both at initial load and after "Re-layout"),
+and kept current via a `dragfree` listener for manual drags -- skipped
+while an expansion is active, since a node dragged mid-expansion is at its
+temporary circle spot, not a real repositioning of its home.
+`expandNeighborhood()` now reads a neighbor's "original" position from this
+map, never from a live, possibly-mid-animation `.position()`. Verified with
+three separate reproductions (a synthetic same-node double-expand, a real
+mouse `dblclick` at the node's actual on-screen coordinates, and the exact
+double-click-an-already-expanded-node-again sequence that first surfaced
+the bug) -- all clean (zero drift) after the fix, all reproduced the drift
+before it. Full existing regression suite re-run clean throughout.
 
 ## 3. Points to fix
 
@@ -2520,16 +2536,23 @@ the test suite updated (27 -> 30 spans) accordingly.
 ## 4. Points to decide
 
 - ~~Doc frame — real rustdoc navigation vs. scraped inline text?~~
-  **Settled: both, side by side.** `doc_index.py`'s scraped signature/doc
-  fragments still render inline (info panel, doc list). The real rustdoc
-  HTML page (removed as dead code earlier in this move) came back as an
-  `<iframe>` in the left `#doc-sidebar`, loaded from a `/docs/` mount
-  (`codemap serve --docs`, auto-wired by `run`) rather than `file://` —
-  see §2.5. Not full "free navigation via rustdoc's own links" yet: clicking
-  a link *inside* the iframe (e.g. to another type's page) navigates the
-  iframe, but doesn't sync the graph focus or the doc list's own selection
-  to wherever that link went — still one-directional (list -> iframe, not
-  iframe -> list/graph).
+  **Settled: both, side by side — but not as an iframe.** `doc_index.py`'s
+  scraped signature/doc fragments still render inline (info panel, doc
+  list). An `<iframe>` embedding the real rustdoc HTML page (served from a
+  `/docs/` mount, `codemap serve --docs`, auto-wired by `run`) was tried and
+  even widened twice, but turned out to never actually be used as anything
+  but a launcher for "open the real page" — see §2.5's second/third/fourth
+  rounds. Removed entirely, replaced by making the item's own name a plain
+  `<a target="_blank">` (`docLinkHtml()`) straight to its native `cargo doc`
+  page in a real browser tab. This closes the question a different way
+  than first framed: there is no iframe left to sync bidirectionally with
+  the graph/doc list — a separate browser tab has no return channel to this
+  page at all, so "iframe -> list/graph" sync isn't a smaller version of the
+  original ask, it's a different, much bigger one (would need injecting a
+  script into every generated rustdoc page to postMessage back, or
+  reintroducing the iframe this project already removed three times over).
+  Not attempted; would need to be raised as its own proposal, not assumed
+  as a leftover half of this one.
 - ~~The tracing log format contract.~~ **Settled: mandatory, not
   descriptive.** README.md's "Tracing log format" section no longer reads
   as "what the parser happens to accept today" — it states the exact
@@ -2589,14 +2612,14 @@ the test suite updated (27 -> 30 spans) accordingly.
   *binary* exercised the library, which already works). No further design
   work planned here — this is closed, not deferred.
 
-  **Async replay, revisited and settled — see §2.14/§2.15.** Original
+  **Async replay, revisited and settled — see §2.13/§2.14.** Original
   reasoning: replay works by assuming log order is a single, straight call
   stack, which stops being true once a span can suspend and resume across
   `.await` points. Same shape as the multi-thread case below, and settled
   the same way: the CORRECTNESS half turned out separable and solvable
   without touching the target's own function bodies (`FmtSpan::ENTER |
   EXIT`, config-only) — confirmed and fixed for single-threaded async
-  runtimes first (§2.14), then extended to multi-threaded ones too (§2.15,
+  runtimes first (§2.13), then extended to multi-threaded ones too (§2.14,
   a global rather than per-thread suspended-span stash) — a task's own
   polls can migrate across OS threads over its lifetime, and `tracing`'s
   plain JSON output has no stable task identity to reassemble that across
@@ -2641,62 +2664,6 @@ the test suite updated (27 -> 30 spans) accordingly.
   §2.8 for exactly what changed in each, including two real bugs the
   migration surfaced and fixed along the way); the Playwright suite's
   ~25 affected files were updated for the new id shape and re-run clean.
-- **Call-stack/timing frame — new visualization or evolve the existing
-  one? Built once exactly as proposed below, then explicitly reverted —
-  see §2.13.** Kept just the flat list, by request. Revisit only if the
-  idea comes back up; the approach below is verified to work if it does.
-  The sidebar's "Execution Trace" list already shows per-span duration and
-  iteration counts, but flat.
-
-  **Proposal: a flame graph, as a second view mode on the *existing*
-  sidebar list, not a brand-new frame.** Concretely:
-  - **Data**: no new data needed. Each `traceData` entry already has
-    `depth`, `stack`, `duration_ms`, `iterations` — a flame graph is a
-    rendering of exactly that, nothing else to compute. (`start`/`end`
-    offsets for laying out horizontal position/width would be new — see
-    "what's missing" below.)
-  - **Layout**: classic flame-graph shape — one horizontal bar per span,
-    stacked by `depth` (root at the bottom or top, either is fine, match
-    whichever reads more naturally next to the existing top-down trace
-    list), width proportional to `duration_ms`, x-position determined by
-    when that span started relative to its parent's own start. Standard,
-    well-understood visualization — no novel design needed here, the
-    interesting part is wiring it into what already exists.
-  - **What's missing from `traceData` today**: a span's *start offset*
-    within its parent. `trace_log.py`/`parseTraceJsonl()` currently
-    collapse a span's occurrences into one aggregated `duration_ms`
-    total, with no record of *when* (relative to trace start, or to its
-    parent's own start) each occurrence happened — needed to place bars
-    left-to-right in the right order and to size gaps (idle time) between
-    sibling calls accurately. This is a real, if small, extension to both
-    parsers, not free from the existing data.
-  - **Interaction, reusing what already exists rather than inventing a
-    parallel mechanism**: clicking a flame-graph bar calls the exact same
-    `stepTo(idx)` the existing trace-list row click already does — same
-    highlight/center/info-panel behavior, no separate code path to keep in
-    sync (a lesson already learned once this session, §2.5's graph-click-
-    vs-doc-list-click drift). The flame graph and the flat list are two
-    renderings of one `traceData`, switchable via a small toggle
-    (`renderTrace()` already exists as the one function that (re)builds
-    the sidebar from `traceData` — this becomes an `if` inside it, keyed
-    on view mode, not two divergent render paths).
-  - **Where it lives**: same right-sidebar slot the flat list already
-    occupies (toggle between the two, not both at once — screen space is
-    already tight there per §2.5's history of sidebar-width fights). Not
-    a new panel/frame, since the vision's "dedicated frame" reads more
-    like "a serious view of this data" than "a fourth panel" — and a new
-    panel competes for the same limited width the doc sidebar and graph
-    already negotiate.
-  - **Scale consideration**: a trace with hundreds of spans (plausible on
-    the `bulk`-scale fixture, §2.7, if ever traced rather than just
-    statically graphed) needs bars thin enough to still render sanely —
-    likely wants a minimum-pixel-width floor per bar (merge/collapse
-    sub-pixel-width spans into their parent visually, same spirit as the
-    doc list's crate/class collapsing) rather than assuming every trace
-    stays dummy-cli-sized.
-  **Built exactly as proposed above, verified working, then reverted at
-  explicit request — see §2.13** for what shipped, how it was verified,
-  and exactly what was torn back out.
 - ~~How is the tool invoked against a new target project?~~ **Settled**:
   a CLI (`codemap.py`) with subcommands, taking `--project <path>` to any
   target crate. See §2.4.
@@ -2709,9 +2676,6 @@ the test suite updated (27 -> 30 spans) accordingly.
   (`codemap/schema_check.py`, not a per-line runtime check inside
   `trace_log.py`).
 - ~~Build the doc frame~~ **Done** — see §2.5 and §4.
-- Build the dedicated call-stack/timing frame — **built once (a flame
-  graph, second view mode on the existing sidebar list), verified working,
-  then explicitly reverted — see §2.13.** Kept just the flat list.
 - ~~Unify the duplicated trace-parsing logic~~ **Done, see §3**: not by
   eliminating one of the two implementations, but by making the server
   round trip (`/__codemap_parse_trace` -> `trace_log.py`) the one real
@@ -2722,13 +2686,6 @@ the test suite updated (27 -> 30 spans) accordingly.
 
 ## 6. Points of improvement (non-blocking)
 
-- ~~Edge-type richness~~ **Explicitly deprioritized, not forgotten.** Today
-  every MIR-derived edge is generically typed `"call"`. The viewer already
-  supports styling `dispatch` / `loop_call` / `trampoline` differently if
-  the generator is later extended to emit them (dyn-dispatch edges are the
-  obvious first candidate for a `dispatch` type instead of plain `call`) —
-  left alone for now by explicit request, not because the idea was
-  rejected. Revisit only if it comes back up.
 - ~~Multi-run trace coverage~~ **Declined, won't build.** A single trace
   only exercises the branches its input happened to take; an optional
   "union of several runs" mode was considered for *edge*/branch coverage
