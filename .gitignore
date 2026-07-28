@@ -26,9 +26,9 @@ __pycache__/
 
 # graph/doc/trace default to writing under the *target* crate's own
 # target/rust-codemap/ directory, not here. These rules are just a safety
-# net for the (non-default) case of an explicit `--out src/codemap/viewer/...`.
-src/codemap/viewer/graph.json
-src/codemap/viewer/source_index.json
-src/codemap/viewer/trace.json
+# net for the (non-default) case of an explicit `--out viewer/...`.
+viewer/graph.json
+viewer/source_index.json
+viewer/trace.json
 *.mir
 

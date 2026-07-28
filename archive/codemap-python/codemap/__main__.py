@@ -41,7 +41,7 @@ Subcommands:
           extraction source").
   validate-trace
           Checks a real trace.jsonl, line by line, against
-          src/codemap/schema/trace-{entry,close}.schema.json -- the written-
+          schema/trace-{entry,close}.schema.json -- the written-
           down version of README.md's "Tracing log format" contract (see
           PROJECT.md §4). Useful both as this project's own fixture-
           validation test and as a real diagnostic for "does my own
@@ -308,12 +308,13 @@ def cmd_doc(args) -> Path:
     # (which could include unrelated siblings or client binaries), or
     # cross-references for those crates' items would silently come up empty.
     packages = local_dependency_closure(manifest)
-    include_private = getattr(args, "include_private", False)
-    doc_cmd = ["cargo", "doc", "--no-deps", "--manifest-path", str(manifest),
+    # Always on, not a flag: a private #[instrument]'d fn with no doc page
+    # has no source_index entry, so trace_log can't resolve its span to a
+    # qualified node id -- it silently drops out of replay instead of
+    # erroring, which is worse than always paying for private-item docs.
+    doc_cmd = ["cargo", "doc", "--no-deps", "--document-private-items", "--manifest-path", str(manifest),
                *[a for pkg in packages for a in ("-p", pkg["name"])]]
-    if include_private:
-        doc_cmd.append("--document-private-items")
-    print(f"Running cargo doc --no-deps{' --document-private-items' if include_private else ''} ...")
+    print("Running cargo doc --no-deps --document-private-items ...")
     subprocess.run(doc_cmd, check=True)
 
     crates = []
@@ -388,7 +389,7 @@ def cmd_selfcheck(args) -> bool:
         print(f"  {'OK' if ok else 'FAIL'}  {label}")
         all_ok = all_ok and ok
     if not all_ok:
-        print("\nOne or more checks failed. If nothing in src/codemap/ or the dummy-cli/"
+        print("\nOne or more checks failed. If nothing in this package or the dummy-cli/"
               "dummy-lib fixtures changed recently, this likely means the installed "
               "rustc's MIR pretty-printer output changed shape -- see PROJECT.md §4, "
               "\"MIR as the only extraction source\".")
@@ -397,17 +398,17 @@ def cmd_selfcheck(args) -> bool:
 
 # ── validate-trace ───────────────────────────────────────────────────────
 
-_SCHEMA_DIR = Path(__file__).parent / "schema"
-# Package-relative, not cwd-relative -- `viewer/` now lives inside this
-# package (src/codemap/viewer/), not at the repo root next to it, so a
-# bare "viewer" default would only resolve correctly if `python -m codemap`
-# happened to be invoked from inside src/. Same reasoning as _SCHEMA_DIR
-# above, which already had to be package-relative for the same reason.
-_VIEWER_DIR = Path(__file__).parent / "viewer"
+# File-relative, not cwd-relative. schema/ and viewer/ are shared with the
+# Rust implementation (cargo-codemap, the primary one now -- see CLAUDE.md)
+# and live at the repo root, three levels up from this file's own
+# archive/codemap-python/codemap/ directory.
+_REPO_ROOT = Path(__file__).parent.parent.parent.parent
+_SCHEMA_DIR = _REPO_ROOT / "schema"
+_VIEWER_DIR = _REPO_ROOT / "viewer"
 
 
 def cmd_validate_trace(args) -> bool:
-    """Checks a real trace.jsonl against the three schemas in src/codemap/schema/
+    """Checks a real trace.jsonl against the three schemas in schema/
     (see PROJECT.md §4, "Trace-format schema") -- one line at a time, since
     each line is independently an entry, a close, or a plain event, not one
     schema for the whole file. Doubles as this project's fixture-validation
@@ -454,7 +455,7 @@ def cmd_validate_trace(args) -> bool:
             for e in errors:
                 print(f"  {e}")
     verdict = "OK" if all_ok else "FAILED"
-    print(f"{verdict}: {total} line(s) checked against src/codemap/schema/trace-{{entry,close,event}}.schema.json")
+    print(f"{verdict}: {total} line(s) checked against schema/trace-{{entry,close,event}}.schema.json")
     return all_ok
 
 
@@ -665,8 +666,7 @@ def cmd_serve(args):
 def cmd_run(args):
     manifest = require_manifest(args.project)
     graph_path = cmd_graph(SimpleNamespace(project=args.project, out=None))
-    doc_path = cmd_doc(SimpleNamespace(project=args.project, graph=None, out=None,
-                                        include_private=args.include_private))
+    doc_path = cmd_doc(SimpleNamespace(project=args.project, graph=None, out=None))
     docs_root = Path(cargo_metadata(manifest)["target_directory"]) / "doc"
 
     print()
@@ -700,10 +700,6 @@ def main():
     r.add_argument("--project", required=True, help="Path to the target crate (dir containing Cargo.toml)")
     r.add_argument("--port", type=int, default=8787)
     r.add_argument("--no-browser", action="store_true", help="Don't automatically open a browser tab")
-    r.add_argument("--include-private", action="store_true",
-                   help="Also document private (non-pub) items -- passes --document-private-items to "
-                        "cargo doc. Off by default: real cost (more HTML pages to render and scan) "
-                        "scaling with how many private items exist -- see PROJECT.md §4.")
     r.set_defaults(func=cmd_run)
 
     g = sub.add_parser("graph", help="Generate the call-graph for a target crate and its whole workspace")
@@ -715,10 +711,6 @@ def main():
     d.add_argument("--project", required=True, help="Path to the target crate (dir containing Cargo.toml)")
     d.add_argument("--graph", default=None, help="graph.json to cross-reference against (default: <target>/rust-codemap/<crate>/graph.json)")
     d.add_argument("--out", default=None, help="Where to write source_index.json (default: <target>/rust-codemap/<crate>/source_index.json)")
-    d.add_argument("--include-private", action="store_true",
-                   help="Also document private (non-pub) items -- passes --document-private-items to "
-                        "cargo doc. Off by default: real cost (more HTML pages to render and scan) "
-                        "scaling with how many private items exist -- see PROJECT.md §4.")
     d.set_defaults(func=cmd_doc)
 
     s = sub.add_parser("serve", help="Serve the viewer directory over HTTP")

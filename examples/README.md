@@ -2,10 +2,12 @@
 
 A small, self-contained target for trying rust-codemap without needing any
 other project on disk: `dummy-core` + `dummy-api` (two crates, so the
-cross-crate collision case has something real to cross) + `dummy-cli`.
-Simplified on purpose -- for the exhaustive regression fixture
-(`[lib] name` overrides, private/public toggling, etc.), see the separate
-`dummy-lib`/`dummy-cli` this one is modeled on; that pair is left untouched.
+cross-crate collision case has something real to cross) + `dummy-cli`. This
+is now also the fixture the `cargo test` MIR-format canary builds against
+(`selfcheck_dummy_cli` in `src/main.rs`), since it lives in this repo and
+the standalone `dummy-lib`/`dummy-cli` project it was originally modeled on
+(exhaustive regression fixture -- `[lib] name` overrides, private/public
+toggling, etc.) no longer exists.
 
 `dummy-api` has one small function chain per test case (3-4 calls deep,
 except where the case is specifically about depth/looping/recursion);
@@ -15,8 +17,16 @@ deliberately -- generated output, not committed, regenerate any time):
 
 ```sh
 cd examples/dummy-cli
+```
+
+```sh
 cargo run -- <test-name>          # writes target/traces/trace_<test-name>.jsonl
-cargo run                         # no argument -- prints the list below
+```
+
+No argument prints the list below:
+
+```sh
+cargo run
 ```
 
 | Test name      | Demonstrates                                                                          |
@@ -32,15 +42,23 @@ cargo run                         # no argument -- prints the list below
 | `async_multi`  | An async task that genuinely migrates across worker threads on a multi-threaded runtime, then calls a child |
 | `collision`    | The same function names (`describe`/`run`) in two different crates -- rust-codemap qualifies node ids by crate so they render as distinct nodes instead of merging |
 
-Try one, e.g.:
+Try one, e.g. `branch`, from `examples/dummy-cli`:
 
 ```sh
-cd examples/dummy-cli && cargo run -- branch
-cd ../..   # rust-codemap root, PYTHONPATH=src already set (see main README)
-python -m codemap run --project examples/dummy-cli --include-private
-# then "Load trace..." in the toolbar -> examples/dummy-cli/target/traces/trace_branch.jsonl
+cargo run -- branch
 ```
 
-`--include-private` matters here: every function in this example except
-the entry points is a private (non-`pub`) helper, and the trace can only
-resolve/qualify a name via `cargo doc`'s own output for it.
+Then from the `rust-codemap` root:
+
+```sh
+cargo codemap run --project examples/dummy-cli
+```
+
+Then use **"Load trace…"** in the toolbar and pick
+`examples/dummy-cli/target/traces/trace_branch.jsonl`.
+
+Every function in this example except the entry points is a private
+(non-`pub`) helper, and a trace can only resolve/qualify a name via
+`cargo doc`'s own output for it -- which is why private items are always
+documented now, not behind an opt-in flag (see
+[doc/commands.md](../doc/commands.md)).

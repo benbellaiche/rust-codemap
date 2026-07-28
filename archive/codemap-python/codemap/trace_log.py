@@ -347,7 +347,7 @@ def parse_trace(text: str, source_index: dict | None = None, graph: dict | None 
     its own) -- indistinguishable from a genuine NEW event by name alone.
     Classification is by `fields.message` instead (a NEW/CLOSE line's own
     `message` is always exactly "new"/"close", a fixed tracing_subscriber
-    marker -- see the JSON schema in src/codemap/schema/): CLOSE first
+    marker -- see the JSON schema in schema/): CLOSE first
     (`"time.busy" in fields`, unchanged), then `message == "new"`, then
     anything else is an EVENT. Getting this wrong is not cosmetic: before
     this fix, a bare event fell into the same branch as a genuine NEW,

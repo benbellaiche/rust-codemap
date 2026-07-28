@@ -13,38 +13,68 @@ mapping") is the main design principle running through the codebase — see
 "Design constraints" below before adding anything that special-cases a
 target project.
 
-Read [README.md](README.md) for the user-facing workflow and the current
-tracing log format. Read [PROJECT.md](doc/PROJECT.md) for design history: what's
-already settled, what's still an open decision, and known limitations —
-check it before re-deciding something that was already discussed, and
-update it (not just this file) when a real decision is made.
+Read [README.md](README.md) for the user-facing workflow and links to the
+rest of `doc/` (command reference, tracing log format, viewer guide,
+architecture, known limitations).
+
+**Rust (`src/*.rs`, `Cargo.toml` at the repo root) is the primary,
+actively-developed implementation, invoked as `cargo codemap` once
+installed (`cargo install --path .`).** It originated as a faithful port of
+a Python original, kept for reference only under
+[archive/codemap-python/](archive/codemap-python/) (not actively developed —
+see its own `codemap/__main__.py` docstring). `schema/` and `viewer/` at the
+repo root are shared by both, not duplicated.
 
 ## Commands
 
-Run from the repo root, with `src` on `PYTHONPATH` (`export
-PYTHONPATH=src` once per shell session -- `codemap` lives under `src/`,
-not importable straight from the repo root; omitted from the commands
-below for readability). `--project <path>` always points at some *other*
-Rust crate on disk (there is no target crate committed to this repo).
+Run from the repo root (`cargo run --` so this works straight from a
+checkout without installing first; once installed via `cargo install
+--path .`, drop `cargo run --` and call `cargo codemap <subcommand>`
+directly). `--project <path>` points at the target Rust crate to analyze (there is no
+target crate committed to this repo) -- defaults to `.`, same as `cargo
+build`, so it's only needed when pointing at a crate other than the
+current directory. Full flag list: [doc/commands.md](doc/commands.md).
+
+Build if graph/doc are missing or stale, then serve -- auto-loads in the
+viewer, no clicks:
 
 ```sh
-python -m codemap run   --project <path>                # graph + doc + serve, one shot -- auto-loads in the viewer, no clicks
-python -m codemap graph --project <path>                 # -> <target_dir>/rust-codemap/<crate>/graph.json
-python -m codemap doc   --project <path>                  # -> <target_dir>/rust-codemap/<crate>/source_index.json
-python -m codemap serve --graph <path> --doc <path> [--docs <path>]  # re-serves already-generated output, re-read on every request
-python -m codemap selfcheck [--project ../dummy-cli]      # MIR-format canary -- see PROJECT.md §4
-python -m codemap validate-trace <trace.jsonl>            # check a trace against src/codemap/schema/trace-*.schema.json
+cargo run -- run --project <path>
 ```
 
-No `trace` subcommand anymore -- removed once "Load trace…" in the viewer
-started accepting a raw log directly (parsed server-side via
-`/__codemap_parse_trace`, which still calls `trace_log.py`) and the other
-subcommands' own manual-load fallback (the old "Load graph…"/"Load doc
-index…" buttons) was removed too, in favor of the `--graph`/`--doc` auto-
-load above -- keeping a fourth, CLI-only, now-redundant path felt
-inconsistent once neither of those applied to it anymore. `serve` with no
-`--graph`/`--doc` now serves an empty shell: there is no other way to get
-a graph/doc index into the viewer.
+Always regenerate `<target_dir>/rust-codemap/<crate>/{graph.json,source_index.json}`:
+
+```sh
+cargo run -- build --project <path>
+```
+
+Check a trace against `schema/trace-*.schema.json`:
+
+```sh
+cargo run -- validate-trace <trace.jsonl>
+```
+
+`graph`/`doc` used to be separate subcommands; merged into one `build`
+since they're never meaningfully used apart -- `doc`'s own cross-referencing
+needs a `graph.json` to resolve method nodes against anyway. `serve` used to
+be its own subcommand (re-serving already-generated output without
+rebuilding); folded into `run`'s own staleness check instead -- `run` now
+IS the "just serve" case whenever the existing output is already fresh, so
+a separate always-just-serve command added nothing a fresh `run` didn't
+already cover. The MIR-format canary (`selfcheck`) moved to a `cargo test`
+(`selfcheck_dummy_cli`, a `#[test]` inside `src/main.rs`'s own `#[cfg(test)]
+mod tests` -- run with a plain `cargo test`) since it's a maintainer
+regression check, not something an end user running `cargo codemap` on
+their own project ever needs -- run it after any change to
+`mir_graph.rs`, and after any Rust toolchain upgrade (rustc's MIR
+pretty-printer output isn't a stable, versioned format -- this canary is
+what catches it silently changing shape).
+
+No `trace` subcommand -- removed (in the original Python) once "Load
+trace…" in the viewer started accepting a raw log directly (parsed
+server-side via `/__codemap_parse_trace`) and the other subcommands' own
+manual-load fallback (the old "Load graph…"/"Load doc index…" buttons) was
+removed too, in favor of `run`'s own fixed-URL auto-load.
 
 No `--bin`/`--lib`: dropped entirely once MIR generation stopped needing
 cargo told which target to build (see "Multi-crate merging" below) — the
@@ -54,54 +84,55 @@ directory, not anything under this repo — see "Design constraints" below.
 `<crate>` is that crate's *actual compiled* name, via `crate_name()` --
 **not** simply the package name with hyphens underscored: a `[lib] name`
 override in Cargo.toml changes it, and assuming otherwise silently drops
-that crate from the graph (real bug, see PROJECT.md §3 bug #6; `crate_name()`
+that crate from the graph -- a real bug found this way; `crate_name()`
 checks the `[lib]` table first, falls back to the package-name derivation
-only if there's no override). This subdirectory is **required** even for a
+only if there's no override. This subdirectory is **required** even for a
 single-crate project: every member of a workspace shares one `target_dir`,
 so without it, two crates in the same workspace would overwrite each
-other's output at the same path (this happened too; see PROJECT.md §2.4
-"Second round"). The viewer never
+other's output at the same path (this happened too). The viewer never
 fetches project-specific files automatically as the primary path; use its
 "Load graph…" / "Load doc index…" / "Load trace…" buttons to pick up
 whatever `graph`/`doc`/`trace` (or `run`) just wrote.
 
-There is no general test suite yet, but `python -m codemap selfcheck` (runs
-`graph` against `../dummy-cli` and asserts a fixed set of structural facts
-about the result -- specific nodes, edges, the `traced` flag, `call_order`
-renumbering, the cross-crate collision fix) and `validate-trace` (checks a
-trace.jsonl against `src/codemap/schema/`) are real, repeatable automated
-checks -- run `selfcheck` after any change to `mir_graph.py`/`__main__.py`'s
-graph-building code, and after any Rust toolchain upgrade (see PROJECT.md
-§4, "MIR as the only extraction source" -- this is the canary that catches
-a future rustc MIR-format change instead of it failing silently). Beyond
-that, to sanity-check a change to `src/codemap/`, run the commands above against:
-- `../dummy-lib/{dummy-core,dummy-ops,dummy-api}` — a sibling repo
-  purpose-built as a multi-crate (library-only) test fixture, see
-  PROJECT.md §2.7 and its own README. Confirm `graph`/`doc` merge all 3
-  crates when pointed at `dummy-api`, but only `{dummy-ops, dummy-core}`
-  when pointed at `dummy-ops` (dummy-api depends on dummy-ops, not the
-  reverse -- it must NOT show up).
-- `../dummy-cli` — a standalone binary depending on `dummy-lib/dummy-api`
-  by path, kept *outside* the dummy-lib workspace on purpose. Pointing at
-  it should resolve to `{dummy-cli, dummy-api, dummy-ops, dummy-core}`;
-  pointing at any `dummy-lib` crate should never pull `dummy-cli` in (it
-  depends on them, they don't depend on it) -- this exact regression
-  happened once already (PROJECT.md §3, bug #4). Also useful for the
-  `[lib] name` case below, since `dummy-cli` itself has no override while
-  everything it depends on does.
-- All three `dummy-lib` crates additionally have a `[lib] name` override
-  in their `Cargo.toml` (different from their package name) -- confirm
-  `graph`/`doc` still find their `.mir`/doc output under the *overridden*
-  name, not a name derived from the package name (PROJECT.md §3, bug #6).
+`cargo test` (runs `selfcheck_dummy_cli` in `src/main.rs`'s own
+`#[cfg(test)] mod tests` -- builds `graph` against `examples/dummy-cli` and
+asserts a fixed set of structural facts about the result: specific nodes,
+edges, the `traced` flag, `call_order` renumbering, the cross-crate
+collision fix) and `validate-trace` (checks a trace.jsonl against
+`schema/`) are real, repeatable automated checks -- run `cargo test` after
+any change to `mir_graph.rs`/`main.rs`'s graph-building code, and after any
+Rust toolchain upgrade (this is the canary that catches a future rustc
+MIR-format change instead of it failing silently). Beyond that, to
+sanity-check a change to `src/`, run the commands above against
+`examples/dummy-cli` (`dummy-core` + `dummy-api` + `dummy-cli`, see its own
+README): confirm `build` merges both `dummy-core`/`dummy-api` when pointed
+at `dummy-cli`, and that pointing at `dummy-core` alone never pulls in
+`dummy-api`/`dummy-cli` (it depends on them, they don't depend on it) --
+this exact regression happened once already.
 
-For execution replay, use a real instrumented binary crate (e.g.
-`../sandbox/tools-codemap` in the outer repo -- but see PROJECT.md §2.7 for
-a caveat about that one's own workspace). Then open the viewer, use the
+There used to be a separate, more exhaustive sibling fixture
+(`dummy-lib`/`dummy-cli`, outside this repo) specifically for a `[lib]
+name`-override regression and a 3-crate dependency chain -- that project
+has since been deleted, and `examples/dummy-cli` doesn't currently have a
+`[lib]` override case of its own; if that regression needs re-verifying,
+add an override to one of `examples/dummy-core`/`dummy-api`'s `Cargo.toml`
+temporarily rather than recreating the old sibling repo.
+
+For execution replay, use any real instrumented binary crate. Then open
+the viewer, use the
 "Load…" buttons, and check the graph renders and Play/Step works. Note
 execution replay is only meaningful for a binary target today (see
 "Design constraints").
 
 ## Architecture
+
+> Historical note: several sections below cite specific node names
+> (`dapi::`/`dcore::`/`dops::`) from the original `dummy-lib`/`dummy-cli`
+> sibling repo, used to confirm the design decisions they describe. That
+> repo has since been deleted (see "Commands" above) -- the reasoning and
+> decisions remain valid, the exact fixture just isn't there to re-run
+> those specific examples against anymore. `examples/dummy-cli` (in this
+> repo) covers similar cases under different node names.
 
 ### Two independent halves
 
@@ -133,9 +164,10 @@ merged into the graph. It is deliberately **not** "every member of the
 workspace the target crate happens to live in" (`cargo metadata --no-deps`)
 — that was the first design, and it was wrong: it swept in unrelated
 sibling crates and, worse, client binaries that depend **on** the target
-crate rather than the other way around (see PROJECT.md §3 bug #4, and
-`dummy-cli` in §2.7, which exists specifically to catch a regression here).
-Instead it calls `cargo metadata` **without** `--no-deps` to get the
+crate rather than the other way around -- a real regression found this
+way (the dependency-direction check in "Commands" above, against
+`examples/dummy-cli`, guards against it recurring). Instead it calls
+`cargo metadata` **without** `--no-deps` to get the
 dependency-resolution graph (`resolve.nodes[].deps`), then walks only the
 *forward* edges from the target's own node, keeping just the `path+file://`
 (local) ones. `cmd_graph` and `cmd_doc` both use this same closure — do not
@@ -153,10 +185,9 @@ actually running" at a glance (`src/codemap/viewer/index.html`'s `#version-badge
 fetches it once on load) -- added after a stale server process (a zombie
 from hours earlier, still bound to the same port) answered requests with
 old `trace_log.py` for a long debugging session despite every other signal
-suggesting a fresh restart (see PROJECT.md §2.12's third follow-up).
-Deliberately mtime-based, not a hand-maintained version string -- there's
-no step to remember, so it can't itself drift out of sync with what's
-actually on disk.
+suggesting a fresh restart. Deliberately mtime-based, not a hand-maintained
+version string -- there's no step to remember, so it can't itself drift
+out of sync with what's actually on disk.
 
 ### `src/codemap/mir_graph.py` — how the call-graph is actually extracted
 
@@ -172,7 +203,7 @@ blob** (`parse_mir(text, crate_name, known_crates, ...)`, one call per
 crate; `merge_crates(...)` combines the results). This changed specifically
 to fix a real bug: two different crates defining the same free function or
 `Type::method` pair used to silently collide into one graph node once
-merged (PROJECT.md §4, "cross-crate node-id collision"). Every node id is
+merged ("cross-crate node-id collision"). Every node id is
 now qualified with the crate that actually defines it
 (`dcore::Item::describe`, `dapi::Item::describe` -- two distinct nodes,
 where there used to be one). A call site's *target* can't always be
@@ -186,7 +217,7 @@ resolved within its own crate's parse, though (see the next bullet) --
   crate's name) -- but MIR is *inconsistent* about whether it prints a
   local free function's own module path or not (`basics::add` right next
   to bare `compute`, both `pub fn` in their own submodule -- confirmed via
-  the dummy-lib fixture, PROJECT.md §2.7), **and this inconsistency turns
+  the dummy-lib fixture), **and this inconsistency turns
   out to extend across crate boundaries too, not just within one crate**:
   confirmed on the same fixture, a call from `dummy-api` into
   `dummy-ops::combiner::double` prints as bare `double(...)` (no crate
@@ -292,7 +323,7 @@ Discovers doc pages purely by filename pattern
 `target/doc/<crate>/`, keyed by `(crate name, item name)` — no manual
 name-to-file table. `SOURCE_LINK_RE` matches `.../src/<any-crate-name>/...`
 generically; don't hardcode a crate name into this regex again (it was
-found and fixed once already — see PROJECT.md §7). The final index is
+found and fixed once already). The final index is
 keyed by crate-qualified id (`crate::Name`, `crate::Type::method`) to match
 `mir_graph.py`'s own node ids exactly — required for a free function
 (itself a graph node) and for a method (looked up against the *specific*
@@ -323,8 +354,8 @@ correct from the heuristic alone.
 The core tracing-log parsing logic (dedup by resolved span id, `time.busy`
 duration parsing, iteration counting) is implemented twice: once here in
 Python, once as `parseTraceJsonl()` inside `src/codemap/viewer/index.html`. This
-duplication is known and tracked in PROJECT.md, not an oversight — if you
-fix a bug in one, check whether it also applies to the other. The two are
+duplication is known, not an oversight — if you fix a bug in one, check
+whether it also applies to the other. The two are
 no longer equivalent, though, and won't become so: only `trace_log.py` can
 resolve a span to its true graph node id by real source location
 (file+line, scanned past the `#[instrument]` attribute to the actual item
@@ -350,15 +381,15 @@ exact same *default* `#[instrument]` span name (just the bare fn name, no
 crate qualifier possible in that name at all), so a global cache kept by
 name silently let the second crate's occurrence inherit the first's
 resolution. Confirmed on the dummy-lib/dummy-cli fixture's own
-`make_and_describe`/`describe` collision test (PROJECT.md §2.7/§2.3) before
-being fixed. Any future change to this file should keep resolving from the
+`make_and_describe`/`describe` collision test before being fixed. Any
+future change to this file should keep resolving from the
 live open-span stack, not from `entry["spans"]`'s own text, for the same
 reason.
 
 Line classification is a real three-way split, not two: CLOSE
 (`"time.busy" in fields`), NEW (`fields.message == "new"`), and EVENT
 (anything else — a plain `tracing::event!`/`info!`/... call from inside an
-instrumented function's own body, see PROJECT.md §2.10 and
+instrumented function's own body, see
 `src/codemap/schema/trace-event.schema.json`). An EVENT's own `span` field
 reports its *enclosing* span's identity, not one of its own — before this
 was recognized as a distinct case, an event line fell into the NEW branch
@@ -379,7 +410,7 @@ code.
 
 There isn't just one open-span stack, either — `open_stacks` (plural) is
 keyed by each entry's own optional `threadId` field (`.with_thread_ids
-(true)`, see README.md and PROJECT.md §2.11), one independent stack per
+(true)`, see [doc/tracing-format.md](doc/tracing-format.md)), one independent stack per
 thread; entries with no `threadId` at all share one implicit key, so an
 ordinary single-threaded trace behaves exactly as if there were only one
 stack, same as before this existed. This is a real correctness fix, not
@@ -394,7 +425,7 @@ visibly got stuck showing the wrong edge as "active"). This does NOT
 reconstruct a real, trace-recorded parent link -- `tracing` does not
 propagate span context across `thread::spawn` on its own (confirmed
 empirically). What it does get, via `implicit_parent` (formerly
-`implicit_root_parent`, main-only -- see §2.8/§2.11): a concurrent span
+`implicit_root_parent`, main-only): a concurrent span
 with no ancestor on its own thread is attributed to whichever function the
 *static* call graph shows as its one and only possible caller, same
 inference `main`'s own direct children already used, just no longer
@@ -458,7 +489,7 @@ gained an explicit `main` prefix it was silently missing) -- confirmed via
 a full re-check of `parse_trace()`'s output against the entire trace, not
 assumed from the one fixture that surfaced it.
 
-`"enter"`/`"exit"` lines (§2.13, `FmtSpan::ENTER | FmtSpan::EXIT`,
+`"enter"`/`"exit"` lines (`FmtSpan::ENTER | FmtSpan::EXIT`,
 opt-in on the target -- never emitted for a plain `NEW | CLOSE` setup)
 fix a real correctness gap for `async fn`: a sync fn's span enters once
 and never exits until CLOSE, so `own_stack` tracking it purely via
@@ -469,7 +500,7 @@ meanwhile. Without tracking this, that unrelated code wrongly inherits the
 suspended span as its ancestor -- confirmed directly (`tokio::join!` on a
 single-threaded runtime, two independent async fns with different sleep
 durations): the shorter one came back nested under the longer one.
-Tracked via a second, GLOBAL structure (§2.14), `suspended_stack` (name ->
+Tracked via a second, GLOBAL structure, `suspended_stack` (name ->
 stashed `(name, callOrder)`, shared across ALL threads, not per-thread like
 `own_stack`): "exit" pops the span off `own_stack` (if genuinely on top)
 and stashes it; "enter" restores it from the stash *unless* it's already
@@ -511,7 +542,7 @@ needed this -- it calls `stepTo()` synchronously, no delay to race.
 - `stepTo()`'s edge lookup can come up empty even for a span with a real,
   confirmed ancestor -- an untraced function in between means the trace
   correctly attributes the callee to its still-open ancestor, but no
-  direct edge exists in `graph.json` for that pair (see PROJECT.md §2.12,
+  direct edge exists in `graph.json` for that pair (see
   `dapi::gap_demo -> untraced_relay -> gap_leaf` in dummy-lib). Handled by
   `cy.add()`-ing a synthetic edge (`gap-${src}->${tgt}`, `edgeType: 'gap'`)
   right there in the loop -- dashed, its own muted-grey color (never one of
@@ -534,7 +565,7 @@ needed this -- it calls `stepTo()` synchronously, no delay to race.
   away) stays hidden; this reveals genuine first-degree relationships, not
   a wider "show everything nearby."
 - `expandNeighborhood()` never reads a neighbor's "original" position via
-  live `.position()` -- always via `homePositions` (§2.15), a separately-
+  live `.position()` -- always via `homePositions`, a separately-
   tracked map updated only after `layoutComponents()`/a manual drag.
   Confirmed as a real, 100%-reproducible bug otherwise: Cytoscape fires
   `tap`, `tap`, THEN `dbltap` for a real double-click (not `dbltap` alone),
@@ -565,7 +596,7 @@ needed this -- it calls `stepTo()` synchronously, no delay to race.
   adding new visual states. The legend itself lives in `#legend-panel`, a
   toolbar-triggered popover (`#btn-legend`, same `position: fixed` +
   `.open`-class toggle `#log-panel` already uses) — not a permanent
-  sidebar block anymore (PROJECT.md §2.10), freeing that space for
+  sidebar block anymore, freeing that space for
   Execution Trace + the newer `#exec-context` panel below it.
 - `#info` (left sidebar) is purely static now — doc link, signature,
   source link, doc comment, via `docEntryHtml()`/`buildInfoHtml()`,
@@ -574,7 +605,7 @@ needed this -- it calls `stepTo()` synchronously, no delay to race.
   internal-state-capture mechanisms below) renders in `#exec-context`
   (right sidebar) instead, via `buildExecContextHtml()` — the left/right
   sidebar split is deliberately "static info" vs. "execution info," not
-  an arbitrary layout choice (PROJECT.md §2.10). A trace entry's
+  an arbitrary layout choice. A trace entry's
   `recordedFields` (one snapshot per invocation, from that invocation's
   own CLOSE — see trace_log.py above) and `events` (a list of
   `{message, fields}`, one per `tracing::event!`/`info!`/... call, across
@@ -603,8 +634,7 @@ needed this -- it calls `stepTo()` synchronously, no delay to race.
   conditional (falls back to Cytoscape's own auto-detected zero-indegree
   roots if `mainNodeId()` finds nothing); `finishTraceToRoot()` is not —
   replay on a library-derived graph remains unexplored territory, and is
-  an accepted, permanent limitation now, not a gap to eventually close
-  (PROJECT.md §4).
+  an accepted, permanent limitation now, not a gap to eventually close.
 - Type names inside a rendered signature are linkified (`linkifySignature`)
   only when that exact identifier is a key in `source_index.json` — never
   from a hardcoded list of "known types."
@@ -613,7 +643,7 @@ needed this -- it calls `stepTo()` synchronously, no delay to race.
 
 - **No target-project mapping, anywhere.** If you're tempted to add a list
   of module names, type names, or file paths specific to some target crate,
-  stop — that has been actively removed twice already (see PROJECT.md §7).
+  stop — that has been actively removed twice already.
   Prefer a structural signal derived from what rustc/cargo actually emit.
   A single, explicit, meaningful CLI parameter (like `--project`) is fine;
   a hidden internal list that has to be kept in sync is not.
@@ -623,8 +653,7 @@ needed this -- it calls `stepTo()` synchronously, no delay to race.
   inside that outer repo's layout.
 - Several things are intentionally *not yet* built (a dedicated
   call-stack/timing frame beyond the sidebar list; real rustdoc-style
-  navigation instead of scraped signature/doc snippets) — these are open
-  decisions in PROJECT.md §4, not gaps to silently fill in. Cross-crate
-  node-id collision and MIR-as-the-extraction-source, previously listed
-  here too, are now settled — see this file's `mir_graph.py`/`selfcheck`
-  sections above and PROJECT.md §4.
+  navigation instead of scraped signature/doc snippets) — deliberate open
+  decisions, not gaps to silently fill in. Cross-crate node-id collision
+  and MIR-as-the-extraction-source, previously listed here too, are now
+  settled — see this file's `mir_graph.py`/`cargo test` sections above.
