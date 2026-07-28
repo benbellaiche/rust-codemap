@@ -35,6 +35,14 @@ target crate committed to this repo) -- defaults to `.`, same as `cargo
 build`, so it's only needed when pointing at a crate other than the
 current directory. Full flag list: [doc/commands.md](doc/commands.md).
 
+**When testing a fix, use `cargo run --` or the freshly-built
+`target/debug/cargo-codemap.exe` -- never `cargo codemap` itself unless
+you just re-ran `cargo install --path .`.** The installed copy is a frozen
+snapshot; a real, previously-hit confusion was concluding a fix didn't
+work because it was actually tested through the stale installed binary,
+not the just-rebuilt one. If you change `src/` and the user is testing via
+`cargo codemap`, tell them to reinstall before reporting the fix as ready.
+
 Build if graph/doc are missing or stale, then serve -- auto-loads in the
 viewer, no clicks:
 

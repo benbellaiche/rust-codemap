@@ -13,6 +13,7 @@
 use std::env;
 use std::fs;
 use std::fs::File;
+use std::path::Path;
 
 const TEST_NAMES: &[&str] = &[
     "simple_graph",
@@ -49,9 +50,14 @@ fn main() {
         std::process::exit(1);
     }
 
-    let log_dir = "target/traces";
-    fs::create_dir_all(log_dir).expect("failed to create target/traces");
-    let log_path = format!("{log_dir}/trace_{test_name}.jsonl");
+    // CARGO_MANIFEST_DIR-relative, not cwd-relative -- since `examples/` is
+    // now a cargo workspace (see doc/commands.md), CWD depends on how this
+    // was invoked (`cd` into this crate vs. `cargo run -p dummy-cli` from
+    // the workspace root), and a plain "target/traces" would silently land
+    // in the wrong place (the shared workspace target/) in the latter case.
+    let log_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("traces");
+    fs::create_dir_all(&log_dir).expect("failed to create target/traces");
+    let log_path = log_dir.join(format!("trace_{test_name}.jsonl"));
     let file = File::create(&log_path).expect("failed to create log file");
     tracing_subscriber::fmt()
         .json()
@@ -90,5 +96,5 @@ fn main() {
     };
 
     println!("test={test_name} result={result}");
-    println!("log written to {log_path}");
+    println!("log written to {}", log_path.display());
 }

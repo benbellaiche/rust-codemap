@@ -34,6 +34,13 @@ cargo install --path .
 Puts `cargo-codemap` on your `PATH` via `~/.cargo/bin` (already there from
 a normal rustup setup).
 
+**If you're developing `cargo-codemap` itself** (not just using it): this
+installed copy is a frozen snapshot, not kept in sync with your checkout.
+`cargo codemap ...` keeps running the old build until you `cargo install
+--path .` again — after any change to `src/`, re-run the install command
+above before testing via `cargo codemap`, or use `cargo run -- <subcommand>`
+instead, which always reflects the current checkout.
+
 ### 2. Run
 
 From inside the target crate (`--project` defaults to `.`, same as

@@ -56,17 +56,20 @@ fn norm_path(p: &str) -> String {
     }
 }
 
-/// (normalized absolute file path, line) -> node id, from source_index.json's
-/// own per-node `absPath`/`line`.
-fn build_line_index(source_index: &Value) -> HashMap<(String, u64), String> {
-    let mut index = HashMap::new();
+/// (normalized absolute file path, line, node id) triples, from
+/// source_index.json's own per-node `absPath`/`line`. A `Vec`, not a
+/// `HashMap` keyed by (path, line): a trace's own `filename` isn't always
+/// already absolute (see `resolve_id`'s suffix-match fallback below), so
+/// exact-key lookup alone isn't enough.
+fn build_line_index(source_index: &Value) -> Vec<(String, u64, String)> {
+    let mut index = Vec::new();
     let Some(obj) = source_index.as_object() else { return index };
     for (node_id, entry) in obj {
         let abs_path = entry.get("absPath").and_then(Value::as_str);
         let line = entry.get("line").and_then(Value::as_u64);
         if let (Some(abs_path), Some(line)) = (abs_path, line) {
             if !abs_path.is_empty() && line > 0 {
-                index.insert((norm_path(abs_path), line), node_id.clone());
+                index.push((norm_path(abs_path), line, node_id.clone()));
             }
         }
     }
@@ -220,12 +223,34 @@ pub fn parse_trace(text: &str, source_index: Option<&Value>, graph: Option<&Valu
         if filename.is_empty() || attr_line == 0 {
             return None;
         }
-        let key = (norm_path(filename), attr_line);
+        let norm_filename = norm_path(filename);
+        // The trace's own `filename` (rustc's `file!()`, embedded by
+        // `#[instrument]`) is usually already absolute -- but it's relative
+        // to the *compilation root* in general, which is the workspace
+        // root once the target crate is a cargo workspace member, not
+        // necessarily that crate's own directory. A relative filename
+        // therefore won't match source_index.json's absPath directly;
+        // resolve it to the real absolute path via a suffix match against
+        // source_index's own entries first (unambiguous in practice: a
+        // multi-segment relative path like "dummy-api/src/lib.rs" is not
+        // going to coincidentally suffix-match some unrelated file).
+        let real_path = if line_index.iter().any(|(p, _, _)| *p == norm_filename) {
+            norm_filename
+        } else {
+            match line_index.iter().find(|(p, _, _)| p.ends_with(&norm_filename)) {
+                Some((p, _, _)) => p.clone(),
+                None => norm_filename,
+            }
+        };
+        let key = (real_path, attr_line);
         let resolved_line = *scan_cache
             .entry(key.clone())
-            .or_insert_with(|| scan_forward_to_code_line(filename, attr_line));
+            .or_insert_with(|| scan_forward_to_code_line(&key.0, attr_line));
         let resolved_line = resolved_line?;
-        line_index.get(&(key.0, resolved_line)).cloned()
+        line_index
+            .iter()
+            .find(|(p, l, _)| *p == key.0 && *l == resolved_line)
+            .map(|(_, _, id)| id.clone())
     };
 
     // Only lines with a real, non-empty span.name matter -- anything else

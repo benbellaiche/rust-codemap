@@ -78,14 +78,27 @@ fn read_package_name(manifest: &Path) -> String {
         eprintln!("ERROR: could not parse {}: {e}", manifest.display());
         std::process::exit(1);
     });
-    doc.get("package")
-        .and_then(|p| p.get("name"))
-        .and_then(toml::Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            eprintln!("ERROR: could not find [package] name = \"...\" in {}", manifest.display());
-            std::process::exit(1);
-        })
+    if let Some(name) = doc.get("package").and_then(|p| p.get("name")).and_then(toml::Value::as_str) {
+        return name.to_string();
+    }
+    // A virtual workspace manifest (`[workspace]`, no `[package]`) has no
+    // single crate of its own -- `--project` needs to point at one of its
+    // members specifically, not the workspace root.
+    if let Some(workspace) = doc.get("workspace") {
+        eprintln!(
+            "ERROR: {} is a workspace root, not a single crate -- point --project at one of its members instead:",
+            manifest.display()
+        );
+        let members = workspace.get("members").and_then(toml::Value::as_array);
+        if let Some(members) = members {
+            for m in members.iter().filter_map(toml::Value::as_str) {
+                eprintln!("  --project {}", manifest.parent().unwrap_or(Path::new(".")).join(m).display());
+            }
+        }
+        std::process::exit(1);
+    }
+    eprintln!("ERROR: could not find [package] name = \"...\" in {}", manifest.display());
+    std::process::exit(1)
 }
 
 /// The actual compiled crate name: `[lib] name` if the manifest overrides
