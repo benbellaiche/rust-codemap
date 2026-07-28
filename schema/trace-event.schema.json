@@ -1,8 +1,8 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/rust-codemap/trace-event.schema.json",
-  "title": "rust-codemap trace event line",
-  "description": "One JSON-Lines record for a plain tracing::event!/info!/warn!/... call made from directly inside an instrumented function's own body -- NOT a span lifecycle event (see trace-entry.schema.json/trace-close.schema.json for those). Optional: only appears at all if the target code actually calls event!/info!/etc. from inside a #[instrument]'d function; the mandated main() snippet doesn't need to change to produce these, tracing_subscriber already emits them under the exact same JSON formatter. See trace_log.py's own module docstring for how this is told apart from an entry/close line (by `fields.message`, never by `span.name` -- an event's own `span` reports its ENCLOSING span's identity, not one of its own, so it's indistinguishable from a genuine NEW by name alone). See trace-entry.schema.json's own description for why there is no 'formatVersion' field.",
+  "$id": "https://github.com/cargo-codemap/trace-event.schema.json",
+  "title": "cargo-codemap trace event line",
+  "description": "One JSON-Lines record for a plain tracing::event!/info!/warn!/... call made from directly inside an instrumented function's own body -- NOT a span lifecycle event (see trace-entry.schema.json/trace-close.schema.json for those). Optional: only appears at all if the target code actually calls event!/info!/etc. from inside a #[instrument]'d function; the mandated main() snippet doesn't need to change to produce these, tracing_subscriber already emits them under the exact same JSON formatter. See trace_log.rs's own module docstring for how this is told apart from an entry/close line (by `fields.message`, never by `span.name` -- an event's own `span` reports its ENCLOSING span's identity, not one of its own, so it's indistinguishable from a genuine NEW by name alone). See trace-entry.schema.json's own description for why there is no 'formatVersion' field.",
   "type": "object",
   "additionalProperties": false,
   "required": ["timestamp", "level", "fields", "target", "filename", "line_number", "span", "spans"],
@@ -28,7 +28,7 @@
     },
     "span": {
       "type": "object",
-      "description": "The ENCLOSING span's own identity and current fields at the moment this event fired -- NOT a new span identity of the event's own (an event isn't a span at all). trace_log.py attaches this event to whichever span is currently innermost on its own internally-tracked open-span stack, not by reading this object's `name` (which, being the enclosing span's, would be ambiguous the exact same way two crates' identically-named default-instrumented spans already are elsewhere in this format).",
+      "description": "The ENCLOSING span's own identity and current fields at the moment this event fired -- NOT a new span identity of the event's own (an event isn't a span at all). trace_log.rs attaches this event to whichever span is currently innermost on its own internally-tracked open-span stack, not by reading this object's `name` (which, being the enclosing span's, would be ambiguous the exact same way two crates' identically-named default-instrumented spans already are elsewhere in this format).",
       "required": ["name"],
       "properties": {
         "name": { "type": "string" }
@@ -36,7 +36,7 @@
     },
     "spans": {
       "type": "array",
-      "description": "Unlike an entry/close line's own `spans` (ancestors ONLY, excluding itself), an event's `spans` includes the span it's nested in -- confirmed empirically, not assumed. Not read by trace_log.py for attribution either way (see `span` above).",
+      "description": "Unlike an entry/close line's own `spans` (ancestors ONLY, excluding itself), an event's `spans` includes the span it's nested in -- confirmed empirically, not assumed. Not read by trace_log.rs for attribution either way (see `span` above).",
       "items": {
         "type": "object",
         "required": ["name"],

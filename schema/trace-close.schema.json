@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/rust-codemap/trace-close.schema.json",
-  "title": "rust-codemap trace close event",
+  "$id": "https://github.com/cargo-codemap/trace-close.schema.json",
+  "title": "cargo-codemap trace close event",
   "description": "One JSON-Lines record for a span's own CLOSE event -- structurally identical to trace-entry.schema.json except for `fields` (a fixed \"close\" marker plus the two duration strings tracing_subscriber adds) -- emitted once, when that span exits. See trace-entry.schema.json's own description for why there is no 'formatVersion' field.",
   "type": "object",
   "additionalProperties": false,

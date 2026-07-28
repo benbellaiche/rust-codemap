@@ -42,7 +42,7 @@ viewer, no clicks:
 cargo run -- run --project <path>
 ```
 
-Always regenerate `<target_dir>/rust-codemap/<crate>/{graph.json,source_index.json}`:
+Always regenerate `<target_dir>/cargo-codemap/<crate>/{graph.json,source_index.json}`:
 
 ```sh
 cargo run -- build --project <path>

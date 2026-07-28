@@ -219,12 +219,12 @@ fn local_dependency_closure(manifest: &Path) -> Vec<Value> {
         .collect()
 }
 
-/// <target_directory>/rust-codemap/<crate_name>/ -- nested under the
-/// crate's own name, not just "rust-codemap/", since a workspace's members
+/// <target_directory>/cargo-codemap/<crate_name>/ -- nested under the
+/// crate's own name, not just "cargo-codemap/", since a workspace's members
 /// all share one target_directory.
 fn default_out_dir(manifest: &Path) -> PathBuf {
     let target_dir = PathBuf::from(cargo_metadata(manifest)["target_directory"].as_str().unwrap());
-    target_dir.join("rust-codemap").join(crate_name(manifest))
+    target_dir.join("cargo-codemap").join(crate_name(manifest))
 }
 
 fn write_json(path: &Path, data: &Value) {

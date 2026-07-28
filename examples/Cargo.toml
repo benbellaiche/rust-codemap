@@ -1,0 +1,3 @@
+[workspace]
+members = ["dummy-core", "dummy-api", "dummy-cli"]
+resolver = "2"

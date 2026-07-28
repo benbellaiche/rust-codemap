@@ -1,8 +1,8 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/rust-codemap/trace-entry.schema.json",
-  "title": "rust-codemap trace entry event",
-  "description": "One JSON-Lines record for a span's own NEW event, as produced by the exact tracing_subscriber setup mandated in README.md's \"Tracing log format\" -- one such record per span, emitted the moment that span is entered. There is no 'formatVersion' field by design (see PROJECT.md §4, \"Trace-format schema\"): this schema file IS the version -- a real format change edits this file, trace-close.schema.json, both parsers (trace_log.py and the viewer's parseTraceJsonl fallback), and the README snippet together, in one commit.",
+  "$id": "https://github.com/cargo-codemap/trace-entry.schema.json",
+  "title": "cargo-codemap trace entry event",
+  "description": "One JSON-Lines record for a span's own NEW event, as produced by the exact tracing_subscriber setup mandated in doc/tracing-format.md. There is no 'formatVersion' field by design: this schema file IS the version -- a real format change edits this file, trace-close.schema.json, both parsers (trace_log.rs and the viewer's parseTraceJsonl fallback), and the doc snippet together, in one commit.",
   "type": "object",
   "additionalProperties": false,
   "required": ["timestamp", "level", "fields", "target", "filename", "line_number", "span", "spans"],
@@ -26,11 +26,11 @@
     },
     "target": {
       "type": "string",
-      "description": "The Rust module path tracing_subscriber attributes this event to (e.g. \"dcore::basics\"). Not read by trace_log.py -- span-to-node resolution uses `filename`/`line_number` instead (see README.md's \"How a span is matched to a graph node\"), specifically because a module path alone can't disambiguate two crates sharing a module name the way a real file path can."
+      "description": "The Rust module path tracing_subscriber attributes this event to (e.g. \"dcore::basics\"). Not read by trace_log.rs -- span-to-node resolution uses `filename`/`line_number` instead (see doc/tracing-format.md's \"How a span is matched to a graph node\"), specifically because a module path alone can't disambiguate two crates sharing a module name the way a real file path can."
     },
     "filename": {
       "type": "string",
-      "description": "Absolute path to the source file containing the #[instrument] attribute that produced this span. Required, not optional: the mandated main() snippet always sets .with_file(true), and file+line resolution (this field, plus line_number below) is the ONLY way trace_log.py can tell two crates' identically-named default-instrumented spans apart -- see PROJECT.md's cross-crate node-id collision entry in §2.3/§4."
+      "description": "Absolute path to the source file containing the #[instrument] attribute that produced this span. Required, not optional: the mandated main() snippet always sets .with_file(true), and file+line resolution (this field, plus line_number below) is the ONLY way trace_log.rs can tell two crates' identically-named default-instrumented spans apart -- see doc/architecture.md's cross-crate node-id collision entry."
     },
     "line_number": {
       "type": "integer",

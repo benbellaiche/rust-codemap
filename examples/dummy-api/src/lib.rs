@@ -1,4 +1,4 @@
-//! Simplified example fixture for rust-codemap -- one entry point per test
+//! Simplified example fixture for cargo-codemap -- one entry point per test
 //! case, each 3/4 calls deep (unless the case itself is specifically about
 //! depth/iteration/recursion), so `examples/dummy-cli` can run any one of
 //! them in isolation and produce a small, easy-to-read trace. Not a
@@ -11,7 +11,7 @@
 use tracing::instrument;
 
 // ── collision: `describe`/`run` exist here AND in dummy-core, same bare
-// names, unrelated logic -- rust-codemap qualifies graph node ids by crate
+// names, unrelated logic -- cargo-codemap qualifies graph node ids by crate
 // (`dummy_api::describe` vs `dummy_core::describe`) specifically so these
 // render as two distinct nodes instead of merging into one.
 //

@@ -1,6 +1,6 @@
 # examples
 
-A small, self-contained target for trying rust-codemap without needing any
+A small, self-contained target for trying cargo-codemap without needing any
 other project on disk: `dummy-core` + `dummy-api` (two crates, so the
 cross-crate collision case has something real to cross) + `dummy-cli`. This
 is now also the fixture the `cargo test` MIR-format canary builds against
@@ -40,7 +40,7 @@ cargo run
 | `recursive`    | Plain self-recursion (factorial-style)                                                   |
 | `async_mono`   | Two async fns genuinely concurrent on a single thread (`tokio::join!`)                   |
 | `async_multi`  | An async task that genuinely migrates across worker threads on a multi-threaded runtime, then calls a child |
-| `collision`    | The same function names (`describe`/`run`) in two different crates -- rust-codemap qualifies node ids by crate so they render as distinct nodes instead of merging |
+| `collision`    | The same function names (`describe`/`run`) in two different crates -- cargo-codemap qualifies node ids by crate so they render as distinct nodes instead of merging |
 
 Try one, e.g. `branch`, from `examples/dummy-cli`:
 
@@ -48,7 +48,7 @@ Try one, e.g. `branch`, from `examples/dummy-cli`:
 cargo run -- branch
 ```
 
-Then from the `rust-codemap` root:
+Then from the `cargo-codemap` root:
 
 ```sh
 cargo codemap run --project examples/dummy-cli

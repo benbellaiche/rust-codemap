@@ -1,4 +1,4 @@
-# rust-codemap
+# cargo-codemap
 
 An interactive call-graph viewer for Rust codebases, with execution replay
 from real `tracing` logs.
@@ -65,8 +65,10 @@ do.
 ## Repository layout
 
 ```
-rust-codemap/
-├── doc/                  # design notes + reference docs (see "Documentation" below)
+cargo-codemap/
+├── .claude/
+│   └── CLAUDE.md         # guidance for Claude Code when working in this repo
+├── doc/                  # reference docs (see "Documentation" below)
 ├── examples/             # a small, self-contained target crate to try the tool against
 │   ├── dummy-core/
 │   ├── dummy-api/
@@ -82,7 +84,6 @@ rust-codemap/
 │   └── index.html
 ├── Cargo.toml
 ├── README.md             # this file
-├── CLAUDE.md
 └── LICENSE
 ```
 

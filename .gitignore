@@ -20,13 +20,10 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Python
-__pycache__/
-*.pyc
-
-# graph/doc/trace default to writing under the *target* crate's own
-# target/rust-codemap/ directory, not here. These rules are just a safety
-# net for the (non-default) case of an explicit `--out viewer/...`.
+# graph.json/source_index.json/trace.json default to writing under the
+# *target* crate's own target/cargo-codemap/ directory, not here -- these
+# rules are just a safety net in case one ever ends up next to index.html
+# anyway (e.g. manual testing).
 viewer/graph.json
 viewer/source_index.json
 viewer/trace.json

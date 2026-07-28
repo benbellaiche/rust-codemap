@@ -72,7 +72,7 @@ cargo codemap validate-trace /path/to/trace.jsonl
 
 ## Output location
 
-Output always lands at `<target crate>/target/rust-codemap/<crate
+Output always lands at `<target crate>/target/cargo-codemap/<crate
 name>/...` (next to cargo's own build output) — there's no flag to
 redirect it. Run any subcommand with `--help` for details:
 
