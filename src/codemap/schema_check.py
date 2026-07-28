@@ -1,5 +1,5 @@
 """schema_check.py -- A small, dependency-free validator for exactly the
-JSON Schema subset actually used by codemap/schema/trace-*.schema.json
+JSON Schema subset actually used by src/codemap/schema/trace-*.schema.json
 (type, required, properties, additionalProperties, const, pattern,
 minimum, items) -- not a general-purpose JSON Schema engine. The schema
 files themselves stay plain, standard JSON Schema (draft-07) so any real

@@ -23,7 +23,7 @@ tool has no other knowledge of, or dependency on, the codebase it's pointed
 at.
 
 This tool is a generalization of a prototype originally built inside a
-sibling project; see [PROJECT.md](PROJECT.md) for the full design history,
+sibling project; see [PROJECT.md](doc/PROJECT.md) for the full design history,
 what's settled, and what's still an open decision.
 
 ## Requirements
@@ -40,19 +40,39 @@ what's settled, and what's still an open decision.
 
 ```
 rust-codemap/
-├── codemap/            # the tool itself — a Python package
-│   ├── __main__.py      # CLI entry point (python -m codemap ...)
-│   ├── mir_graph.py       # MIR text -> call-graph
-│   ├── doc_index.py        # cargo doc HTML -> source_index.json
-│   └── trace_log.py         # tracing JSON-lines -> replayable spans
-├── viewer/              # the browser UI (Cytoscape.js), served as static files
-│   └── index.html
+├── .github/              # CI / assistant config, if any (this repo's own CLAUDE.md stays at
+│                         # the root instead -- that's where Claude Code looks for it)
+├── doc/
+│   └── PROJECT.md        # design notes: current state, open decisions, TODOs
+├── examples/             # a small, self-contained target crate to try the tool against
+│   ├── dummy-core/
+│   ├── dummy-api/
+│   └── dummy-cli/
+├── src/
+│   └── codemap/          # the tool itself -- a Python package (src layout)
+│       ├── __main__.py    # CLI entry point (python -m codemap ...)
+│       ├── mir_graph.py    # MIR text -> call-graph
+│       ├── doc_index.py     # cargo doc HTML -> source_index.json
+│       ├── trace_log.py      # tracing JSON-lines -> replayable spans
+│       ├── schema/             # trace-format JSON Schema (see "Tracing log format")
+│       └── viewer/               # the browser UI (Cytoscape.js), served as static files
+│           └── index.html
 ├── requirements.txt
-├── README.md            # this file
-└── PROJECT.md           # design notes: current state, open decisions, TODOs
+├── README.md             # this file
+├── CLAUDE.md
+└── LICENSE
 ```
 
-Nothing here refers to any specific target project. `viewer/` contains
+`src` layout, standard practice for a Python package: `codemap` isn't
+importable straight from the repo root anymore, so either run with
+`src` on the path (`PYTHONPATH=src python -m codemap ...`, used
+throughout the rest of this README) or `cd src` first. `schema/`/`viewer/`
+live *inside* the package rather than next to it, since both are read at
+runtime relative to the package's own file location
+(`Path(__file__).parent / "..."`), not the current working directory --
+they travel with the package wherever it's imported from.
+
+Nothing here refers to any specific target project. `src/codemap/viewer/` contains
 **only** the tool's own static UI (`index.html`) — the HTTP server never
 serves anything project-specific by default, and nothing generated is
 ever written into this repo. `graph`/`doc`/`trace` write their output
@@ -71,11 +91,18 @@ the next (see "Replaying a real execution").
 
 ## Quick start
 
-The fastest way to get going, run from this repo's root:
+The fastest way to get going, run from this repo's root with `src` on your
+`PYTHONPATH` (`export PYTHONPATH=src`, once per shell session -- omitted
+from every command below for readability; `cd src` first works just as
+well instead):
 
 ```sh
 python -m codemap run --project /path/to/target-crate
 ```
+
+No target crate handy? `examples/` has a small self-contained one built
+for exactly this (see [examples/README.md](examples/README.md)):
+`python -m codemap run --project examples/dummy-cli --include-private`.
 
 This compiles the target crate (and every local crate it actually depends
 on — see [Multi-crate merging](#multi-crate-merging)), extracts the
@@ -352,7 +379,7 @@ list) shows both automatically once a trace has them:
   the way, not just the final one.
 
 Both are entirely optional and additive: a trace with none of this still
-parses exactly as it always has. See `codemap/schema/trace-event.schema.json`
+parses exactly as it always has. See `src/codemap/schema/trace-event.schema.json`
 for the third line shape a plain event produces (distinct from entry/close
 — told apart by `fields.message`, since an event's own `span` field
 reports its *enclosing* span's identity, never one of its own).
@@ -567,16 +594,16 @@ python -m codemap validate-trace <trace.jsonl>
 private" toggle (hidden entirely if you didn't pass this) has something to
 show. Off by default: rendering pages for every private item is a real
 cost that scales with how many exist, on top of the type-checking `cargo
-doc` already does either way — see [PROJECT.md](PROJECT.md) §2.9.
+doc` already does either way — see [PROJECT.md](doc/PROJECT.md) §2.9.
 
 `selfcheck` and `validate-trace` are this tool's own internal checks, not
 something you run against your own project: `selfcheck` builds the graph
 for a known fixture (default `../dummy-cli`, this repo's own test fixture)
 and asserts a fixed set of facts about it, specifically to catch a future
 Rust toolchain upgrade silently changing MIR's text format (see
-[PROJECT.md](PROJECT.md) §4, "MIR as the only extraction source");
+[PROJECT.md](doc/PROJECT.md) §4, "MIR as the only extraction source");
 `validate-trace` checks any trace.jsonl against the schema in
-`codemap/schema/` — genuinely useful on your own trace too, to confirm it
+`src/codemap/schema/` — genuinely useful on your own trace too, to confirm it
 actually matches the mandated format above.
 
 `--out`/`--graph` (on `graph`/`doc`) default to `<target crate>/target/rust-codemap/<crate name>/...` — see
@@ -621,14 +648,14 @@ if two different crates in the closure define the same free function name
 or the same `Type::method` pair, they still render as two distinct graph
 nodes, not one collapsed together. Resolving a call site's actual target
 crate isn't always as simple as reading an explicit qualifier off the MIR
-text, though — see [PROJECT.md](PROJECT.md) §2.8 for how cross-crate calls
+text, though — see [PROJECT.md](doc/PROJECT.md) §2.8 for how cross-crate calls
 get resolved (and the one case, a third crate calling a method name shared
 by two *other* crates with no qualifier of its own, that MIR text alone
 genuinely can't disambiguate).
 
 ## How the call-graph is built
 
-`codemap/mir_graph.py` parses MIR text (produced via `cargo build` with
+`src/codemap/mir_graph.py` parses MIR text (produced via `cargo build` with
 `RUSTFLAGS=--emit=mir`, see above) with regular expressions — no AST, no
 type-checker, no external tool beyond `rustc` itself. It handles a few
 cases a naive "grep for calls" would miss:
@@ -660,7 +687,7 @@ cases a naive "grep for calls" would miss:
 
 ## Known limitations
 
-See [PROJECT.md](PROJECT.md) for the full list and the reasoning behind
+See [PROJECT.md](doc/PROJECT.md) for the full list and the reasoning behind
 each. In short, today:
 
 - Regex-based MIR parsing has been exercised against generics/

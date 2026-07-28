@@ -145,7 +145,7 @@ A generic, project-agnostic tool that, for **any Rust codebase**:
   `graph.json`'s edges the way `trace_log.py` does), behavior is unchanged
   from before this feature existed.
 
-  `viewer/index.html`'s `stepTo()` was updated to match: when coloring the
+  `src/codemap/viewer/index.html`'s `stepTo()` was updated to match: when coloring the
   hop into a span's own immediate call, if that span carries a `callOrder`
   and more than one parallel edge exists between the same two nodes, it
   narrows down to the one edge whose own `callOrder` matches, instead of
@@ -173,7 +173,7 @@ A generic, project-agnostic tool that, for **any Rust codebase**:
   already caught once before in this project, §2.5's dimmed-edge-color
   entry).
 
-### 2.4 CLI (`codemap/` package, run as `python -m codemap <subcommand>`)
+### 2.4 CLI (`src/codemap/` package, run as `python -m codemap <subcommand>`)
 
 A single entry point with subcommands (`run`, `graph`, `doc`, `serve`)
 replacing what used to be several independently-invoked scripts plus
@@ -192,8 +192,8 @@ path in felt inconsistent. `trace_log.py` itself stays -- the server
 endpoint still calls it directly; only the standalone `cmd_trace` CLI
 wrapper and its argparse subparser are gone.
 
-Laid out as a proper Python package (`codemap/__main__.py`, `mir_graph.py`,
-`doc_index.py`, `trace_log.py` all under `codemap/`) rather than loose
+Laid out as a proper Python package (`src/codemap/__main__.py`, `mir_graph.py`,
+`doc_index.py`, `trace_log.py` all under `src/codemap/`) rather than loose
 scripts at the repo root — `python -m codemap` picks up the package without
 any `sys.path` hacking. `requirements.txt` is present but currently empty:
 the tool has zero third-party Python dependencies today.
@@ -204,14 +204,14 @@ directory cargo itself already uses for build output and `cargo doc`, and
 already gitignored by any normal Rust project. Nothing is ever written into
 this repo. `run` composes `graph` + `doc` + `serve` in one call and prints
 the exact paths it wrote. This replaced an earlier version where these
-commands defaulted to writing into `viewer/` inside *this* repo — wrong on
+commands defaulted to writing into `src/codemap/viewer/` inside *this* repo — wrong on
 two counts: it mixed generated per-target data with the tool's own checked-
 in source, and re-running against a second target project would silently
 overwrite the first's output. See §2.5 for the other half of that fix (how
 the viewer picks this data up without the server needing to know where it
 is).
 
-**Second round**: even after moving out of `viewer/`, all members of one
+**Second round**: even after moving out of `src/codemap/viewer/`, all members of one
 *workspace* still share the exact same `target_directory` — so
 `dummy-core`, `dummy-ops`, `dummy-api` (see §2.7) were each overwriting the
 previous one's `graph.json` at the same path. Fixed by nesting one level
@@ -263,7 +263,7 @@ functions in a different crate resolved against the wrong file entirely).
 src_root)` to a list of them, one pair per crate in the closure, precisely
 so each crate's items resolve against that crate's own `src/`.
 
-### 2.5 Viewer (`viewer/index.html`, Cytoscape.js)
+### 2.5 Viewer (`src/codemap/viewer/index.html`, Cytoscape.js)
 
 - **Central frame**: the call-graph itself (breadthfirst layout, re-layout
   button), node color by type (fn/method), edge color by type.
@@ -290,7 +290,7 @@ so each crate's items resolve against that crate's own `src/`.
   resolves, for the one case (`codemap run`) it's meant to.
   **The "Load graph…"/"Load doc index…" toolbar buttons and file pickers
   are gone entirely** (removed once the auto-load above existed and made
-  them redundant for the one case they mattered for) -- `viewer/` no
+  them redundant for the one case they mattered for) -- `src/codemap/viewer/` no
   longer has ANY client-side way to load a graph/doc index other than
   these two fixed-URL fetches. Calling `serve` standalone now genuinely
   needs `--graph`/`--doc` to show anything at all; without them it 404s on
@@ -1278,7 +1278,7 @@ id-collision fix) still passed, exactly matching what should and shouldn't
 be affected by that specific break.
 
 **Trace-format schema.** Written as two JSON Schema (draft-07) documents,
-`codemap/schema/trace-entry.schema.json` and `trace-close.schema.json` --
+`src/codemap/schema/trace-entry.schema.json` and `trace-close.schema.json` --
 separate files rather than one schema with "required unless it's a close
 event" conditionals, since the two event shapes really are structurally
 different (`fields` is a fixed `{"message": "new"}` on one, a `{"message":
@@ -1292,7 +1292,7 @@ already written there): this isn't a wire protocol with independently-
 evolving producers/consumers, it's one parser pair maintained in this same
 repo, so a real format change edits the schema, both parsers, and the
 README snippet together, in one commit -- the schema file itself, not a
-version number inside it, is what marks a real change. `codemap/
+version number inside it, is what marks a real change. `src/codemap/
 schema_check.py` is a small, dependency-free validator for exactly the
 subset of JSON Schema these two files use (type/required/properties/
 additionalProperties/const/pattern/minimum/items) -- the schema files
@@ -1939,7 +1939,7 @@ process (a zombie from hours earlier, still bound to the same port,
 silently answering requests with old code while every other signal --
 terminal banners, apparently-fresh restarts -- suggested otherwise; see
 §2.11's fourth follow-up). Added a `GET /__codemap_version` endpoint
-(`LoggingHandler.do_GET`, `codemap/__main__.py`) returning the *actual, on-
+(`LoggingHandler.do_GET`, `src/codemap/__main__.py`) returning the *actual, on-
 disk* last-modified time of `index.html`, `trace_log.py`, and
 `__main__.py` itself, plus the server process's own PID -- computed fresh
 on every request (`Path(...).stat().st_mtime`), never cached, never a
@@ -2185,6 +2185,127 @@ double-click-an-already-expanded-node-again sequence that first surfaced
 the bug) -- all clean (zero drift) after the fix, all reproduced the drift
 before it. Full existing regression suite re-run clean throughout.
 
+### 2.16 `examples/`: a small, self-contained target crate
+
+`dummy-lib`/`dummy-cli` (§2.7) is the exhaustive regression fixture --
+cross-crate merging, `[lib] name` overrides, private/public toggling, and
+every correctness fix this project has needed a real repro for. That makes
+it a poor first thing to point someone at: too much going on at once, and
+it lives *outside* this repo, so trying the tool at all meant having that
+sibling checked out too. `examples/dummy-core` + `examples/dummy-api` +
+`examples/dummy-cli` is a separate, deliberately simplified set *inside*
+this repo instead -- `dummy-lib`/`dummy-cli` themselves are untouched,
+still doing their own job. Two crates, not one, specifically so a real
+cross-crate same-name case (`collision`, below) has something genuine to
+cross -- one crate alone can't demonstrate that at all.
+
+One small function chain per test case in `dummy-api` (3-4 calls deep,
+except where the case is specifically about depth/looping/recursion), and
+`dummy-cli` runs exactly one case per invocation (picked by name on the
+command line), writing its own `target/traces/trace_<name>.jsonl` --
+deliberately under `target/`, not committed alongside the source (plain
+generated output, regenerate any time with `cargo run`), and not one
+combined trace the way `dummy-cli` mixes all of its fixtures into a single
+run. Ten cases: `simple_graph`, `gap`, `branch` (if/else, both edges real
+in the static graph, one path per run -- captures which branch via
+`record()`), `dispatch` (three `Shape` implementors -- three static calls,
+each resolving to exactly one, next to one dynamic call site invoked with
+all three, fanning out to all three in the static graph), `workflow` (see
+below), `iterations` (same call site in a loop), `recursive`, `async_mono`
+(single-threaded runtime, §2.13), `async_multi` (multi-threaded runtime,
+§2.14), and `collision` (the same `describe`/`run` names in both
+`dummy-api` and `dummy-core`, correctly rendered as four distinct nodes).
+
+**`workflow` replaced an original `deep_chain` case (a plain 10-level
+linear chain, nothing else) by request** -- a purely linear chain doesn't
+look like real code, and the ask was specifically for something that
+would let someone recognize their own codebase's shape in the graph:
+`workflow_entry` pattern-matches on a real enum, `WorkflowKind::Square`/
+`Triangle`/`Other` (a real 3-arm `match` over real matchable variants, not
+an `x % 3` arithmetic stand-in -- generalizing `branch`'s plain if/else to
+more than two outcomes); the "mid" (`Triangle`) arm has its own if/else
+inside it; the "high" (`Other`) arm loops, reusing `iterations`'s
+same-call-site-repeated pattern rather than inventing a second one; every
+arm eventually calls one shared `workflow_finish` -- a real, common shape
+(a shared "finalize" helper) that gives `workflow_finish` four distinct
+real incoming edges in the static graph. `dummy-cli` calls `workflow_entry`
+exactly once (`Square(0)`), same as `branch`'s own single call -- only that
+one arm (the deepest, six levels from `main`) actually runs; `Triangle`/
+`Other` stay real, declared edges in the static graph regardless, not
+guessed or hidden.
+
+**Two real gotchas found while building this, not assumed.**
+1. `dispatch`: a first attempt made the static half *generic* (`fn
+   dispatch_static<S: Shape>(shape: S)`), expecting monomorphization to
+   resolve its own `shape.area()` call to `Square::area` directly. It
+   didn't: even with only one instantiation (one MIR body, printed as
+   plain `dispatch_static`, no `::<Square>` suffix), the call *inside*
+   still read `<S as Shape>::area(...)` -- the generic bound name, not the
+   concrete type -- so `normalize_call` (correctly) couldn't resolve it,
+   same as it correctly doesn't for a genuinely-external generic call.
+   Confirmed by reading the raw MIR directly. Fixed by not using a generic
+   parameter at all -- one small concrete-type function per shape, simpler
+   code and a more honest "static dispatch" than a generic bound that only
+   ever monomorphizes to one type anyway.
+2. `collision`: an early version had `dummy-cli`'s `main` call
+   `dummy_api::run` directly. That produced a real, previously-unexercised
+   fan-out: for this specific call, rustc's MIR dropped the `dummy_api::`
+   qualifier the source actually wrote, leaving a bare `run(...)` -- and
+   since `dummy-core` *also* defines `run`, `merge_crates`' own no-hint
+   fallback (correctly, by design -- 2+ candidates, can't tell which was
+   meant) showed edges to BOTH as possible targets, same over-
+   approximation already used for `&dyn Trait`. Real and correct, but a
+   different lesson than this case is about, and confusing sitting next to
+   it unannounced. Fixed by routing through a uniquely-named
+   `collision_entry` wrapper instead: it only exists in `dummy-api`, so it
+   resolves cleanly even under the same bare-call treatment, and its own
+   call to `run` (from *inside* `dummy-api`) resolves same-crate-first --
+   checked before any other crate specifically so a name existing in both
+   the caller's own crate and elsewhere never has to guess.
+3. **A practical maintenance gotcha, not a tool bug**, found while
+   re-verifying after editing `workflow`: regenerating only the one
+   trace that changed left the OTHER nine stale in a way that broke
+   *their* resolution too, not just looking outdated. `resolve_id()`
+   cross-references each trace line's own recorded `file:line` against
+   `source_index.json`'s line index -- regenerated fresh (accurate for the
+   *current* source), while an old trace's `line_number`s still point at
+   wherever those lines were *before* the edit. Any edit that shifts line
+   counts (adding an enum, a comment block, anything above another
+   function) silently desyncs every other already-generated trace in the
+   same file against the next `codemap doc` run -- confirmed directly:
+   `recursive`'s stale trace resolved to `iterations_square`/
+   `recursive_entry` with a nonsensical stack after an unrelated edit
+   earlier in the file, purely from the line shift. All ten must be
+   regenerated (`cargo run -- <name>` per case) after any edit to
+   `dummy-api/src/lib.rs`, not just the case that motivated the edit.
+
+Verified end to end for all ten cases, not just built and assumed
+correct: every trace validates against the schema (`validate-trace`),
+`parse_trace()` (with `--include-private`'s `source_index.json` -- every
+function here except the entry points is private, so without it every
+name stays unqualified and every `implicit_parent` lookup misses)
+resolves every case's stack/depth/`recordedFields` as designed (including
+`async_multi_migrating` -> `async_multi_child` surviving real cross-thread
+migration, the exact §2.14 regression case, now also covered by this
+fixture too), and all ten load and step through cleanly in a real browser
+with zero console errors.
+
+**A third real gotcha, this time in the viewer's own layout, surfaced by
+just looking at this fixture's rendered graph.** `main`'s 10 direct
+children came out visibly packed into square-ish blocks instead of one
+row, even though dagre's own one-row-per-rank layout is exactly what a
+`TB`-ranked dagre run naturally produces. Confirmed directly (server log):
+dagre's own result measured `w=3083` for this graph's 41-node component --
+just barely over the existing `max(3000, n*40)` width-budget check
+(§2.5's own adaptive-layout history), so it silently fell back to the
+square-block grid meant for genuinely pathological cases, rejecting a
+perfectly reasonable width for no real benefit. Fixed by raising the
+floor, 3000 -> 6000 -- doesn't weaken the large-graph safety net at all
+(driven by the `n * 40` term, which overtakes this floor above ~150 nodes
+regardless), just stops it misfiring on a modest graph with a genuinely
+wide single rank. Verified directly: `main`'s children all land at the
+same Y position now, and the full existing regression suite stayed clean.
+
 ## 3. Points to fix
 
 - ~~Duplicated trace-parsing logic~~ **Fixed.** `trace_log.py` (Python) and
@@ -2380,7 +2501,7 @@ before it. Full existing regression suite re-run clean throughout.
   components (isolated pub fns nothing else calls, tiny call clusters) —
   the more of them, the bigger the combined bounding box, independent of
   how many nodes are actually in each. Fixed by `layoutComponents()`
-  (`viewer/index.html`): split the graph into connected components
+  (`src/codemap/viewer/index.html`): split the graph into connected components
   (`cy.elements().components()`, built into Cytoscape core, no plugin
   needed), run `breadthfirst` independently *within* each component only
   (skipped entirely for isolated size-1 components — nothing to lay out),
@@ -2577,9 +2698,9 @@ before it. Full existing regression suite re-run clean throughout.
     aggregates into one, exactly as before.
 - ~~Trace-format schema — write it as a real, versioned contract.~~
   **Settled and implemented — see §2.8.** Two JSON Schema (draft-07)
-  documents (`codemap/schema/trace-{entry,close}.schema.json`), no
+  documents (`src/codemap/schema/trace-{entry,close}.schema.json`), no
   version field (the schema file itself is the version), checked via
-  `python -m codemap validate-trace` and `codemap/schema_check.py` (a
+  `python -m codemap validate-trace` and `src/codemap/schema_check.py` (a
   small dependency-free validator, not a runtime per-line check inside
   `trace_log.py` itself). Still doesn't resolve the "is a root span
   required" question just above — the schema encodes whatever that
@@ -2660,7 +2781,7 @@ before it. Full existing regression suite re-run clean throughout.
   node id by the crate that defines it (`crate::Type::method`,
   `crate::free_fn`), rather than detect-and-warn: a warning still leaves
   the merged graph *wrong*, just louder about it. `mir_graph.py`,
-  `doc_index.py`, `trace_log.py`, and `viewer/index.html` all updated (see
+  `doc_index.py`, `trace_log.py`, and `src/codemap/viewer/index.html` all updated (see
   §2.8 for exactly what changed in each, including two real bugs the
   migration surfaced and fixed along the way); the Playwright suite's
   ~25 affected files were updated for the new id shape and re-run clean.
@@ -2671,9 +2792,9 @@ before it. Full existing regression suite re-run clean throughout.
 ## 5. Points to implement
 
 - ~~Write down the tracing log format contract as an actual document/
-  schema~~ **Done — see §2.8.** `codemap/schema/trace-{entry,close}.schema.json`,
+  schema~~ **Done — see §2.8.** `src/codemap/schema/trace-{entry,close}.schema.json`,
   no version field, checked via `python -m codemap validate-trace`
-  (`codemap/schema_check.py`, not a per-line runtime check inside
+  (`src/codemap/schema_check.py`, not a per-line runtime check inside
   `trace_log.py`).
 - ~~Build the doc frame~~ **Done** — see §2.5 and §4.
 - ~~Unify the duplicated trace-parsing logic~~ **Done, see §3**: not by

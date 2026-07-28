@@ -1,0 +1,14 @@
+[package]
+name = "dummy-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# dummy-core is a transitive dependency via dummy-api -- not listed
+# directly here since main.rs only ever calls into dummy-api, which itself
+# calls dummy-core internally for the `collision` case (see dummy-api's own
+# docstring on `run`).
+dummy-api = { path = "../dummy-api" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }

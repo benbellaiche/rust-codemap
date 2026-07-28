@@ -959,7 +959,21 @@
                             animate: false, fit: false,
                         }).run();
                         const dBox = comp.boundingBox();
-                        const widthBudget = Math.max(3000, nodesInComp.length * 40);
+                        // Floor raised 3000 -> 6000: a modest graph with a
+                        // genuinely wide single rank (e.g. one root with ~9
+                        // direct children, each with their own sub-chains)
+                        // could measure just barely over the old floor
+                        // (confirmed directly: 41 nodes, dagre's own one-
+                        // row-per-rank result came out w=3083) and silently
+                        // fall back to the square-block grid below --
+                        // visually worse (a modest, perfectly readable width
+                        // rejected for a much more cramped block layout) for
+                        // no real benefit, since this floor only ever
+                        // matters below ~150 nodes anyway (n*40 overtakes it
+                        // above that). Doesn't weaken the actual large-graph
+                        // safety net at all -- that one is driven by the
+                        // `nodesInComp.length * 40` term, unaffected here.
+                        const widthBudget = Math.max(6000, nodesInComp.length * 40);
                         if (dBox.w > widthBudget || dBox.h > widthBudget) {
                             // dagre still puts every node of a rank on one
                             // row, same as plain breadthfirst -- a genuinely

@@ -41,7 +41,7 @@ Subcommands:
           extraction source").
   validate-trace
           Checks a real trace.jsonl, line by line, against
-          codemap/schema/trace-{entry,close}.schema.json -- the written-
+          src/codemap/schema/trace-{entry,close}.schema.json -- the written-
           down version of README.md's "Tracing log format" contract (see
           PROJECT.md §4). Useful both as this project's own fixture-
           validation test and as a real diagnostic for "does my own
@@ -388,7 +388,7 @@ def cmd_selfcheck(args) -> bool:
         print(f"  {'OK' if ok else 'FAIL'}  {label}")
         all_ok = all_ok and ok
     if not all_ok:
-        print("\nOne or more checks failed. If nothing in codemap/ or the dummy-cli/"
+        print("\nOne or more checks failed. If nothing in src/codemap/ or the dummy-cli/"
               "dummy-lib fixtures changed recently, this likely means the installed "
               "rustc's MIR pretty-printer output changed shape -- see PROJECT.md §4, "
               "\"MIR as the only extraction source\".")
@@ -398,10 +398,16 @@ def cmd_selfcheck(args) -> bool:
 # ── validate-trace ───────────────────────────────────────────────────────
 
 _SCHEMA_DIR = Path(__file__).parent / "schema"
+# Package-relative, not cwd-relative -- `viewer/` now lives inside this
+# package (src/codemap/viewer/), not at the repo root next to it, so a
+# bare "viewer" default would only resolve correctly if `python -m codemap`
+# happened to be invoked from inside src/. Same reasoning as _SCHEMA_DIR
+# above, which already had to be package-relative for the same reason.
+_VIEWER_DIR = Path(__file__).parent / "viewer"
 
 
 def cmd_validate_trace(args) -> bool:
-    """Checks a real trace.jsonl against the three schemas in codemap/schema/
+    """Checks a real trace.jsonl against the three schemas in src/codemap/schema/
     (see PROJECT.md §4, "Trace-format schema") -- one line at a time, since
     each line is independently an entry, a close, or a plain event, not one
     schema for the whole file. Doubles as this project's fixture-validation
@@ -448,7 +454,7 @@ def cmd_validate_trace(args) -> bool:
             for e in errors:
                 print(f"  {e}")
     verdict = "OK" if all_ok else "FAILED"
-    print(f"{verdict}: {total} line(s) checked against codemap/schema/trace-{{entry,close,event}}.schema.json")
+    print(f"{verdict}: {total} line(s) checked against src/codemap/schema/trace-{{entry,close,event}}.schema.json")
     return all_ok
 
 
@@ -675,7 +681,7 @@ def cmd_run(args):
         webbrowser.open(url)
 
     cmd_serve(SimpleNamespace(
-        dir="viewer", port=args.port,
+        dir=str(_VIEWER_DIR), port=args.port,
         docs=str(docs_root) if docs_root.exists() else None,
         graph=str(graph_path), doc=str(doc_path),
     ))
@@ -716,7 +722,7 @@ def main():
     d.set_defaults(func=cmd_doc)
 
     s = sub.add_parser("serve", help="Serve the viewer directory over HTTP")
-    s.add_argument("--dir", default="viewer", help="Directory to serve (should contain index.html)")
+    s.add_argument("--dir", default=str(_VIEWER_DIR), help="Directory to serve (should contain index.html)")
     s.add_argument("--docs", default=None, help="Also serve this directory (a target/doc/ root) under /docs/, "
                                                   "so the viewer can embed native cargo-doc pages")
     s.add_argument("--graph", default=None, help="graph.json to serve at /graph.json -- the viewer auto-loads "

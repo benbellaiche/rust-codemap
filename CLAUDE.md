@@ -14,14 +14,17 @@ mapping") is the main design principle running through the codebase — see
 target project.
 
 Read [README.md](README.md) for the user-facing workflow and the current
-tracing log format. Read [PROJECT.md](PROJECT.md) for design history: what's
+tracing log format. Read [PROJECT.md](doc/PROJECT.md) for design history: what's
 already settled, what's still an open decision, and known limitations —
 check it before re-deciding something that was already discussed, and
 update it (not just this file) when a real decision is made.
 
 ## Commands
 
-Run from the repo root. `--project <path>` always points at some *other*
+Run from the repo root, with `src` on `PYTHONPATH` (`export
+PYTHONPATH=src` once per shell session -- `codemap` lives under `src/`,
+not importable straight from the repo root; omitted from the commands
+below for readability). `--project <path>` always points at some *other*
 Rust crate on disk (there is no target crate committed to this repo).
 
 ```sh
@@ -30,7 +33,7 @@ python -m codemap graph --project <path>                 # -> <target_dir>/rust-
 python -m codemap doc   --project <path>                  # -> <target_dir>/rust-codemap/<crate>/source_index.json
 python -m codemap serve --graph <path> --doc <path> [--docs <path>]  # re-serves already-generated output, re-read on every request
 python -m codemap selfcheck [--project ../dummy-cli]      # MIR-format canary -- see PROJECT.md §4
-python -m codemap validate-trace <trace.jsonl>            # check a trace against codemap/schema/trace-*.schema.json
+python -m codemap validate-trace <trace.jsonl>            # check a trace against src/codemap/schema/trace-*.schema.json
 ```
 
 No `trace` subcommand anymore -- removed once "Load trace…" in the viewer
@@ -66,12 +69,12 @@ There is no general test suite yet, but `python -m codemap selfcheck` (runs
 `graph` against `../dummy-cli` and asserts a fixed set of structural facts
 about the result -- specific nodes, edges, the `traced` flag, `call_order`
 renumbering, the cross-crate collision fix) and `validate-trace` (checks a
-trace.jsonl against `codemap/schema/`) are real, repeatable automated
+trace.jsonl against `src/codemap/schema/`) are real, repeatable automated
 checks -- run `selfcheck` after any change to `mir_graph.py`/`__main__.py`'s
 graph-building code, and after any Rust toolchain upgrade (see PROJECT.md
 §4, "MIR as the only extraction source" -- this is the canary that catches
 a future rustc MIR-format change instead of it failing silently). Beyond
-that, to sanity-check a change to `codemap/`, run the commands above against:
+that, to sanity-check a change to `src/codemap/`, run the commands above against:
 - `../dummy-lib/{dummy-core,dummy-ops,dummy-api}` — a sibling repo
   purpose-built as a multi-crate (library-only) test fixture, see
   PROJECT.md §2.7 and its own README. Confirm `graph`/`doc` merge all 3
@@ -102,20 +105,20 @@ execution replay is only meaningful for a binary target today (see
 
 ### Two independent halves
 
-1. **`codemap/`** — a Python package, zero third-party dependencies
+1. **`src/codemap/`** — a Python package, zero third-party dependencies
    (`requirements.txt` is deliberately empty). `__main__.py` is the CLI
    dispatcher (`python -m codemap <subcommand>`); `mir_graph.py`,
    `doc_index.py`, `trace_log.py` are pure parsing modules with no CLI/IO
    concerns of their own — each takes text/paths in and returns a plain
    dict/list out, so they're easy to reason about independent of argparse.
-   `codemap/schema/trace-{entry,close}.schema.json` are the written trace-
+   `src/codemap/schema/trace-{entry,close}.schema.json` are the written trace-
    format contract (plain, standard JSON Schema draft-07 -- readable by any
    real validator, not just this repo); `schema_check.py` is a small,
    dependency-free validator for exactly the subset of JSON Schema those
    two files use, so checking a trace against them (`validate-trace`)
    doesn't need pulling in a third-party `jsonschema` package just for
    that.
-2. **`viewer/index.html`** — a single self-contained HTML file (Cytoscape.js
+2. **`src/codemap/viewer/index.html`** — a single self-contained HTML file (Cytoscape.js
    plus the `cytoscape-dagre` layout extension and its `dagre` dependency,
    all from a CDN via plain `<script>` tags, no build step, no bundler,
    registered with `cytoscape.use(cytoscapeDagre)`) that fetches `graph.json` /
@@ -123,7 +126,7 @@ execution replay is only meaningful for a binary target today (see
    side and the viewer only communicate through those three JSON files —
    there is no other coupling.
 
-### `codemap/__main__.py` — multi-crate dependency resolution
+### `src/codemap/__main__.py` — multi-crate dependency resolution
 
 `local_dependency_closure()` is the piece that decides *which* crates get
 merged into the graph. It is deliberately **not** "every member of the
@@ -146,7 +149,7 @@ through to the base class's static-file serving -- returns each of
 `index.html`/`trace_log.py`/`__main__.py`'s real on-disk mtime (`Path(...)
 .stat().st_mtime`, computed fresh per request, never cached) plus the
 server's own PID. Exists purely to answer "which code is this process
-actually running" at a glance (`viewer/index.html`'s `#version-badge`
+actually running" at a glance (`src/codemap/viewer/index.html`'s `#version-badge`
 fetches it once on load) -- added after a stale server process (a zombie
 from hours earlier, still bound to the same port) answered requests with
 old `trace_log.py` for a long debugging session despite every other signal
@@ -155,7 +158,7 @@ Deliberately mtime-based, not a hand-maintained version string -- there's
 no step to remember, so it can't itself drift out of sync with what's
 actually on disk.
 
-### `codemap/mir_graph.py` — how the call-graph is actually extracted
+### `src/codemap/mir_graph.py` — how the call-graph is actually extracted
 
 This is the part most likely to need care when changed. It parses MIR
 *text* (produced via `cargo build -p <crate> ...` with
@@ -282,7 +285,7 @@ resolved within its own crate's parse, though (see the next bullet) --
   `traced == false` means "structurally can never produce a span," which is
   a stronger and more useful statement than "didn't show up in this trace."
 
-### `codemap/doc_index.py` — cross-referencing cargo doc
+### `src/codemap/doc_index.py` — cross-referencing cargo doc
 
 Discovers doc pages purely by filename pattern
 (`struct.Name.html`/`enum.Name.html`/`trait.Name.html`/`fn.name.html`) under
@@ -315,11 +318,11 @@ the method's own anchor decides which case applies. Found and fixed by
 testing against the dummy-lib fixture's real `Summable` trait, not assumed
 correct from the heuristic alone.
 
-### `codemap/trace_log.py` vs. the viewer's inline JS parser
+### `src/codemap/trace_log.py` vs. the viewer's inline JS parser
 
 The core tracing-log parsing logic (dedup by resolved span id, `time.busy`
 duration parsing, iteration counting) is implemented twice: once here in
-Python, once as `parseTraceJsonl()` inside `viewer/index.html`. This
+Python, once as `parseTraceJsonl()` inside `src/codemap/viewer/index.html`. This
 duplication is known and tracked in PROJECT.md, not an oversight — if you
 fix a bug in one, check whether it also applies to the other. The two are
 no longer equivalent, though, and won't become so: only `trace_log.py` can
@@ -356,7 +359,7 @@ Line classification is a real three-way split, not two: CLOSE
 (`"time.busy" in fields`), NEW (`fields.message == "new"`), and EVENT
 (anything else — a plain `tracing::event!`/`info!`/... call from inside an
 instrumented function's own body, see PROJECT.md §2.10 and
-`codemap/schema/trace-event.schema.json`). An EVENT's own `span` field
+`src/codemap/schema/trace-event.schema.json`). An EVENT's own `span` field
 reports its *enclosing* span's identity, not one of its own — before this
 was recognized as a distinct case, an event line fell into the NEW branch
 by mistake and pushed that enclosing name onto `open_stack` a second time,
@@ -404,7 +407,7 @@ guess, since a single candidate is the only case that's actually certain.
 
 Separately, every span also carries `openSeq`/`closeSeq` -- the 0-indexed
 position of its own NEW/CLOSE line in the raw log (all lines counted, NEW/
-CLOSE/EVENT alike), not derived from the resolved span list. `viewer/
+CLOSE/EVENT alike), not derived from the resolved span list. `src/codemap/viewer/
 index.html`'s `stepTo()` uses these instead of trusting step-index order
 for "has this span returned yet": a span already stepped past (`i < idx`)
 stays visually active if `span.closeSeq >= traceData[idx].openSeq` -- its
@@ -503,7 +506,7 @@ the trace stuck on the first step, unrelated to any of the fixes above --
 would affect any trace, not just concurrent ones). `btn-step-prev` never
 needed this -- it calls `stepTo()` synchronously, no delay to race.
 
-### `viewer/index.html` — the pieces that aren't obvious from a skim
+### `src/codemap/viewer/index.html` — the pieces that aren't obvious from a skim
 
 - `stepTo()`'s edge lookup can come up empty even for a span with a real,
   confirmed ancestor -- an untraced function in between means the trace
@@ -547,7 +550,7 @@ needed this -- it calls `stepTo()` synchronously, no delay to race.
 - "Load graph…" / "Load doc index…" / "Load trace…" are plain
   `<input type="file">` + `FileReader` pickers — they read straight off
   disk client-side, no fetch involved. This is deliberate: it's what lets
-  `viewer/` stay pure static assets with zero project-specific files ever
+  `src/codemap/viewer/` stay pure static assets with zero project-specific files ever
   needing to sit next to `index.html`, even though `graph`/`doc`/`trace`
   write their output outside this repo entirely (see the CLI section
   above). `loadGraph(g)` tears down (`cy.destroy()`) and rebuilds the whole
