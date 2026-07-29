@@ -18,7 +18,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "cargo-codemap", about = "Interactive call-graph viewer for Rust codebases, with execution replay from real tracing logs.")]
+#[command(name = "cargo-codemap", version, about = "Interactive call-graph viewer for Rust codebases, with execution replay from real tracing logs.")]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,

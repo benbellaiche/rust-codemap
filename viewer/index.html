@@ -2154,6 +2154,7 @@
                         // spans within the same render pass if the same gap
                         // recurs; torn down by clearAll() before the next.
                         if (!src || !tgt) continue; // no ancestor at all here (e.g. the root) -- nothing to draw
+                        if (!cy.getElementById(src).length || !cy.getElementById(tgt).length) continue; // one end isn't a real node in this graph -- cy.add() below throws on a nonexistent source/target
                         const gapId = `gap-${src}->${tgt}`;
                         e = cy.getElementById(gapId);
                         if (!e.length) {

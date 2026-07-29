@@ -26,6 +26,21 @@ static WHITESPACE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
 static CODE_HEADER_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"(?s)<h4[^>]*class="code-header"[^>]*>(.*?)</h4>"#).unwrap());
 
+/// Nearest valid char boundary at or before `idx` -- needed because every
+/// slice bound below is a fixed byte offset (+2000/+3000/-10) applied to a
+/// cargo-doc HTML page, which can land mid-character on any non-ASCII byte
+/// sequence (an accented name in a doc comment, a unicode symbol, ...) and
+/// panic `&html[a..b]` otherwise. `str::floor_char_boundary` is nightly-only,
+/// hence this stable equivalent; walking backward from `idx` always
+/// terminates since byte 0 is always a boundary.
+fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    let mut idx = idx.min(s.len());
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
 fn strip_tags(html: &str) -> String {
     TAG_RE
         .replace_all(html, "")
@@ -56,7 +71,7 @@ fn extract_top(html: &str) -> Extracted {
     // item-decl. If a section header (Fields / Implementations / ...)
     // shows up first, there's no doc for the item itself -- don't fall
     // through to some other item's docblock further down the same page.
-    let tail_end = (m_decl.end() + 3000).min(html.len());
+    let tail_end = floor_char_boundary(html, m_decl.end() + 3000);
     let tail = &html[m_decl.end()..tail_end];
     let h2_pos = tail.find("<h2");
     if let Some(doc_m) = DOCBLOCK_RE.captures(tail) {
@@ -78,8 +93,8 @@ fn extract_method(html: &str, anchor: &str) -> Extracted {
     let mut out = Extracted { sig: String::new(), doc: String::new(), file: String::new(), line: 0 };
     let needle = format!(r#"id="{anchor}""#);
     let Some(idx) = html.find(&needle) else { return out };
-    let chunk_start = idx.saturating_sub(10);
-    let chunk_end = (idx + 2000).min(html.len());
+    let chunk_start = floor_char_boundary(html, idx.saturating_sub(10));
+    let chunk_end = floor_char_boundary(html, idx + 2000);
     let chunk = &html[chunk_start..chunk_end];
     if let Some(m) = SOURCE_LINK_RE.captures(chunk) {
         out.file = m[1].to_string();
@@ -88,7 +103,7 @@ fn extract_method(html: &str, anchor: &str) -> Extracted {
     if let Some(m) = CODE_HEADER_RE.captures(chunk) {
         out.sig = WHITESPACE_RE.replace_all(&strip_tags(&m[1]), " ").trim().to_string();
     }
-    let doc_end = (idx + 3000).min(html.len());
+    let doc_end = floor_char_boundary(html, idx + 3000);
     if let Some(m) = DOCBLOCK_RE.captures(&html[idx..doc_end]) {
         out.doc = m[1].trim().to_string();
     }
