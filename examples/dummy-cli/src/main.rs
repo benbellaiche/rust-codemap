@@ -15,6 +15,37 @@ use std::fs;
 use std::fs::File;
 use std::path::Path;
 
+/// Sets up the global `tracing` subscriber cargo-codemap's replay needs:
+/// JSON Lines, one span/event per line, with source location, thread
+/// identity, and the NEW/ENTER/EXIT/CLOSE span events all captured -- see
+/// doc/tracing-format.md "Why each setup flag matters" for what breaks
+/// without each one. `path` is created (truncated if it already exists);
+/// `level` is the minimum level captured at all.
+///
+/// This function has no dependency on anything else in this file -- copy
+/// it as-is into your own project's `main()` and call it there, before
+/// anything else runs.
+fn init_tracing(path: impl AsRef<Path>, level: tracing::Level) {
+    let path = path.as_ref();
+    let trace_file = File::create(path)
+        .unwrap_or_else(|e| panic!("failed to create trace file {}: {e}", path.display()));
+    tracing_subscriber::fmt()
+        .json()
+        .with_max_level(level)
+        .with_span_events(
+            tracing_subscriber::fmt::format::FmtSpan::NEW
+                | tracing_subscriber::fmt::format::FmtSpan::ENTER
+                | tracing_subscriber::fmt::format::FmtSpan::EXIT
+                | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+        )
+        .with_file(true)
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_writer(move || trace_file.try_clone().expect("failed to clone trace file handle"))
+        .init();
+}
+
 const TEST_NAMES: &[&str] = &[
     "simple_graph",
     "gap",
@@ -58,20 +89,7 @@ fn main() {
     let log_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("traces");
     fs::create_dir_all(&log_dir).expect("failed to create target/traces");
     let log_path = log_dir.join(format!("trace_{test_name}.jsonl"));
-    let file = File::create(&log_path).expect("failed to create log file");
-    tracing_subscriber::fmt()
-        .json()
-        .with_span_events(
-            tracing_subscriber::fmt::format::FmtSpan::NEW
-                | tracing_subscriber::fmt::format::FmtSpan::ENTER
-                | tracing_subscriber::fmt::format::FmtSpan::EXIT
-                | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
-        )
-        .with_file(true)
-        .with_line_number(true)
-        .with_thread_ids(true)
-        .with_writer(move || file.try_clone().expect("failed to clone log file handle"))
-        .init();
+    init_tracing(&log_path, tracing::Level::INFO);
 
     let result = match test_name.as_str() {
         "simple_graph" => dummy_api::simple_entry(5).to_string(),

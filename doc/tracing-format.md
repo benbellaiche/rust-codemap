@@ -6,35 +6,59 @@ own file. Do this once, in `main()`.
 
 ## 1. Set up the subscriber
 
-At the very top of `main()`, before anything else runs:
+At the very top of `main()`, before anything else runs, copy this function
+as-is into your own project and call it there — it has no dependency on
+anything else in the file it came from
+(`examples/dummy-cli/src/main.rs`, which does exactly this):
 
 ```rust
-let trace_file = std::fs::File::create("trace.jsonl").expect("failed to create trace.jsonl");
-tracing_subscriber::fmt()
-    .json()
-    .with_span_events(
-        tracing_subscriber::fmt::format::FmtSpan::NEW
-            | tracing_subscriber::fmt::format::FmtSpan::ENTER
-            | tracing_subscriber::fmt::format::FmtSpan::EXIT
-            | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
-    )
-    .with_file(true)
-    .with_line_number(true)
-    .with_thread_ids(true)
-    .with_thread_names(true)
-    .with_writer(move || trace_file.try_clone().expect("failed to clone trace file handle"))
-    .init();
+/// Sets up the global `tracing` subscriber cargo-codemap's replay needs:
+/// JSON Lines, one span/event per line, with source location, thread
+/// identity, and the NEW/ENTER/EXIT/CLOSE span events all captured -- see
+/// "Why each setup flag matters" below for what breaks without each one.
+/// `path` is created (truncated if it already exists); `level` is the
+/// minimum level captured at all.
+fn init_tracing(path: impl AsRef<std::path::Path>, level: tracing::Level) {
+    let path = path.as_ref();
+    let trace_file = std::fs::File::create(path)
+        .unwrap_or_else(|e| panic!("failed to create trace file {}: {e}", path.display()));
+    tracing_subscriber::fmt()
+        .json()
+        .with_max_level(level)
+        .with_span_events(
+            tracing_subscriber::fmt::format::FmtSpan::NEW
+                | tracing_subscriber::fmt::format::FmtSpan::ENTER
+                | tracing_subscriber::fmt::format::FmtSpan::EXIT
+                | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+        )
+        .with_file(true)
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_writer(move || trace_file.try_clone().expect("failed to clone trace file handle"))
+        .init();
+}
 ```
 
-No extra dependency needed — `.with_writer(...)` just takes a closure
+Call it once, at the very top of `main()`:
+
+```rust
+init_tracing("trace.jsonl", tracing::Level::INFO);
+```
+
+`level` is the minimum level captured at all — pass `tracing::Level::TRACE`
+to keep everything, or a higher level to drop noisy spans from the trace
+file. Needs `tracing-subscriber` as a dependency with its `json` feature
+enabled (`tracing-subscriber = { version = "0.3", features = ["json"] }`),
+alongside `tracing` itself.
+
+No extra dependency beyond that — `.with_writer(...)` just takes a closure
 returning anything that implements `Write`; `File::try_clone()` is a cheap
-fd/handle duplication, not a copy of the file's contents. This writes the
-trace to its own `trace.jsonl`, so it never mixes with your binary's own
-logs (if it has any) — those keep going wherever they already do,
-untouched. This is exactly what `examples/dummy-cli/src/main.rs` does,
-including for its `async_mono`/`async_multi` (tokio) cases — a plain
-synchronous file write is fast enough that it's never been worth adding
-an async/non-blocking writer (e.g. the `tracing-appender` crate) on top.
+fd/handle duplication, not a copy of the file's contents. This is exactly
+what `examples/dummy-cli/src/main.rs` does, including for its
+`async_mono`/`async_multi` (tokio) cases — a plain synchronous file write
+is fast enough that it's never been worth adding an async/non-blocking
+writer (e.g. the `tracing-appender` crate) on top.
 
 **Simpler alternative, if your binary doesn't log anything else:** drop
 the `trace_file` line and the `.with_writer(...)` call, then redirect
