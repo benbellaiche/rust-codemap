@@ -677,6 +677,18 @@
         // would otherwise silently do nothing (a real, confirmed bug: 4
         // rapid clicks left the trace stuck on the very first step).
         let stepBusy = false;
+        // Bumped by every navigation action (Step>'s eventual completion,
+        // < Step, Reset, clicking an Execution Trace row) -- lets a delayed
+        // Step> completion (the animPlay timeout, or a much longer
+        // return-path flash / finishTraceToRoot unwind) notice it's been
+        // superseded by one of those other, synchronous actions and skip
+        // re-applying its own now-stale stepTo() instead of silently
+        // overwriting whatever the user just did a moment later (confirmed
+        // reproducible: Step>, then quickly < Step / Reset / a trace-row
+        // click, then the queued Step> completion still lands and clobbers
+        // it). `stepBusy` alone only ever protected against a second Step>
+        // click; it was never checked by these other controls.
+        let navToken = 0;
         // True while a trace is loaded but its replay overlay (visited/
         // current colors, edge styling) is deliberately hidden so the
         // static-navigation highlight/dim can be used instead -- distinct
@@ -2058,6 +2070,7 @@
             ul.querySelectorAll('.sp').forEach(el =>
                 el.addEventListener('click', ev => {
                     if (ev.target.classList.contains('sp-toggle')) return;
+                    navToken++; // invalidate any in-flight Step> completion so it can't overwrite this
                     stepTo(+el.dataset.i);
                 })
             );
@@ -2321,7 +2334,17 @@
             if (common >= pathPrev.length) return []; // going deeper, no return
             // Nodes to unwind: deepest first, up to common ancestor
             const toUnwind = pathPrev.slice(common).reverse();
-            const ancestor = pathPrev[common - 1];
+            // `common === 0` means the two chains share no prefix at all --
+            // the normal case for two spans both directly under `main`
+            // (stack: []), and the ONLY case `finishTraceToRoot` ever hits
+            // (it compares against a synthetic `{stack: []}` root marker).
+            // `main` itself is never traced (see doc/tracing-format.md), so
+            // it never appears inside a real span's own `stack` even though
+            // it's the true root of every call chain -- `pathPrev[common-1]`
+            // would underflow to `undefined` here otherwise, which is what
+            // silently broke `finishTraceToRoot`'s final highlight/camera-pan
+            // onto `main` on every single completed replay.
+            const ancestor = common > 0 ? pathPrev[common - 1] : mainNodeId(cy.nodes());
             return [...toUnwind, ancestor]; // e.g. ["from_json","load_input","main"]
         }
 
@@ -2381,10 +2404,18 @@
 
         // ── Final unwind: from the last traced span all the way back to main ────
         // Triggered by an extra "Step >" click once the trace is fully played.
-        function finishTraceToRoot(onDone) {
+        function finishTraceToRoot(onDone, expectedToken) {
             const last = traceData[traceIdx];
             const rp = computeReturnPath(last, { name: mainNodeId(cy.nodes()), stack: [] });
             const settle = () => {
+                // Superseded by a later navigation action (< Step / Reset /
+                // a trace-row click) while the return-path flash was still
+                // playing -- skip mutating the graph, but still call
+                // onDone() so `stepBusy` doesn't stay stuck true forever.
+                if (expectedToken !== undefined && expectedToken !== navToken) {
+                    if (onDone) onDone();
+                    return;
+                }
                 for (let i = 0; i < rp.length - 1; i++) {
                     const child = rp[i], parent = rp[i + 1];
                     const e = cy.edges().filter(ed => ed.data('source') === parent && ed.data('target') === child);
@@ -2478,13 +2509,18 @@
             if (!traceData.length) { loadTrace().then(() => { if (traceData.length) { traceIdx = 0; stepTo(0); } }); return; }
             if (traceIdx === traceData.length - 1) {
                 stepBusy = true;
-                finishTraceToRoot(() => { stepBusy = false; });
+                const myToken = ++navToken;
+                finishTraceToRoot(() => { stepBusy = false; }, myToken);
                 return;
             }
             if (traceIdx + 1 >= traceData.length) return;
             const nextIdx = traceIdx + 1;
             stepBusy = true;
-            const doStep = () => setTimeout(() => { stepTo(nextIdx); stepBusy = false; }, animPlay);
+            const myToken = ++navToken;
+            const doStep = () => setTimeout(() => {
+                if (myToken === navToken) stepTo(nextIdx); // else: superseded by < Step / Reset / a trace-row click -- don't clobber it
+                stepBusy = false;
+            }, animPlay);
             if (traceIdx >= 0) {
                 const rp = computeReturnPath(traceData[traceIdx], traceData[nextIdx]);
                 logToServer('stepTo/returnPath', `from=${traceData[traceIdx].name} (stack=${JSON.stringify(traceData[traceIdx].stack)}) to=${traceData[nextIdx].name} (stack=${JSON.stringify(traceData[nextIdx].stack)}) -> computeReturnPath=${JSON.stringify(rp)}`);
@@ -2496,11 +2532,12 @@
         document.getElementById('btn-step-prev').addEventListener('click', () => {
             stopPlay();
             if (!traceData.length || traceIdx <= 0) return;
+            navToken++; // invalidate any in-flight Step> completion so it can't overwrite this
             stepTo(traceIdx - 1);
         });
 
         document.getElementById('btn-reset').addEventListener('click', () => {
-            stopPlay(); traceIdx = -1; stepBusy = false; clearAll();
+            stopPlay(); navToken++; traceIdx = -1; stepBusy = false; clearAll();
         });
 
         document.getElementById('btn-untraced').addEventListener('click', () => applyUntracedVisibility(!showUntraced));

@@ -551,12 +551,33 @@ fn resolve_static_path(base: &Path, req_path: &str) -> Option<PathBuf> {
     }
     let rel = path.trim_start_matches('/');
     let mut resolved = base.to_path_buf();
-    for seg in rel.split('/') {
+    // Split on both '/' and '\\' -- a segment containing a raw backslash
+    // (never produced by this viewer's own links, but nothing stops an
+    // arbitrary HTTP client from sending one) would otherwise sail through
+    // the '..'-only check below as one opaque segment and still be
+    // interpreted as multiple path components once handed to the
+    // filesystem on Windows.
+    for seg in rel.split(['/', '\\']) {
         if seg.is_empty() || seg == "." {
             continue;
         }
         if seg == ".." {
             return None; // no path traversal above the served root
+        }
+        // `PathBuf::push` replaces the whole buffer -- discarding `base`
+        // entirely -- when pushed a segment it considers absolute (a
+        // Windows drive-qualified path like `C:\Windows\win.ini`), or,
+        // more subtly, even a bare drive letter alone (`C:`, a "prefix
+        // without root"), which Windows treats as "relative to that
+        // drive's own current directory" and also replaces `self` rather
+        // than appending. Confirmed exploitable directly: an unguarded
+        // `GET /C:\Windows\win.ini` returned that file's real contents.
+        // Reject any segment carrying a `:` (the only way a drive
+        // qualifier can appear) or that `Path` itself considers absolute,
+        // rather than trusting the literal ".." check alone to catch
+        // every escape.
+        if seg.contains(':') || Path::new(seg).is_absolute() {
+            return None;
         }
         resolved.push(seg);
     }
